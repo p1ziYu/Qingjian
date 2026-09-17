@@ -97,6 +97,7 @@ class MainWindow(QMainWindow):
         self._binding_cards: list[BindingCard] = []
         self._binding_shortcuts: list[QShortcut] = []
         self._fixed_shortcuts: list[QShortcut] = []
+        self._arrow_shortcuts: list[QShortcut] = []
         self._retranslators: list = []
         self._inflight: dict[str, tuple[Path, int]] = {}
         #: The copy that drops into an envelope, its animation and where it lands.
@@ -568,9 +569,11 @@ class MainWindow(QMainWindow):
         ]
         self._fixed_shortcuts = [self._shortcut(sequence, handler)
                                  for sequence, handler in pairs]
-        # The only keys that repeat while held: see `_arrow`.
-        self._fixed_shortcuts.append(self._shortcut("Left", lambda: self._arrow(-1), repeat=True))
-        self._fixed_shortcuts.append(self._shortcut("Right", lambda: self._arrow(1), repeat=True))
+        # The only keys that repeat while held: see `_arrow`. `_set_view` turns
+        # them off in the grid, where the arrows belong to the grid itself.
+        self._arrow_shortcuts = [self._shortcut("Left", lambda: self._arrow(-1), repeat=True),
+                                 self._shortcut("Right", lambda: self._arrow(1), repeat=True)]
+        self._fixed_shortcuts.extend(self._arrow_shortcuts)
         for value in range(1, 6):
             self._fixed_shortcuts.append(
                 self._shortcut(f"Shift+{value}", lambda v=value: self._rate_current(v)))
@@ -1021,7 +1024,6 @@ class MainWindow(QMainWindow):
     def _grid_activated(self, path: str) -> None:
         if self.engine.go_to(path):
             self._set_view(config.VIEW_SINGLE)
-            self._refresh_view()
 
     def _grid_selection_changed(self, count: int) -> None:
         # More than one chosen means the next key files all of them.
@@ -1057,20 +1059,23 @@ class MainWindow(QMainWindow):
             self._update_actions()
             return
 
-        target = self._preview_target()
-        ready = self.preloader.take(path, target)
-        if ready is None and decodes_slowly(path):
-            # A large PNG or TIFF cannot be scaled while it is decoded, so it
-            # would hold the window for seconds. Show its name, decode on a
-            # worker, and swap the picture in when it lands.
-            self.preview.show_loading(path, path.name, tr("scan.reading"))
-            self.preloader.request(path, target)
-        else:
-            ok, error = self.preview.show_path(path, ready)
-            if not ok:
-                self.status(tr("status.preview_failed", name=path.name, error=error),
-                            "warning")
-        self._prefetch_neighbours()
+        # Nothing of the single view is on screen in the grid, so decoding and
+        # prefetching here would only spend time on a page nobody can see.
+        if self.view_mode == config.VIEW_SINGLE:
+            target = self._preview_target()
+            ready = self.preloader.take(path, target)
+            if ready is None and decodes_slowly(path):
+                # A large PNG or TIFF cannot be scaled while it is decoded, so it
+                # would hold the window for seconds. Show its name, decode on a
+                # worker, and swap the picture in when it lands.
+                self.preview.show_loading(path, path.name, tr("scan.reading"))
+                self.preloader.request(path, target)
+            else:
+                ok, error = self.preview.show_path(path, ready)
+                if not ok:
+                    self.status(tr("status.preview_failed", name=path.name, error=error),
+                                "warning")
+            self._prefetch_neighbours()
         elide(self.filename_label, path.name, max(160, self.filename_label.width()))
         info = metadata.read(path)
         bits = []
@@ -1179,17 +1184,23 @@ class MainWindow(QMainWindow):
         self.view_switch.set_value(mode, quiet=True)
         self._place_stamps(mode)
         self.viewer_stack.setCurrentIndex(0 if mode == config.VIEW_SINGLE else 1)
+        # Left/Right belong to whichever view is on screen: the grid moves its
+        # own cursor with them, and a hidden page must not decode anything.
+        for shortcut in self._arrow_shortcuts:
+            shortcut.setEnabled(mode == config.VIEW_SINGLE)
         if mode == config.VIEW_SINGLE:
-            current = self.engine.current_path()
-            if current is not None:
-                self.filmstrip.follow(self.engine.index)
-                self.filmstrip.show_path(current)
+            # The grid cursor is the only one the user could see; come back to it.
+            chosen = self.grid.current_path()
+            if chosen is not None:
+                self.engine.go_to(chosen)
+            self._refresh_view()
         else:
             self.preview.release()
             self._fill_grid()
             current = self.engine.current_path()
             if current is not None:
                 self.grid.show_path(current)
+            self.grid.setFocus()
 
     def _change_view(self, mode: str) -> None:
         self._set_view(mode)
@@ -1402,6 +1413,8 @@ class MainWindow(QMainWindow):
         binding = self.settings.bindings[index]
         targets = self._targets()
         if not targets:
+            if self.view_mode == config.VIEW_GRID:
+                self.status(tr("status.nothing_chosen"), "warning")
             return
         if binding.needs_folder() and not binding.folder:
             self.choose_binding_folder(index)
@@ -1508,9 +1521,9 @@ class MainWindow(QMainWindow):
 
     def _targets(self) -> list[Path]:
         if self.view_mode == config.VIEW_GRID:
-            chosen = [Path(p) for p in self.grid.selected_paths()]
-            if chosen:
-                return chosen
+            # The engine cursor is not on screen here, so a key that fell back
+            # to it would file a file nobody chose.
+            return [Path(p) for p in self.grid.selected_paths()]
         current = self.engine.current_path()
         return [current] if current is not None else []
 
@@ -1686,7 +1699,15 @@ class MainWindow(QMainWindow):
     def rename_current(self) -> None:
         if self._blocked():
             return
-        path = self.engine.current_path()
+        if self.view_mode == config.VIEW_GRID:
+            targets = self._targets()
+            if len(targets) != 1:
+                self.status(tr("status.rename_one_only") if targets
+                            else tr("status.nothing_chosen"), "warning")
+                return
+            path = targets[0]
+        else:
+            path = self.engine.current_path()
         if path is None:
             return
         name, ok = QInputDialog.getText(self, tr("rename"), tr("info.filename"), text=path.name)
@@ -1717,12 +1738,17 @@ class MainWindow(QMainWindow):
     def trash_current(self) -> None:
         if self._blocked():
             return
-        path = self.engine.current_path()
-        if path is None:
+        targets = self._targets()
+        if not targets:
+            self.status(tr("status.nothing_chosen"), "warning")
             return
-        self._run_operation(path,
-                            lambda progress, cancel: self.engine.trash(path, progress, cancel),
-                            f"{tr('action.trash')} · {path.name}")
+        for path in targets:
+            # `target=path` binds the loop variable now; a bare closure would
+            # recycle the last item once per selected file.
+            self._run_operation(
+                path,
+                lambda progress, cancel, target=path: self.engine.trash(target, progress, cancel),
+                f"{tr('action.trash')} · {path.name}")
 
     def undo(self) -> None:
         self._transition(self.engine.undo, tr("status.undo_done"))

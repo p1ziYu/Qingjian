@@ -151,6 +151,277 @@ class RecycleTests(WindowCase):
 
 
 @unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
+class GridTargetTests(WindowCase):
+    """The grid acts on what is chosen in it, never on the hidden cursor."""
+
+    def to_grid(self, chosen=()) -> None:
+        from qingjian.core import config
+        self.window._set_view(config.VIEW_GRID)
+        self.app.processEvents()
+        if chosen:
+            self.window.grid.select_all_paths([str(path) for path in chosen])
+            self.app.processEvents()
+
+    def test_delete_in_the_grid_recycles_the_selected_file(self):
+        queue = list(self.engine.queue_paths)
+        self.to_grid([queue[5]])
+        self.window.trash_current()
+        self.app.processEvents()
+        self.assertFalse(queue[5].exists(), "the selected file is still there")
+        self.assertTrue(queue[0].exists(), "a file nobody chose was recycled")
+
+    def test_deleting_many_at_once_recycles_every_one_of_them(self):
+        """A closure that did not bind the loop variable files the last one twice.
+
+        The queue is the shipped default, and on it the work runs a beat after
+        the loop has moved on. Waiting on a real worker makes that a race: it
+        often wins before the loop's second turn, and the bug slips through. So
+        hold every job back until the loop has finished, then run them in order
+        -- late binding then has nowhere to hide.
+        """
+        from types import SimpleNamespace
+        self.settings.background_queue = True
+        self.patch(self.window, "_report", lambda error: None)
+        held = []
+
+        def hold(label, work, meta):
+            held.append(work)
+            return SimpleNamespace(id=f"held-{len(held)}")
+
+        self.patch(self.engine, "enqueue", hold)
+        queue = list(self.engine.queue_paths)
+        chosen = [queue[2], queue[5]]
+        contents = sorted(path.read_bytes() for path in chosen)
+        self.to_grid(chosen)
+        self.window.trash_current()
+        self.assertEqual(2, len(held), "one job per chosen file")
+        for work in held:
+            work(lambda message, percent: None, lambda: False)
+        self.app.processEvents()
+        self.assertEqual([False, False], [path.exists() for path in chosen])
+        self.assertEqual([True, True], [queue[index].exists() for index in (0, 7)])
+        # Recycling renames as it goes, so match on what the files hold: both
+        # pictures must be in the bin, not the same one twice.
+        self.assertEqual(contents, sorted(path.read_bytes() for path in self.recycled()))
+
+    def test_rename_in_the_grid_offers_the_selected_name(self):
+        from PySide6.QtWidgets import QInputDialog
+        queue = list(self.engine.queue_paths)
+        self.to_grid([queue[5]])
+        seen = []
+
+        def get_text(parent, title, label, text="", **kwargs):
+            seen.append(text)
+            return "", False
+
+        self.patch(QInputDialog, "getText", get_text)
+        self.window.rename_current()
+        self.assertEqual([queue[5].name], seen)
+
+    def test_renaming_many_at_once_says_so_and_touches_nothing(self):
+        from PySide6.QtWidgets import QInputDialog
+        from qingjian.core.i18n import tr
+        queue = list(self.engine.queue_paths)
+        self.to_grid([queue[2], queue[5]])
+        seen = []
+
+        def get_text(parent, title, label, text="", **kwargs):
+            seen.append(text)
+            return "", False
+
+        self.patch(QInputDialog, "getText", get_text)
+        self.window.rename_current()
+        self.assertEqual([], seen)
+        self.assertEqual(tr("status.rename_one_only"), self.window.status_label.text())
+
+    def test_with_nothing_selected_the_grid_files_nothing(self):
+        from qingjian.core.i18n import tr
+        queue = list(self.engine.queue_paths)
+        self.to_grid()
+        self.window.grid.clearSelection()
+        self.app.processEvents()
+        self.assertEqual([], self.window._targets())
+        self.window.classify_index(0)
+        self.app.processEvents()
+        self.assertTrue(all(path.exists() for path in queue))
+        self.assertEqual(tr("status.nothing_chosen"), self.window.status_label.text())
+
+
+@unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
+class GridSelectionTests(WindowCase):
+    """What is chosen in the grid survives a view switch, and the count is honest."""
+
+    def test_switching_views_keeps_the_chosen_files(self):
+        from qingjian.core import config
+        from qingjian.core.i18n import tr
+        queue = list(self.engine.queue_paths)
+        chosen = [queue[1], queue[3], queue[5]]
+        self.window._set_view(config.VIEW_GRID)
+        self.app.processEvents()
+        self.window.grid.select_all_paths([str(path) for path in chosen])
+        self.app.processEvents()
+        self.window._toggle_view()
+        self.window._toggle_view()
+        self.app.processEvents()
+        self.assertEqual(sorted(str(path) for path in chosen),
+                         sorted(self.window.grid.selected_paths()))
+        self.assertEqual(sorted(chosen), sorted(self.window._targets()))
+        self.assertEqual(tr("side.bulk_subtitle", count=3), self.window.grid_selected.text())
+
+    def test_filing_a_selection_leaves_the_count_honest(self):
+        from qingjian.core import config
+        queue = list(self.engine.queue_paths)
+        self.window._set_view(config.VIEW_GRID)
+        self.app.processEvents()
+        self.window.grid.select_all_paths([str(queue[1]), str(queue[2])])
+        self.app.processEvents()
+        self.window.classify_index(0)
+        self.app.processEvents()
+        QTest.qWait(50)
+        self.app.processEvents()
+        self.assertEqual([], self.window.grid.selected_paths())
+        self.assertFalse(self.window.grid_selected.isVisible(),
+                         "the label still counts files that are gone")
+        self.assertEqual([], self.window._targets())
+
+
+@unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
+class GridColumnTests(QtCase):
+    """84e83d2 made the grid re-layout in a loop and drop a column."""
+
+    def build(self, width: int, height: int, count: int):
+        from qingjian.ui.browsers import ThumbnailGrid
+        from qingjian.ui.thumbs import ThumbnailCache
+        cache = ThumbnailCache()
+        self.addCleanup(cache.shutdown)
+        view = ThumbnailGrid(cache)
+        self.addCleanup(view.deleteLater)
+        view.resize(width, height)
+        view.show()
+        view.set_paths([str(self.tmp / f"img{i:05d}.jpg") for i in range(count)])
+        self.app.processEvents()
+        return view
+
+    def test_the_grid_settles_instead_of_relaying_out_forever(self):
+        view = self.build(986, 640, 9)
+        calls = []
+        real = view._sync_grid
+
+        def counting():
+            calls.append(1)
+            return real()
+
+        view._sync_grid = counting
+        self.addCleanup(lambda: setattr(view, "_sync_grid", real))
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            self.app.processEvents()
+        self.assertLessEqual(len(calls), 3, f"{len(calls)} re-layouts in a second")
+
+    def test_a_short_grid_still_fills_the_row(self):
+        from PySide6.QtWidgets import QStyle
+        view = self.build(984, 900, 10)
+        extent = view.style().pixelMetric(QStyle.PixelMetric.PM_ScrollBarExtent,
+                                          None, view.verticalScrollBar())
+        expected = max(1, (view.maximumViewportSize().width() - extent - 1)
+                       // (view.edge + 18))
+        top = view.visualItemRect(view.item(0)).top()
+        first_row = sum(1 for row in range(view.count())
+                        if view.visualItemRect(view.item(row)).top() == top)
+        self.assertEqual(expected, first_row, f"cell {view.gridSize().width()}")
+
+
+@unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
+class GridProbeTests(QtCase):
+    """A 4K window with the slider at its minimum shows more than 400 cells."""
+
+    def test_a_big_grid_asks_for_everything_on_screen(self):
+        from qingjian.ui.browsers import ThumbnailGrid
+        from qingjian.ui.thumbs import ThumbnailCache
+        cache = ThumbnailCache()
+        self.addCleanup(cache.shutdown)
+        view = ThumbnailGrid(cache)
+        self.addCleanup(view.deleteLater)
+        view.resize(3800, 1900)
+        view.set_show_names(False)
+        view.set_edge(96)
+        view.show()
+        view.set_paths([str(self.tmp / f"img{i:05d}.jpg") for i in range(1000)])
+        self.app.processEvents()
+        QTest.qWait(150)
+        self.app.processEvents()
+        cell = view.gridSize()
+        port = view.viewport()
+        columns = max(1, port.width() // cell.width())
+        rows = port.height() // cell.height()
+        on_screen = columns * rows
+        start, end = view.visible_rows()
+        self.assertGreaterEqual(end, on_screen - 1, f"visible_rows() = {(start, end)}")
+        last = view.paths()[on_screen - 1]
+        self.assertIn((last, view.edge), cache._wanted)
+        self.assertGreaterEqual(view._tile_room, on_screen)
+
+
+@unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
+class FilmstripDecorationTests(QtCase):
+    def test_a_rebuilt_strip_keeps_the_stars_it_was_given(self):
+        from qingjian.ui.browsers import Filmstrip
+        from qingjian.ui.thumbs import ThumbnailCache
+        cache = ThumbnailCache()
+        self.addCleanup(cache.shutdown)
+        strip = Filmstrip(cache)
+        self.addCleanup(strip.deleteLater)
+        paths = [str(self.tmp / f"img{i:04d}.jpg") for i in range(400)]
+        marks = {path: {"rating": 3, "label": ""} for path in paths[::5]}
+        strip.set_queue(paths, 0, marks)
+        self.app.processEvents()
+        self.assertEqual(80, len(strip._decorations))
+        strip.follow(200)          # a jump, e.g. clicking far along the strip
+        self.app.processEvents()
+        self.assertEqual(80, len(strip._decorations), "the stars were dropped")
+
+
+@unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
+class SelectAllCostTests(QtCase):
+    """Twenty thousand items used to freeze the window for a minute."""
+
+    def grid(self, count: int):
+        from qingjian.ui.browsers import ThumbnailGrid
+        from qingjian.ui.thumbs import ThumbnailCache
+        cache = ThumbnailCache()
+        self.addCleanup(cache.shutdown)
+        view = ThumbnailGrid(cache)
+        self.addCleanup(view.deleteLater)
+        view.resize(1200, 800)
+        view.set_paths([str(self.tmp / f"img{i:05d}.jpg") for i in range(count)])
+        self.app.processEvents()
+        return view
+
+    def timed(self, action) -> float:
+        started = time.perf_counter()
+        action()
+        self.app.processEvents()
+        return time.perf_counter() - started
+
+    def test_choosing_every_file_and_flipping_it_is_instant(self):
+        view = self.grid(5000)
+        every = view.paths()
+        spent = self.timed(lambda: view.select_all_paths(every))
+        self.assertEqual(5000, len(view.selectedItems()))
+        self.assertLess(spent, 0.5, f"select all took {spent:.2f}s")
+        spent = self.timed(view.invert_selection)
+        self.assertEqual(0, len(view.selectedItems()))
+        self.assertLess(spent, 0.5, f"invert took {spent:.2f}s")
+
+    def test_flipping_an_alternating_choice_keeps_the_other_half(self):
+        view = self.grid(100)
+        view.select_all_paths(view.paths()[::2])
+        view.invert_selection()
+        self.assertEqual(list(range(1, 100, 2)),
+                         sorted(view.row(item) for item in view.selectedItems()))
+
+
+@unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
 class RecoverExitTests(WindowCase):
     """Recovery that cannot finish offers a way out; a clean start says nothing."""
 
@@ -659,7 +930,7 @@ class HoldArrowTests(WindowCase):
         for _ in range(4):
             self.right(repeat=True)
         self.right(press=False)
-        self.assertEqual(start + 1, self.engine.index)
+        self.assertEqual(start, self.engine.index)
 
     def hold(self, repeats: int = 3) -> None:
         """Press and keep holding: the release never arrives during the test.
@@ -735,6 +1006,96 @@ class HoldArrowTests(WindowCase):
         dialog.close()
         name = self.engine.current_path().name
         self.until(lambda: self.rendered[-1] == name, "never rendered after the dialog closed")
+
+
+@unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
+class GridArrowTests(WindowCase):
+    def test_an_arrow_in_the_grid_moves_the_grid_not_the_hidden_cursor(self):
+        from qingjian.core import config
+        self.activate()
+        self.window._set_view(config.VIEW_GRID)
+        self.app.processEvents()
+        self.window.grid.setFocus()
+        self.window.grid.setCurrentRow(0)
+        self.app.processEvents()
+        rendered: list[str] = []
+        real = self.window.preview.show_path
+
+        def counting(path, cached=None):
+            rendered.append(Path(path).name)
+            return real(path, cached)
+
+        self.patch(self.window.preview, "show_path", counting)
+        index = self.engine.index
+        row = self.window.grid.currentRow()
+        QTest.keyClick(self.window.grid, Qt.Key.Key_Right)
+        self.app.processEvents()
+        self.assertEqual(row + 1, self.window.grid.currentRow())
+        self.assertEqual(index, self.engine.index, "the hidden cursor moved")
+        self.assertEqual([], rendered, "the hidden page was rendered")
+
+
+@unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
+class ViewSwitchRenderTests(WindowCase):
+    def setUp(self):
+        super().setUp()
+        from PIL import Image
+        first = Image.new("RGB", (240, 180), (200, 40, 40))
+        second = Image.new("RGB", (240, 180), (40, 40, 200))
+        self.clip = self.source / "MOVING.gif"
+        first.save(self.clip, save_all=True, append_images=[second], duration=120, loop=0)
+        # QMovie keeps the file open; let go before the temp directory is removed.
+        self.addCleanup(self.let_go_of_the_gif)
+        self.window.open_folder(self.source)
+        self.app.processEvents()
+
+    def let_go_of_the_gif(self) -> None:
+        """Close the handle QMovie keeps open; that leak is F-026, not this group.
+
+        `release()` only drops the reference, so on Windows the temp directory
+        cannot be removed while any movie this case made is still alive.
+        """
+        import gc
+        import shiboken6
+        from PySide6.QtGui import QMovie
+        self.window.preview.release()
+        self.app.processEvents()
+        for movie in [obj for obj in gc.get_objects() if isinstance(obj, QMovie)]:
+            if shiboken6.isValid(movie):
+                movie.stop()
+                shiboken6.delete(movie)
+        gc.collect()
+        self.app.processEvents()
+
+    def test_coming_back_to_the_single_view_draws_the_animation_again(self):
+        self.assertTrue(self.engine.go_to(str(self.clip)))
+        self.window._refresh_view()
+        self.app.processEvents()
+        self.assertIsNotNone(self.window.preview._movie, "the gif never played")
+        self.window._toggle_view()
+        self.window._toggle_view()
+        self.app.processEvents()
+        self.assertIsNotNone(self.window.preview._movie, "blank after coming back")
+
+    def test_filing_from_the_grid_renders_nothing_behind_it(self):
+        from qingjian.core import config
+        queue = list(self.engine.queue_paths)
+        self.assertTrue(self.engine.go_to(str(queue[2])))
+        self.window._set_view(config.VIEW_GRID)
+        self.app.processEvents()
+        rendered: list[str] = []
+        real = self.window.preview.show_path
+
+        def counting(path, cached=None):
+            rendered.append(Path(path).name)
+            return real(path, cached)
+
+        self.patch(self.window.preview, "show_path", counting)
+        self.window.grid.select_all_paths([str(queue[1])])
+        self.app.processEvents()
+        self.window.classify_index(0)
+        self.app.processEvents()
+        self.assertEqual([], rendered, "the hidden page was rendered")
 
 
 @unittest.skipUnless(HAVE_QT, "PySide6 is not installed")

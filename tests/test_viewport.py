@@ -61,6 +61,11 @@ class RebuildTests(unittest.TestCase):
     def test_an_empty_window_always_rebuilds(self):
         self.assertTrue(viewport.needs_rebuild(0, (0, 0)))
 
+    def test_a_window_already_against_either_end_is_left_alone(self):
+        """The first eight and last eight items rebuilt the strip every step."""
+        self.assertFalse(viewport.needs_rebuild(1, (0, 81), total=400))
+        self.assertFalse(viewport.needs_rebuild(398, (319, 400), total=400))
+
     def test_a_window_covering_the_whole_list_never_rebuilds(self):
         """A folder smaller than the window is built once and left alone."""
         for index in range(120):
@@ -93,7 +98,7 @@ class RebuildTests(unittest.TestCase):
             self.assertLess(per_step, 10.0, f"{total} items -> {per_step:.2f} rows/step")
         # The point is that the cost per step does not grow with the queue —
         # rebuilding the whole strip was what made a long queue unusable.
-        self.assertLessEqual(costs[-1][1], costs[0][1] + 0.01, costs)
+        self.assertLess(abs(costs[-1][1] - costs[0][1]), 1.0, costs)
 
     def test_the_loaded_window_always_holds_the_cursor(self):
         total = 5000

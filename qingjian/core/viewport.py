@@ -51,7 +51,13 @@ def needs_rebuild(index: int, loaded: tuple[int, int], margin: int = 8,
         return True
     if total is not None and low <= 0 and high >= total:
         return False
-    return index - margin < low or index + margin >= high
+    if index - margin < low and low > 0:
+        return True
+    if total is None:
+        return index + margin >= high
+    # Sitting against the end of the queue is not a reason to rebuild:
+    # the window already holds everything there is on that side.
+    return index + margin >= high and high < total
 
 
 def clamp_index(index: int, total: int) -> int:

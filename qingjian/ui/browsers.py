@@ -20,7 +20,8 @@ from __future__ import annotations
 from collections import OrderedDict
 from pathlib import Path
 
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import (QItemSelection, QItemSelectionModel, QPointF, QRectF, QSize, Qt,
+                            QTimer, Signal)
 from PySide6.QtGui import QColor, QFontMetrics, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (QAbstractItemView, QListWidget, QListWidgetItem, QStyle,
                                QStyledItemDelegate)
@@ -242,6 +243,9 @@ class _Browser(QListWidget):
         self._decorations: dict[str, dict] = {}
         #: path -> ((thumbnail key, decoration), tile), most recently drawn last.
         self._tiles: "OrderedDict[str, tuple]" = OrderedDict()
+        #: How many tiles are worth keeping: one screenful, never fewer than
+        #: `_TILE_LIMIT`. A fixed cap evicted tiles that were still on screen.
+        self._tile_room = _TILE_LIMIT
         self.setViewMode(QListWidget.ViewMode.IconMode)
         self.setMovement(QListWidget.Movement.Static)
         self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -388,7 +392,14 @@ class _Browser(QListWidget):
         end = start
         bottom = viewport.bottom()
         right = viewport.right()
-        for row in range(start, min(total, start + _MAX_PROBE)):
+        # 400 rows is short of a 4K window full of the smallest thumbnails,
+        # and everything past the cap stayed blank for good.
+        limit = _MAX_PROBE
+        cell = self.gridSize()
+        if cell.isValid() and cell.width() > 0 and cell.height() > 0:
+            columns = max(1, viewport.width() // cell.width())
+            limit = max(_MAX_PROBE, columns * (viewport.height() // cell.height() + 2))
+        for row in range(start, min(total, start + limit)):
             rect = self.visualItemRect(self.item(row))
             if rect.isNull():
                 break
@@ -405,6 +416,7 @@ class _Browser(QListWidget):
         start, end = self.visible_rows()
         low, high = viewport.band(start, end, total, _OVERSCAN)
         wanted = [str(self.item(row).data(_ROLE_PATH)) for row in range(low, high + 1)]
+        self._tile_room = max(_TILE_LIMIT, len(wanted))
         # Anything outside this band stops being worth a worker's time.
         self.cache.set_wanted(wanted, self.edge)
         for key in wanted:
@@ -423,7 +435,7 @@ class _Browser(QListWidget):
             tile = print_tile(self._decorated(key, pixmap), self.iconSize(),
                               self.itemDelegate().border)
             self._tiles[key] = (signature, tile)
-            while len(self._tiles) > _TILE_LIMIT:
+            while len(self._tiles) > self._tile_room:
                 self._tiles.popitem(last=False)
         else:
             self._tiles.move_to_end(key)
@@ -473,6 +485,11 @@ class _Browser(QListWidget):
 
     def selected_paths(self) -> list[str]:
         return [str(item.data(_ROLE_PATH)) for item in self.selectedItems()]
+
+    def current_path(self) -> str | None:
+        """The item the keyboard cursor sits on, whether or not it is selected."""
+        item = self.currentItem()
+        return str(item.data(_ROLE_PATH)) if item is not None else None
 
     def show_path(self, path: str | Path) -> None:
         item = self._rows.get(str(path))
@@ -549,7 +566,14 @@ class Filmstrip(_Browser):
             self.show_path(self._all[index])
             return
         self._window = (low, high)
+        # `follow` passes no decorations; dropping the ones we hold would wipe
+        # the stars and colour labels off the strip on every rebuild. Hand the
+        # same dict back rather than pass it in: `set_paths` would copy it, and
+        # this runs on every flip that crosses the window edge.
+        held = self._decorations
         self.set_paths(self._all[low:high], decorations)
+        if decorations is None:
+            self._decorations = held
         self.show_path(self._all[index])
 
     def drop(self, path: str | Path) -> None:
@@ -611,15 +635,65 @@ class ThumbnailGrid(_Browser):
         self.show_names = True
         self.itemSelectionChanged.connect(
             lambda: self.selection_changed.emit(len(self.selectedItems())))
+        # A batch move walks `remove_path` once per file. Coalescing the recount
+        # keeps one operation to a single O(n) sweep of `selectedItems()`.
+        self._recount = QTimer(self)
+        self._recount.setSingleShot(True)
+        self._recount.setInterval(0)
+        self._recount.timeout.connect(
+            lambda: self.selection_changed.emit(len(self.selectedItems())))
         self._sync_grid()
+
+    def _announce_selection(self) -> None:
+        """Say the selection changed after a change Qt made under blockSignals."""
+        self._recount.start()
+
+    def set_paths(self, paths, decorations: dict | None = None) -> None:
+        super().set_paths(paths, decorations)
+        self._announce_selection()
+
+    def set_paths_chunked(self, paths, decorations: dict | None = None,
+                          progress=None, cancel=None, chunk: int = 500) -> bool:
+        done = super().set_paths_chunked(paths, decorations, progress, cancel, chunk)
+        self._announce_selection()
+        return done
+
+    def remove_path(self, path: str | Path) -> int:
+        row = super().remove_path(path)
+        if row >= 0:
+            self._announce_selection()
+        return row
+
+    def show_path(self, path: str | Path) -> None:
+        item = self._rows.get(str(path))
+        if item is None:
+            return
+        if self.selectionModel().hasSelection():
+            # Moving the cursor must not throw away what the user picked.
+            self.selectionModel().setCurrentIndex(
+                self.indexFromItem(item), QItemSelectionModel.SelectionFlag.NoUpdate)
+            self.scrollToItem(item, QAbstractItemView.ScrollHint.PositionAtCenter)
+            self._schedule_fetch()
+            return
+        super().show_path(path)
+        self._announce_selection()
 
     def _sync_grid(self) -> None:
         """Share the width out between the columns, so no empty column is left over."""
         label = 30 if self.show_names else 0
         base = self.edge + 18
-        available = max(base, self.viewport().width() - 1)
+        style = self.style()
+        # Measuring the live viewport made the width depend on whether the
+        # scrollbar happened to be up, and each new grid size changed that
+        # answer again: a few hundred item counts re-laid out forever.
+        width = self.maximumViewportSize().width()
+        if not style.pixelMetric(QStyle.PixelMetric.PM_ScrollView_ScrollBarOverlap, None, self):
+            width -= style.pixelMetric(QStyle.PixelMetric.PM_ScrollBarExtent,
+                                       None, self.verticalScrollBar())
+        available = max(base, width - 1)
         columns = max(1, available // base)
-        grid = QSize(available // columns, base + label)
+        room = 2 * self.spacing()        # Qt adds it around every cell
+        grid = QSize(max(base - room, available // columns - room), base + label)
         if grid != self.gridSize():
             self.setGridSize(grid)
 
@@ -643,19 +717,30 @@ class ThumbnailGrid(_Browser):
         self._sync_grid()
 
     def select_all_paths(self, paths) -> None:
-        self.blockSignals(True)
-        self.clearSelection()
-        for path in paths:
-            item = self._rows.get(str(path))
-            if item is not None:
-                item.setSelected(True)
-        self.blockSignals(False)
-        self.selection_changed.emit(len(self.selectedItems()))
+        # One QItemSelection instead of N setSelected calls: four thousand
+        # items took two seconds a click, and an invert after it took minutes.
+        rows = sorted(self.row(self._rows[str(p)]) for p in paths if str(p) in self._rows)
+        model = self.model()
+        selection = QItemSelection()
+        start = previous = None
+        for row in rows:
+            if start is None:
+                start = previous = row
+            elif row == previous + 1:
+                previous = row
+            else:
+                selection.select(model.index(start, 0), model.index(previous, 0))
+                start = previous = row
+        if start is not None:
+            selection.select(model.index(start, 0), model.index(previous, 0))
+        self.selectionModel().select(selection,
+                                     QItemSelectionModel.SelectionFlag.ClearAndSelect)
+        self._announce_selection()
 
     def invert_selection(self) -> None:
-        self.blockSignals(True)
-        for row in range(self.count()):
-            item = self.item(row)
-            item.setSelected(not item.isSelected())
-        self.blockSignals(False)
-        self.selection_changed.emit(len(self.selectedItems()))
+        if not self.count():
+            return
+        model = self.model()
+        whole = QItemSelection(model.index(0, 0), model.index(self.count() - 1, 0))
+        self.selectionModel().select(whole, QItemSelectionModel.SelectionFlag.Toggle)
+        self._announce_selection()

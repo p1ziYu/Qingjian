@@ -9,6 +9,9 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import os
+import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -29,6 +32,18 @@ def digests(root: Path) -> dict[str, list[str]]:
         key = hashlib.sha256(path.read_bytes()).hexdigest()
         out.setdefault(key, []).append(str(path.relative_to(root)))
     return out
+
+
+def assert_each_content_once(case: unittest.TestCase, root: Path,
+                             before: dict[str, list[str]]) -> None:
+    """Every content recorded before the test is still on disk, exactly once.
+
+    "No content is in two places" alone passes when a file is simply gone.
+    """
+    after = digests(root)
+    for key, places in before.items():
+        now = after.get(key, [])
+        case.assertEqual(1, len(now), f"the content first at {places} is now at {now}")
 
 
 class HistoryBranchTests(TempCase):
@@ -63,6 +78,7 @@ class HistoryBranchTests(TempCase):
 
     def test_the_file_is_never_in_two_places_after_that_sequence(self):
         engine, source, binding = self.build()
+        before = digests(self.tmp)
         engine.classify(binding, source / "img0.jpg")
         engine.undo()
         engine.classify(binding, source / "img0.jpg")
@@ -70,6 +86,7 @@ class HistoryBranchTests(TempCase):
         engine.redo()
         for places in digests(self.tmp).values():
             self.assertEqual(len(places), 1, f"the same content is in {places}")
+        assert_each_content_once(self, self.tmp, before)
 
     def test_undo_then_redo_still_works_when_nothing_intervenes(self):
         """Truncating the branch must not break the ordinary case."""
@@ -190,26 +207,51 @@ class ExclusionTests(TempCase):
 
         Before the store took a lock this raised `pending_block_write`, and the
         two threads' atomic writes clobbered each other's temporary file.
+
+        The first move is let through alone and the rest are held back, so at
+        least one undo really runs while sorting is still queued; without that
+        the loop could finish before the queue had done anything to undo.
         """
         engine, source, binding = self.build()
-        for path in sorted(source.iterdir()):
-            engine.enqueue("sort", lambda progress, cancel, path=path:
-                           engine.classify(binding, path, progress=progress, cancel=cancel),
-                           {"path": str(path)})
-        errors: list[str] = []
-        for _ in range(20):
+        before = digests(self.tmp)
+        first_done = threading.Event()
+        release = threading.Event()
+
+        def sort(path, progress, cancel, first):
+            if not first:
+                release.wait(10)
             try:
-                if engine.can_undo():
-                    engine.undo()
+                return engine.classify(binding, path, progress=progress, cancel=cancel)
+            finally:
+                if first:
+                    first_done.set()
+
+        for index, path in enumerate(sorted(source.iterdir())):
+            engine.enqueue("sort", lambda progress, cancel, path=path, first=index == 0:
+                           sort(path, progress, cancel, first),
+                           {"path": str(path)})
+        self.addCleanup(release.set)
+        self.assertTrue(first_done.wait(10), "the queue never ran the first move")
+        errors: list[str] = []
+        undone = 0
+        for attempt in range(20):
+            if attempt == 1:
+                release.set()
+            try:
+                if engine.can_undo() and not engine.undo().skipped:
+                    undone += 1
             except TransactionError as error:
                 errors.append(str(error))
-        engine.queue.wait_idle(30)
+        release.set()
+        self.assertTrue(engine.queue.wait_idle(30), "the queue did not finish")
         failures = [str(job.error) for job in engine.queue.failures()]
         self.assertEqual(failures, [], "a queued operation failed")
         self.assertEqual(errors, [], "an interactive operation was refused")
+        self.assertGreaterEqual(undone, 1, "no undo ran while sorting was queued")
         self.assertFalse(engine.store.has_pending(), "a journal was left behind")
         for places in digests(self.tmp).values():
             self.assertEqual(len(places), 1, f"the same content is in {places}")
+        assert_each_content_once(self, self.tmp, before)
 
     def test_a_mutation_started_inside_another_is_refused(self):
         """`processEvents` can dispatch a key press mid-transaction.
@@ -230,6 +272,97 @@ class ExclusionTests(TempCase):
         engine.classify(binding, source / "img0.jpg", progress=meddle)
         self.assertEqual(seen, ["tried"], "the progress hook never ran")
         self.assertTrue((source / "img1.jpg").exists(), "the nested move went through")
+
+
+class UndoIndexTests(TempCase):
+    """Undo must put files back in the stem index without a rescan.
+
+    A stale index after undo means the next move takes the photograph and
+    leaves its raw behind, and nothing on screen says so.
+    """
+
+    def setUp(self):
+        super().setUp()
+        import time
+        from PIL import Image
+        self.library = self.tmp / "library"
+        self.library.mkdir()
+        seed = self.tmp / "seed.jpg"
+        Image.new("RGB", (48, 32), (30, 60, 90)).save(seed, quality=50)
+        blob = seed.read_bytes()
+        for index in range(12):
+            (self.library / f"IMG_{index:05d}.JPG").write_bytes(blob)
+        for index in range(4):
+            (self.library / f"IMG_{index:05d}.CR2").write_bytes(b"raw" * 40)
+        # The index distrusts a folder touched moments ago; a real one is older.
+        when = time.time() - 300
+        os.utime(self.library, (when, when))
+        self.settings = config.Settings()
+        self.settings.bindings[0].folder = str(self.tmp / "Keepers")
+        self.settings.bindings[0].name_template = "{name}"
+        self.engine = Engine(self.data, self.settings)
+        self.addCleanup(self.engine.close)
+        self.engine.open_folder(self.library)
+
+    def test_an_undo_puts_the_files_back_in_the_index_without_a_rescan(self):
+        target = self.library / "IMG_00002.JPG"
+        self.engine.go_to(target)
+        self.engine.classify(self.settings.bindings[0], target)
+        self.engine.undo()
+        self.assertEqual(2, self.engine.group_for(target).count)
+
+    def test_after_undo_the_raw_still_travels_with_the_photo(self):
+        target = self.library / "IMG_00002.JPG"
+        self.engine.go_to(target)
+        self.engine.classify(self.settings.bindings[0], target)
+        self.engine.undo()
+        self.engine.classify(self.settings.bindings[0], target)
+        self.assertFalse(target.with_suffix(".CR2").exists(), "the raw stayed behind")
+        self.assertTrue((self.tmp / "Keepers" / "IMG_00002.CR2").exists())
+
+
+class NonAsciiNameTests(TempCase):
+    """Chinese and emoji names through a crash, recovery and undo."""
+
+    def test_non_ascii_names_survive_a_crash_recover_and_undo(self):
+        from qingjian.core.safestore import Plan, SafeStore, identity, step_move
+        src, dst = self.tmp / "源", self.tmp / "目标"
+        first = self.write(src / "照片_🌅.JPG", "jpg-内容".encode() * 300)
+        second = self.write(src / "照片_🌅.CR2", "raw-内容".encode() * 300)
+        plan = Plan(forward=[step_move(first, dst / first.name, identity(first)),
+                             step_move(second, dst / second.name, identity(second))])
+        plan.inverse = SafeStore.invert(plan.forward)
+        # A real kill runs no exception handler, so the process really exits
+        # between the two moves.
+        (self.tmp / "plan.json").write_text(json.dumps(plan.to_dict(), ensure_ascii=False),
+                                            encoding="utf-8")
+        script = (
+            "import json, os, sys\n"
+            "from pathlib import Path\n"
+            "from qingjian.core.safestore import Plan, SafeStore\n"
+            "tmp = Path(sys.argv[1])\n"
+            "plan = Plan.from_dict(json.loads((tmp / 'plan.json').read_text(encoding='utf-8')))\n"
+            "def die(_name, percent):\n"
+            "    if percent > 0:\n"
+            "        os._exit(9)\n"
+            "SafeStore(tmp / 'data' / 'store').run(plan, progress=die)\n"
+            "os._exit(0)\n")
+        env = dict(os.environ, PYTHONPATH=str(ROOT), PYTHONDONTWRITEBYTECODE="1")
+        done = subprocess.run([sys.executable, "-c", script, str(self.tmp)], env=env,
+                              capture_output=True, timeout=60)
+        self.assertEqual(9, done.returncode, done.stderr.decode(errors="replace")[-400:])
+        self.assertEqual(1, len(list(dst.iterdir())), "the crash was not between the moves")
+        restarted = SafeStore(self.data / "store")
+        self.assertTrue(restarted.has_pending(), "the crash left no journal to recover from")
+        self.assertTrue(restarted.recover())
+        self.assertFalse(restarted.has_pending())
+        self.assertEqual(["照片_🌅.CR2", "照片_🌅.JPG"], sorted(p.name for p in dst.iterdir()))
+        undo = Plan(forward=plan.inverse)
+        undo.inverse = plan.forward
+        restarted.run(undo)
+        self.assertEqual("jpg-内容".encode() * 300, first.read_bytes())
+        self.assertEqual("raw-内容".encode() * 300, second.read_bytes())
+        self.assertEqual([], self.tree(dst))
 
 
 class AtomicWriteTests(TempCase):

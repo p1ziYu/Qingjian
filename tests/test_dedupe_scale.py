@@ -111,6 +111,21 @@ class ExactPrefilterTests(TempCase):
         self.assertEqual(len(again), 1)
 
 
+    def test_same_head_and_tail_different_middle_is_not_a_duplicate(self):
+        """Two raws that a head-and-tail sample cannot tell apart.
+
+        Cameras write the same header and footer into every file, so a scan
+        that samples the ends calls whole cards full of duplicates.
+        """
+        head = bytes(range(256)) * 256                  # 64 KB
+        middle = b"\x00" * (3 << 20)
+        first = self.write(self.tmp / "a.cr2", head + middle + head)
+        second = self.write(self.tmp / "b.cr2", head + middle[:-1] + b"\x01" + head)
+        self.assertEqual(safestore.sample_digest(first), safestore.sample_digest(second),
+                         "the sample already tells them apart, so this proves nothing")
+        self.assertEqual([], dedupe.find_exact([first, second]))
+
+
 class CachePressureTests(TempCase):
     """The cache must not flush to disk once per photograph."""
 

@@ -1,5 +1,6 @@
 import os
 import time
+from pathlib import Path
 
 from base import TempCase, unittest
 from fixtures import build_library
@@ -273,9 +274,12 @@ class OtherActionTests(PlannerCase):
         self.commit(self.planner.plan_rename(self.planner.group_for(master), "sunset",
                                           source_root=self.root))
         names = sorted(p.name for p in (self.root / "Day3").iterdir())
-        self.assertIn("sunset.JPG", names)
-        self.assertIn("sunset.CR2", names)
-        self.assertIn("sunset.JPG.xmp", names)
+        for name in ("sunset.JPG", "sunset.CR2", "sunset.JPG.xmp", "sunset.XMP"):
+            self.assertIn(name, names)
+        # And nothing kept the old name: an upper-case sidecar left behind is
+        # how a shot gets split in two.
+        for name in ("IMG_5511.JPG", "IMG_5511.CR2", "IMG_5511.JPG.xmp", "IMG_5511.XMP"):
+            self.assertNotIn(name, names)
 
     def test_rename_rejects_a_reserved_name(self):
         master = self.root / "Day4" / "solo_01.JPG"
@@ -340,6 +344,97 @@ class OtherActionTests(PlannerCase):
         self.assertEqual("new.JPG.xmp",
                          ops.sidecar_target_name("new.JPG", "IMG_1", "IMG_1.JPG.xmp"))
         self.assertEqual("new.XMP", ops.sidecar_target_name("new.JPG", "IMG_1", "IMG_1.XMP"))
+
+
+class RenameHistoryTests(TempCase):
+    """Renaming through the engine: undo, redo, and the two conflict answers.
+
+    A rename moves four files at once, so a half-undone rename is how the
+    photograph and its raw end up with different names.
+    """
+
+    def setUp(self):
+        super().setUp()
+        from qingjian.core.engine import Engine
+        self.root = self.tmp / "lib"
+        build_library(self.root)
+        settings = config.Settings()
+        settings.recursive = True
+        self.keep = self.tmp / "Keepers"
+        settings.bindings[0].folder = str(self.keep)
+        settings.bindings[0].name_template = "{name}"
+        self.settings = settings
+        self.engine = Engine(self.data, settings)
+        self.addCleanup(self.engine.close)
+        self.engine.open_folder(self.root)
+
+    def folder(self, path: Path) -> dict[str, bytes]:
+        return {p.name: p.read_bytes() for p in path.iterdir() if p.is_file()}
+
+    def test_a_rename_undone_and_redone_returns_every_member(self):
+        master = self.root / "Day3" / "IMG_5511.JPG"
+        before = self.folder(master.parent)
+        self.engine.rename("sunset.JPG", master)
+        self.engine.undo()
+        self.assertEqual(before, self.folder(master.parent), "undo did not restore the shot")
+        self.engine.redo()
+        names = set(self.folder(master.parent))
+        old = {"IMG_5511.JPG", "IMG_5511.CR2", "IMG_5511.JPG.xmp", "IMG_5511.XMP"}
+        self.assertFalse(old & names, sorted(names))
+        self.assertTrue({"sunset.JPG", "sunset.CR2", "sunset.JPG.xmp", "sunset.XMP"} <= names,
+                        sorted(names))
+
+    def test_a_case_only_rename_is_refused(self):
+        """Windows would treat it as renaming a file onto itself."""
+        target = self.root / "Day4" / "solo_01.JPG"
+        content = target.read_bytes()
+        with self.assertRaises(NameError_) as caught:
+            self.engine.rename("SOLO_01.JPG", target)
+        self.assertEqual("error.name_case_only", caught.exception.key)
+        self.assertEqual(content, target.read_bytes())
+        self.assertEqual(["solo_01.JPG"], [p.name for p in target.parent.iterdir()
+                                           if p.name.casefold().startswith("solo_01")
+                                           and p.suffix.casefold() == ".jpg"])
+
+    def test_a_rename_conflict_answered_with_keep_both_leaves_the_other_file(self):
+        target = self.root / "Day4" / "solo_01.JPG"
+        other = self.root / "Day4" / "solo_02.JPG"
+        content, other_content = target.read_bytes(), other.read_bytes()
+        self.engine.rename("solo_02.JPG", target, resolver=lambda a, b: ops.CONFLICT_SEQUENCE)
+        self.assertEqual(other_content, other.read_bytes(), "the other photo was replaced")
+        landed = [p for p in other.parent.iterdir() if p.is_file() and p.read_bytes() == content]
+        self.assertEqual(1, len(landed), [p.name for p in landed])
+        self.assertNotEqual(other, landed[0])
+        self.engine.undo()
+        self.assertEqual(content, target.read_bytes())
+        self.assertEqual(other_content, other.read_bytes())
+
+    def test_a_rename_conflict_answered_with_replace_is_undone_byte_for_byte(self):
+        target = self.root / "Day4" / "solo_01.JPG"
+        other = self.root / "Day4" / "solo_02.JPG"
+        content, other_content = target.read_bytes(), other.read_bytes()
+        self.engine.rename("solo_02.JPG", target, resolver=lambda a, b: ops.CONFLICT_REPLACE)
+        self.assertEqual(content, other.read_bytes(), "the rename did not replace the file")
+        self.assertFalse(target.exists())
+        self.engine.undo()
+        self.assertEqual(other_content, other.read_bytes(), "the replaced photo is gone")
+        self.assertEqual(content, target.read_bytes())
+
+    def test_undoing_a_move_made_by_a_template_puts_every_file_back(self):
+        """The folders the template made may stay behind; the files may not."""
+        binding = self.settings.bindings[0]
+        binding.path_template = "{YYYY}/{YYYY-MM}"
+        master = self.root / "Day3" / "IMG_5511.JPG"
+        before = self.folder(master.parent)
+        self.engine.classify(binding, master)
+        moved = [p for p in self.keep.rglob("*") if p.is_file()]
+        self.assertEqual(4, len(moved), [p.name for p in moved])
+        self.assertTrue(all(p.parent != self.keep for p in moved),
+                        "the template did not make any folders")
+        self.engine.undo()
+        self.assertEqual(before, self.folder(master.parent), "undo did not restore the shot")
+        self.assertEqual([], [p for p in self.keep.rglob("*") if p.is_file()],
+                         "a file was left in the folders the template made")
 
 
 if __name__ == "__main__":

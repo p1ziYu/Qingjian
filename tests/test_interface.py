@@ -77,11 +77,18 @@ class WindowCase(QtCase):
 
     def close_window(self) -> None:
         self.window.close()
+        # Delete it as well: a closed window keeps its shortcuts, and the next
+        # case's Ctrl+Z then went to the window this case left behind.
+        self.window.deleteLater()
         self.app.processEvents()
 
     def activate(self) -> None:
         self.window.activateWindow()
         self.assertTrue(QTest.qWaitForWindowActive(self.window, 2000))
+
+    def recycled(self) -> list[Path]:
+        """Files sitting in any `.qingjian-trash` under the test's directory."""
+        return [p for p in self.tmp.rglob("*") if p.is_file() and ".qingjian-trash" in p.parts]
 
 
 class RecycleTests(WindowCase):
@@ -98,13 +105,17 @@ class RecycleTests(WindowCase):
     def test_delete_recycles_at_once_and_undo_brings_it_back(self):
         asked = self.refuse_questions()
         current = self.engine.current_path()
+        content = current.read_bytes()
         self.window.trash_current()
         self.app.processEvents()
         self.assertEqual([], asked)
         self.assertFalse(current.exists())
+        self.assertEqual([content], [p.read_bytes() for p in self.recycled()])
         self.window.undo()
         self.app.processEvents()
         self.assertTrue(current.exists())
+        self.assertEqual(content, current.read_bytes())
+        self.assertEqual([], self.recycled(), "undo left a copy in .qingjian-trash")
 
     def test_recycling_a_grid_selection_asks_nothing(self):
         from qingjian.core import config
@@ -113,11 +124,272 @@ class RecycleTests(WindowCase):
         self.window._set_view(config.VIEW_GRID)
         self.app.processEvents()
         chosen = list(self.engine.queue_paths[:3])
+        contents = sorted(path.read_bytes() for path in chosen)
         self.window.grid.select_all_paths(chosen)
         self.window.classify_index(2)
         self.app.processEvents()
         self.assertEqual([], asked)
         self.assertEqual([False, False, False], [path.exists() for path in chosen])
+        self.assertEqual(contents, sorted(p.read_bytes() for p in self.recycled()),
+                         "the three photos are not in .qingjian-trash")
+        for _ in chosen:
+            if all(path.exists() for path in chosen):
+                break
+            self.window.undo()
+            self.app.processEvents()
+        self.assertEqual(contents, sorted(path.read_bytes() for path in chosen
+                                          if path.exists()), "Ctrl+Z did not bring them back")
+        self.assertEqual([], self.recycled())
+
+
+@unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
+class BackgroundQueueTests(WindowCase):
+    """The shipped default: keys file photographs on the queue thread.
+
+    Every case here drives the real key, not the handler, because the chain
+    from shortcut to queue to the row in the list is what broke in the field.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.settings.background_queue = True            # the shipped default
+        self.settings.bindings[1].folder = str(self.tmp / "other")
+        self.reported: list = []
+        self.patch(self.window, "_report", self.reported.append)
+        # A queue failure pops a modal box; offscreen it would never close.
+        self.patch(QMessageBox, "warning", lambda *a, **k: QMessageBox.StandardButton.Ok)
+        self.patch(QMessageBox, "critical", lambda *a, **k: QMessageBox.StandardButton.Ok)
+        self.activate()
+
+    def settled(self, timeout: float = 20.0) -> bool:
+        return self.wait_until(lambda: self.engine.queue.pending == 0, timeout)
+
+    def press(self, key, modifier=Qt.KeyboardModifier.NoModifier) -> None:
+        """Send a real key press and wait for the queue to go quiet again.
+
+        The window is activated first: a press that arrives while another
+        case's window still holds activation goes nowhere, and the queue is
+        then trivially idle, so waiting on it proves nothing.
+        """
+        self.activate()
+        QTest.keyClick(self.window, key, modifier)
+        self.assertTrue(self.settled(), "the queue never went idle")
+
+    def until(self, predicate, message: str, timeout: float = 20.0) -> None:
+        """Wait for what the key was supposed to do, not for a fixed delay."""
+        self.assertTrue(self.wait_until(predicate, timeout), message)
+
+    def slow_classify(self, seconds: float = 15.0):
+        """Hold the next queued classify open, so the queue is really busy.
+
+        The gate is opened by whoever waits for the queue (`_drain_queue`),
+        not by a timer: the point is that the wait happens at all.
+        """
+        import threading
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        real_drain = self.window._drain_queue
+
+        def draining():
+            gate.set()
+            return real_drain()
+
+        self.patch(self.window, "_drain_queue", draining)
+        real = self.engine.classify
+
+        def slow(*args, **kwargs):
+            gate.wait(seconds)
+            return real(*args, **kwargs)
+
+        self.patch(self.engine, "classify", slow)
+        return gate
+
+    def test_a_binding_key_files_the_photo_through_the_queue(self):
+        current = self.engine.current_path()
+        before = len(self.engine.queue_paths)
+        self.press(Qt.Key.Key_1)
+        self.until(lambda: (self.keep / current.name).exists(), "not in the key's folder")
+        self.assertFalse(current.exists())
+        self.until(lambda: len(self.engine.queue_paths) == before - 1,
+                   f"the list still has {len(self.engine.queue_paths)} rows")
+
+    def test_a_failed_move_goes_back_to_its_row(self):
+        from qingjian.core.safestore import TransactionError
+        self.engine.go_to(self.engine.queue_paths[3])
+        path = self.engine.current_path()
+        row = self.engine.queue_paths.index(path)
+
+        def refuse(*args, **kwargs):
+            raise TransactionError("error.external_change", "injected")
+
+        self.patch(self.engine, "classify", refuse)
+        self.window.classify_index(0)
+        self.assertTrue(self.settled())
+        self.until(lambda: path in self.engine.queue_paths, "the item vanished from the list")
+        self.assertEqual(row, self.engine.queue_paths.index(path), "put back on the wrong row")
+        self.assertTrue(path.exists())
+
+    def test_undo_waits_for_the_move_still_in_the_queue(self):
+        """A plan is only valid for the filesystem it was built against.
+
+        What matters is the state when undo begins: the queue must be empty by
+        then, not "empty a moment later".
+        """
+        first = self.engine.current_path()
+        pending: list[int] = []
+        real_undo = self.engine.undo
+
+        def undoing(*args, **kwargs):
+            pending.append(self.engine.queue.pending)
+            return real_undo(*args, **kwargs)
+
+        self.patch(self.engine, "undo", undoing)
+        self.slow_classify()            # opens only once something waits for the queue
+        self.window.classify_index(0)
+        self.window.undo()
+        self.assertTrue(self.settled())
+        self.assertEqual([0], pending, "undo began while a move was still queued")
+        self.until(lambda: first.exists(), "undo did not put the queued move back")
+        self.assertFalse((self.keep / first.name).exists())
+
+    def test_delete_then_ctrl_z_and_ctrl_y_through_the_keys(self):
+        current = self.engine.current_path()
+        content = current.read_bytes()
+        self.press(Qt.Key.Key_Delete)
+        self.until(lambda: not current.exists(), "Delete did not recycle it")
+        self.assertEqual([content], [p.read_bytes() for p in self.recycled()])
+        self.press(Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
+        self.until(lambda: current.exists(), "Ctrl+Z did not bring it back")
+        self.assertEqual(content, current.read_bytes())
+        self.assertEqual([], self.recycled())
+        self.press(Qt.Key.Key_Y, Qt.KeyboardModifier.ControlModifier)
+        self.until(lambda: not current.exists(), "Ctrl+Y did not recycle it again")
+
+    def test_f2_renames_and_ctrl_z_puts_the_old_name_back(self):
+        from unittest import mock
+        from PySide6.QtWidgets import QInputDialog
+        current = self.engine.current_path()
+        content = current.read_bytes()
+        target = current.with_name("renamed.JPG")
+        with mock.patch.object(QInputDialog, "getText", return_value=("renamed.JPG", True)):
+            self.press(Qt.Key.Key_F2)
+            self.until(lambda: target.exists(), "the file was not renamed")
+        self.assertEqual(content, target.read_bytes())
+        self.assertFalse(current.exists())
+        self.press(Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
+        self.until(lambda: current.exists(), "the old name did not come back")
+        self.assertFalse(target.exists())
+
+    def conflict(self, decision):
+        from unittest import mock
+        from qingjian.ui import mainwindow
+        patcher = mock.patch.object(mainwindow.ConflictDialog, "ask",
+                                    return_value=(decision, False))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_conflict_answered_with_keep_both_keeps_both(self):
+        from qingjian.core import ops
+        current = self.engine.current_path()
+        content = current.read_bytes()
+        older = self.write(self.keep / current.name, b"OLDER FILE")
+        self.conflict(ops.CONFLICT_SEQUENCE)
+        self.press(Qt.Key.Key_1)
+        self.until(lambda: not current.exists(), "the photo was never filed")
+        self.assertEqual(b"OLDER FILE", older.read_bytes(), "the existing file was replaced")
+        landed = [p for p in self.keep.iterdir() if p.read_bytes() == content]
+        self.assertEqual(1, len(landed), sorted(p.name for p in self.keep.iterdir()))
+
+    def test_a_conflict_answered_with_replace_can_be_undone(self):
+        from qingjian.core import ops
+        current = self.engine.current_path()
+        content = current.read_bytes()
+        older = self.write(self.keep / current.name, b"OLDER FILE")
+        self.conflict(ops.CONFLICT_REPLACE)
+        self.press(Qt.Key.Key_1)
+        self.until(lambda: older.read_bytes() == content,
+                   "the photo did not replace the old file")
+        self.assertEqual([older], sorted(self.keep.iterdir()))
+        self.press(Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
+        self.until(lambda: older.read_bytes() == b"OLDER FILE", "the replaced file is gone")
+        self.assertEqual(content, current.read_bytes())
+
+    def test_closing_with_a_queued_move_drains_it_first(self):
+        from unittest import mock
+        current = self.engine.current_path()
+        # The engine's own shutdown waits for the queue, so watch what the
+        # window hands over: by then the queue must already be empty.
+        pending: list[int] = []
+        real_close = self.engine.close
+
+        def closing():
+            pending.append(self.engine.queue.pending)
+            return real_close()
+
+        self.patch(self.engine, "close", closing)
+        self.slow_classify()            # opens only once closing waits for the queue
+        self.window.classify_index(0)
+        with mock.patch.object(QMessageBox, "question",
+                               return_value=QMessageBox.StandardButton.Yes):
+            self.window.close()
+        self.assertEqual([0], pending, "the window closed over a queued move")
+        self.assertTrue((self.keep / current.name).exists())
+
+
+@unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
+class DuplicateReviewTests(WindowCase):
+    """Duplicates, then review, then recycling: the whole chain in one case."""
+
+    def setUp(self):
+        super().setUp()
+        from PIL import Image
+        for index in (1, 2):
+            # Noise, because the exact scan ignores anything under 8 KB.
+            original = self.source / f"DUP_{index}.JPG"
+            Image.effect_noise((640, 480), 60).convert("RGB").save(original, quality=95)
+            self.write(self.source / f"DUP_{index}_copy.JPG", original.read_bytes())
+        self.groups: list = []
+        self.window.open_folder(self.source)
+        self.app.processEvents()
+
+    def scan_and_send(self, dialog):
+        from qingjian.core import dedupe
+        self.assertTrue(self.wait_until(lambda: dedupe.MODE_EXACT in dialog._results, 30),
+                        "the exact scan never finished")
+        self.groups = list(dialog._results[dedupe.MODE_EXACT])
+        dialog._extras_to_review()
+        return QDialog.DialogCode.Accepted
+
+    def test_the_extras_go_to_review_and_recycling_spares_the_keeper(self):
+        self.patch(self.window, "_run_dialog", self.scan_and_send)
+        self.window.open_duplicates()
+        self.app.processEvents()
+        self.assertEqual(2, len(self.groups))
+        extras = sorted(str(member.path) for group in self.groups for member in group.extras)
+        keepers = sorted(str(group.keep().path) for group in self.groups)
+        self.assertEqual(2, len(extras))
+        queued = sorted(self.engine.state.review_queue(str(self.engine.source_root)))
+        self.assertEqual(extras, queued, "the review queue is not exactly the extras")
+        for keeper in keepers:
+            self.assertNotIn(keeper, queued, "a keeper was sent to review")
+        self.window.toggle_review()
+        self.app.processEvents()
+        self.assertTrue(self.engine.review_mode)
+        self.assertEqual(extras, sorted(str(path) for path in self.engine.queue_paths))
+        content = [Path(path).read_bytes() for path in extras]
+        for _ in extras:
+            self.window.trash_current()
+            self.app.processEvents()
+        self.assertEqual([], [path for path in extras if Path(path).exists()])
+        self.assertEqual(sorted(content), sorted(p.read_bytes() for p in self.recycled()))
+        for keeper in keepers:
+            self.assertTrue(Path(keeper).exists(), "a keeper was recycled")
+        for _ in extras:
+            self.window.undo()
+            self.app.processEvents()
+        self.assertEqual(content, [Path(path).read_bytes() for path in extras],
+                         "Ctrl+Z did not restore the reviewed files")
+        self.assertEqual([], self.recycled())
 
 
 @unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
@@ -291,6 +563,71 @@ class HoldArrowTests(WindowCase):
             self.right(repeat=True)
         self.right(press=False)
         self.assertEqual(start + 1, self.engine.index)
+
+    def hold(self, repeats: int = 3) -> None:
+        """Press and keep holding: the release never arrives during the test.
+
+        It is sent at cleanup, before the window closes, so the settle timer
+        does not fire on a closed window (that is F-067, left for later).
+        """
+        self.addCleanup(self.right, False)
+        self.right()
+        for _ in range(repeats):
+            self.right(repeat=True)
+
+    def still(self):
+        from PySide6.QtGui import QColor, QPixmap
+        pixmap = QPixmap(64, 48)
+        pixmap.fill(QColor(200, 30, 30))
+        return pixmap
+
+    def test_a_held_picture_shows_its_thumbnail_when_it_arrives(self):
+        from qingjian.ui import mainwindow
+        shown: list[str] = []
+        real = self.window.preview.show_still
+
+        def spy(path, pixmap):
+            shown.append(Path(path).name)
+            return real(path, pixmap)
+
+        self.patch(self.window.preview, "show_still", spy)
+        self.hold()
+        current = self.engine.current_path()
+        self.window.thumbs.ready.emit(str(current), mainwindow.HOLD_EDGE, self.still())
+        self.app.processEvents()
+        self.assertEqual(current.name, shown[-1] if shown else None)
+
+    def test_a_late_thumbnail_does_not_replace_the_full_render(self):
+        from qingjian.ui import mainwindow
+        self.hold()
+        early = list(self.window._flipped)[0]
+        self.right(press=False)
+        self.app.processEvents()
+        self.window.thumbs.ready.emit(early, mainwindow.HOLD_EDGE, self.still())
+        self.app.processEvents()
+        self.assertEqual(self.engine.current_path(), self.window.preview.current_path)
+
+    def test_a_lost_release_still_settles_on_the_picture(self):
+        self.hold()
+        name = self.engine.current_path().name
+        self.assertTrue(self.wait_until(lambda: self.rendered[-1] == name, 3.0),
+                        f"still showing {self.rendered[-1]}, not {name}")
+
+    def test_the_settle_waits_for_an_open_dialog(self):
+        self.hold()
+        drawn = len(self.rendered)
+        dialog = QDialog(self.window)
+        dialog.setModal(True)
+        dialog.show()
+        self.addCleanup(dialog.close)
+        self.app.processEvents()
+        self.window._settle_timer.timeout.emit()
+        self.app.processEvents()
+        self.assertEqual(drawn, len(self.rendered), "rendered in full behind a dialog")
+        dialog.close()
+        name = self.engine.current_path().name
+        self.assertTrue(self.wait_until(lambda: self.rendered[-1] == name, 3.0),
+                        "never rendered after the dialog closed")
 
 
 @unittest.skipUnless(HAVE_QT, "PySide6 is not installed")

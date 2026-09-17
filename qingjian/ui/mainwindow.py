@@ -1837,12 +1837,66 @@ class MainWindow(QMainWindow):
             self._with_progress(tr("tool.recover"),
                                 lambda progress, cancel: self.engine.recover(progress))
         except (TransactionError, OSError) as error:
-            self._report(error)
+            self._offer_recover_exit(error, can_rollback=True)
+            return
+        except ValueError as error:              # a damaged journal; JSONDecodeError is one
+            log.warning("the journal could not be read: %s", error)
+            self._offer_recover_exit(TransactionError("error.journal_damaged"),
+                                     can_rollback=False)
+            return
+        except Cancelled:
             return
         self.status(tr("status.recover_done"), "success")
         self.recover_button.setVisible(self.engine.has_pending())
         if self.engine.source_root:
             self.rescan()
+
+    def _offer_recover_exit(self, error: BaseException, can_rollback: bool) -> None:
+        """Recovery failed: let the user reverse what ran, or keep the files as they are.
+
+        This is the only way out of a journal that can never be replayed. It is
+        not a delete confirmation: it appears after a failure, never before one.
+        """
+        key = getattr(error, "key", "")
+        fields = getattr(error, "fields", {}) or {}
+        message = tr(key, **fields) if key else str(error)
+        log.warning("recovery could not finish: %s", error)
+        self.status(message, "error")
+        choice = self._ask_recover_exit(message, can_rollback)
+        if choice:
+            rollback = choice == "rollback"
+            try:
+                self._with_progress(
+                    tr("tool.recover"),
+                    lambda progress, cancel: self.engine.abandon_pending(rollback, progress))
+            except Cancelled:
+                # Cancelling the way out is not a failure: the journal is still
+                # there, so the same exit can be taken again.
+                self.status(tr("error.cancelled"), "normal")
+            except (TransactionError, OSError, ValueError) as failure:
+                self._report(failure)
+            else:
+                self.status(tr("status.recover_rolled_back") if rollback
+                            else tr("status.recover_kept"), "success")
+        self.recover_button.setVisible(self.engine.has_pending())
+        if choice and self.engine.source_root:
+            self.rescan()
+
+    def _ask_recover_exit(self, message: str, can_rollback: bool) -> str:
+        box = QMessageBox(QMessageBox.Icon.Warning, tr("error.title"),
+                          tr("recover.exit_text", error=message),
+                          QMessageBox.StandardButton.NoButton, self)
+        roles = QMessageBox.ButtonRole
+        rollback = box.addButton(tr("recover.rollback"), roles.AcceptRole) if can_rollback else None
+        keep = box.addButton(tr("recover.keep"), roles.DestructiveRole)
+        later = box.addButton(tr("recover.later"), roles.RejectRole)
+        box.setDefaultButton(later)
+        box.setEscapeButton(later)
+        box.exec()
+        clicked = box.clickedButton()
+        if rollback is not None and clicked is rollback:
+            return "rollback"
+        return "keep" if clicked is keep else ""
 
     def _step_frame(self, direction: int) -> None:
         message = self.preview.step_frame(direction)

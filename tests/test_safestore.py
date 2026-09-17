@@ -1,4 +1,5 @@
 import json
+import os
 import time
 from pathlib import Path
 
@@ -25,6 +26,11 @@ class StoreCase(TempCase):
         plan = Plan(forward=[step_move(path, target, identity(path))])
         plan.inverse = SafeStore.invert(plan.forward)
         return plan
+
+    def patch_module(self, owner, name, value) -> None:
+        original = getattr(owner, name)
+        setattr(owner, name, value)
+        self.addCleanup(setattr, owner, name, original)
 
 
 class MoveTests(StoreCase):
@@ -93,12 +99,17 @@ class GuardTests(StoreCase):
     def test_a_partial_failure_keeps_the_journal(self):
         first = self.file("a.bin")
         second = self.file("b.bin")
-        stale = identity(second)
-        second.write_bytes(b"changed after planning")
         plan = Plan(forward=[step_move(first, self.dst / "a.bin", identity(first)),
-                             step_move(second, self.dst / "b.bin", stale)])
+                             step_move(second, self.dst / "b.bin", identity(second))])
+
+        def break_second(name, percent):
+            # The precheck refuses a plan that is doomed before it starts, so
+            # the damage has to happen while the plan is already running.
+            if name == "b.bin" and second.exists():
+                second.write_bytes(b"changed part-way")
+
         with self.assertRaises(TransactionError) as caught:
-            self.store.run(plan)
+            self.store.run(plan, progress=break_second)
         self.assertEqual("error.unfinished", caught.exception.key)
         self.assertTrue(self.store.has_pending())
         self.assertTrue((self.dst / "a.bin").is_file())
@@ -154,6 +165,164 @@ class GuardTests(StoreCase):
         self.assertFalse(self.store.has_pending())
 
 
+class PrecheckTests(StoreCase):
+    """A plan is checked step by step before the journal exists."""
+
+    def test_a_plan_whose_later_member_changed_is_refused_before_anything_moves(self):
+        first = self.file("a.bin")
+        second = self.file("b.bin", b"payload" * 99)
+        stale = identity(second)
+        second.write_bytes(b"changed after planning")
+        plan = Plan(forward=[step_move(first, self.dst / "a.bin", identity(first)),
+                             step_move(second, self.dst / "b.bin", stale)])
+        with self.assertRaises(TransactionError) as caught:
+            self.store.run(plan)
+        self.assertEqual("error.external_change", caught.exception.key)
+        self.assertTrue(first.exists(), "the first member moved although the plan was doomed")
+        self.assertEqual([], self.tree(self.dst))
+        self.assertFalse(self.store.has_pending())
+
+    def test_a_plan_that_unlinks_its_own_source_is_refused(self):
+        """F-002 and F-012 fall back to this: no plan may delete what it also reads."""
+        photo = self.file("IMG.JPG")
+        current = identity(photo)
+        unlink = step_unlink(photo, current)
+        unlink["snapshot"] = self.store.snapshot(photo)
+        plan = Plan(forward=[unlink, step_copy(photo, photo, current)])
+        with self.assertRaises(TransactionError) as caught:
+            self.store.run(plan)
+        self.assertEqual("error.plan_collision", caught.exception.key)
+        self.assertTrue(photo.is_file(), "the file was deleted by its own plan")
+        self.assertFalse(self.store.has_pending())
+
+    def test_two_members_that_want_the_same_target_are_refused(self):
+        heic = self.file("IMG_9.HEIC", b"h" * 300)
+        jpg = self.file("IMG_9.JPG", b"j" * 500)
+        plan = Plan(forward=[step_move(heic, self.dst / "photo.jpg", identity(heic)),
+                             step_move(jpg, self.dst / "photo.JPG", identity(jpg))])
+        with self.assertRaises(TransactionError) as caught:
+            self.store.run(plan)
+        self.assertEqual("error.plan_collision", caught.exception.key)
+        self.assertTrue(heic.is_file())
+        self.assertTrue(jpg.is_file())
+        self.assertFalse(self.store.has_pending())
+
+    def test_cross_volume_moves_are_counted_before_the_disk_fills(self):
+        """F-029: a group half-moved onto a full card is what jams the journal."""
+        first = self.file("a.bin", b"a" * 200000)
+        second = self.file("b.bin", b"b" * 200000)
+        plan = Plan(forward=[step_move(first, self.dst / "a.bin", identity(first)),
+                             step_move(second, self.dst / "b.bin", identity(second))])
+        self.patch_module(ss, "same_volume", lambda a, b: False)
+        self.patch_module(ss, "free_space", lambda path: 1024 * 1024)
+        with self.assertRaises(TransactionError) as caught:
+            self.store.run(plan)
+        self.assertEqual("error.disk_full", caught.exception.key)
+        self.assertTrue(first.is_file())
+        self.assertTrue(second.is_file())
+        self.assertEqual([], self.tree(self.dst))
+        self.assertFalse(self.store.has_pending())
+
+
+    def test_a_target_that_cannot_be_stated_is_refused_before_anything_moves(self):
+        """"I cannot tell" is not "nothing is there".
+
+        Reading a refused or unreachable target as absent waves the plan
+        through, and the group half-moves -- the state F-008 exists to prevent.
+        """
+        first = self.file("a.bin")
+        second = self.file("b.bin", b"payload" * 99)
+        blocked = self.dst / "b.bin"
+        plan = Plan(forward=[step_move(first, self.dst / "a.bin", identity(first)),
+                             step_move(second, blocked, identity(second))])
+        target, real = str(blocked), os.stat
+
+        def refusing(path, *args, **kwargs):
+            if str(path) == target:
+                raise PermissionError(13, "Access is denied")
+            return real(path, *args, **kwargs)
+
+        self.patch_module(os, "stat", refusing)
+        with self.assertRaises(PermissionError):
+            self.store.run(plan)
+        self.assertFalse(self.store.has_pending(), "a journal was written for a doomed plan")
+        self.assertTrue(first.is_file(), "the first member moved although the plan was doomed")
+        self.assertTrue(second.is_file())
+        self.assertEqual([], self.tree(self.dst))
+
+
+class AbandonTests(StoreCase):
+    """The way out of a journal that can never be replayed."""
+
+    def stuck(self, snapshots=None, state=None):
+        """Step one done, step two impossible: the journal a part-way failure leaves."""
+        first = self.file("a.bin")
+        second = self.file("b.bin", b"payload" * 99)
+        plan = Plan(forward=[step_move(first, self.dst / "a.bin", identity(first)),
+                             step_move(second, self.dst / "b.bin", identity(second))],
+                    snapshots=list(snapshots or []), state=state)
+        plan.inverse = SafeStore.invert(plan.forward)
+
+        def break_second(name, percent):
+            if name == "b.bin" and second.exists():
+                second.write_bytes(b"changed while the plan was running")
+
+        with self.assertRaises(TransactionError):
+            self.store.run(plan, progress=break_second)
+        self.assertTrue(self.store.has_pending())
+        return plan, first, second
+
+    def test_abandoning_with_rollback_puts_the_finished_part_back(self):
+        plan, first, second = self.stuck()
+        self.assertTrue(self.store.abandon(True))
+        self.assertFalse(self.store.has_pending())
+        self.assertTrue(first.is_file(), "the finished step was not rolled back")
+        self.assertEqual([], self.tree(self.dst))
+        self.store.run(Plan(forward=[step_move(first, self.dst / "a.bin", identity(first))]))
+        self.assertTrue((self.dst / "a.bin").is_file())
+
+    def test_abandoning_without_rollback_keeps_the_files_and_the_reference(self):
+        spare = self.file("c.bin")
+        snapshot = self.store.snapshot(spare)
+        record = {"id": "rec-1", "action": "move", "original": str(self.src / "a.bin"),
+                  "destination": str(self.dst / "a.bin"), "undoable": True,
+                  "payload": {"forward": [], "inverse": [], "snapshots": [snapshot["file"]]}}
+        committed = []
+        self.stuck(snapshots=[snapshot["file"]], state={"records_add": [record]})
+        self.assertTrue(self.store.abandon(False, save_state=committed.append))
+        self.assertFalse(self.store.has_pending())
+        self.assertTrue((self.dst / "a.bin").is_file(), "the finished step was undone")
+        self.assertTrue(Path(snapshot["file"]).is_file(), "the restore copy was thrown away")
+        kept = committed[-1]["records_add"][0]
+        self.assertFalse(kept["undoable"])
+        self.assertIn(snapshot["file"], kept["payload"]["snapshots"])
+
+    def test_keeping_the_files_refuses_to_orphan_a_snapshot(self):
+        """Without somewhere to record it, the restore copy would be unreachable."""
+        spare = self.file("c.bin")
+        snapshot = self.store.snapshot(spare)
+        self.stuck(snapshots=[snapshot["file"]])
+        with self.assertRaises(ValueError):
+            self.store.abandon(False)
+        self.assertTrue(self.store.has_pending(), "the journal went away with the record")
+        self.assertTrue(Path(snapshot["file"]).is_file())
+
+    def test_a_damaged_journal_can_be_set_aside(self):
+        self.store.journal_path.write_text("{ not json", encoding="utf-8")
+        self.assertTrue(self.store.abandon(False, save_state=lambda delta: None))
+        self.assertFalse(self.store.has_pending())
+        aside = [p.name for p in (self.data / "store").iterdir()
+                 if p.name.startswith("journal.damaged-")]
+        self.assertEqual(1, len(aside), "the damaged journal was not kept for diagnosis")
+
+    def test_a_damaged_journal_cannot_be_rolled_back(self):
+        self.store.journal_path.write_text("{ not json", encoding="utf-8")
+        with self.assertRaises(TransactionError) as caught:
+            self.store.abandon(True)
+        self.assertEqual("error.journal_damaged", caught.exception.key)
+        self.assertTrue(self.store.has_pending())
+
+
 class RecoveryTests(StoreCase):
     def test_a_crash_between_steps_is_finished_on_restart(self):
         first = self.file("a.bin")
@@ -204,10 +373,99 @@ class RecoveryTests(StoreCase):
         self.store.run(plan, save_state=committed.append)
         self.assertEqual([{"marker": True}], committed)
 
+    def test_recovery_keeps_the_journal_when_a_replay_step_fails(self):
+        """A journal read back from disk may already have changed files."""
+        first = self.file("a.bin")
+        second = self.file("b.bin", b"payload" * 99)
+        plan = Plan(forward=[step_move(first, self.dst / "a.bin", identity(first)),
+                             step_move(second, self.dst / "b.bin", identity(second))])
+        payload = plan.to_dict()
+        payload["stage_id"] = "stage"
+        ss.atomic_json(self.store.journal_path, payload)     # a kill leaves no "mutated"
+        os.replace(first, self.dst / "a.bin")                # the first step had finished
+        os.utime(second, ns=(1_600_000_000_000_000_000, 1_600_000_000_000_000_000))
+        restarted = SafeStore(self.data / "store")
+        with self.assertRaises(TransactionError) as caught:
+            restarted.recover()
+        self.assertEqual("error.unfinished", caught.exception.key)
+        self.assertTrue(restarted.has_pending(),
+                        "the journal was deleted, so the finished move has no record")
+        self.assertTrue((self.dst / "a.bin").is_file())
+
     def test_a_damaged_journal_is_not_silently_dropped(self):
         self.store.journal_path.write_text("{ not json", encoding="utf-8")
         with self.assertRaises(json.JSONDecodeError):
             self.store.recover()
+
+
+class ImpostorTests(StoreCase):
+    """A file of the same size and mtime is not the same file."""
+
+    def journal(self, plan) -> None:
+        payload = plan.to_dict()
+        payload["stage_id"] = "stage"
+        ss.atomic_json(self.store.journal_path, payload)
+
+    def test_undoing_a_recycle_refuses_to_delete_the_slot_for_an_impostor(self):
+        photo = self.file("a.JPG", b"photo" * 100)
+        current = identity(photo)
+        slot = self.store.trash_slot(photo)
+        plan = Plan(forward=[step_move(photo, slot, current)])
+        plan.inverse = SafeStore.invert(plan.forward)
+        self.store.run(plan)
+        self.assertTrue(slot.is_file())
+        self.write(photo, b"other" * 100)                 # same size, same mtime, other bytes
+        os.utime(photo, ns=(current["mtime_ns"], current["mtime_ns"]))
+        self.journal(Plan(forward=plan.inverse, verify=VERIFY_FULL))
+        with self.assertRaises(TransactionError):
+            SafeStore(self.data / "store").recover()
+        self.assertTrue(slot.is_file(), "the recycled original was deleted for an impostor")
+
+    def test_a_finished_cross_volume_move_is_checked_against_its_hash(self):
+        photo = self.file("b.JPG", b"photo" * 100)
+        plan = Plan(forward=[step_move(photo, self.dst / "b.JPG", identity(photo))],
+                    verify=VERIFY_FULL)
+        self.patch_module(ss, "same_volume", lambda a, b: False)
+        self.store.run(plan)
+        landed = self.dst / "b.JPG"
+        stamp = landed.stat().st_mtime_ns
+        landed.write_bytes(b"other" * 100)
+        os.utime(landed, ns=(stamp, stamp))
+        self.journal(plan)
+        with self.assertRaises(TransactionError):
+            SafeStore(self.data / "store").recover()
+
+
+class SyncInverseTests(StoreCase):
+    """What a cross-volume copy really got must reach the right step, and only it.
+
+    A journal may carry steps that a record does not, so the record's own forward
+    is the only list its inverse lines up with.
+    """
+
+    def build(self, record_forward):
+        first = step_move(self.src / "a.JPG", self.dst / "a.JPG", {"size": 111, "mtime_ns": 11})
+        second = step_move(self.src / "b.JPG", self.dst / "b.JPG", {"size": 222, "mtime_ns": 22})
+        forward = [first, second]
+        body = {"forward": record_forward, "inverse": SafeStore.invert(record_forward)}
+        payload = {"forward": forward, "inverse": SafeStore.invert(forward),
+                   "state": {"records_add": [{"payload": body}]}}
+        first["result"] = {"size": 111, "mtime_ns": 8_000_000_000}   # the card rounded the clock
+        return payload, first, body
+
+    def test_a_record_shorter_than_the_journal_still_learns_what_landed(self):
+        mine = step_move(self.src / "a.JPG", self.dst / "a.JPG", {"size": 111, "mtime_ns": 11})
+        payload, first, body = self.build([mine])
+        SafeStore._sync_inverse(payload, 0, first)
+        self.assertEqual(first["result"], body["inverse"][0]["src_id"],
+                         "undoing this record still expects the clock the plan guessed")
+
+    def test_a_record_holding_another_step_is_left_alone(self):
+        other = step_move(self.src / "b.JPG", self.dst / "b.JPG", {"size": 222, "mtime_ns": 22})
+        payload, first, body = self.build([other])
+        SafeStore._sync_inverse(payload, 0, first)
+        self.assertEqual(222, body["forward"][0]["result"]["size"],
+                         "one file's identity was written onto another file's step")
 
 
 class DeleteAndReplaceTests(StoreCase):

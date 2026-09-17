@@ -10,6 +10,8 @@ import ast
 import hashlib
 import json
 import os
+import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -122,6 +124,244 @@ class HistoryBranchTests(TempCase):
         after = engine.store.usage(refresh=True)
         self.assertLess(after, before)
         self.assertEqual(engine.state.counts()["redo"], 0)
+
+
+class StuckJournalTests(TempCase):
+    """A failure that can never be replayed must not brick the app."""
+
+    def build(self):
+        source = self.tmp / "lib"
+        self.write(source / "IMG_1.JPG", b"J" * 400)
+        self.write(source / "IMG_1.CR2", b"R" * 900)
+        self.write(source / "IMG_2.JPG", b"K" * 500)
+        settings = config.Settings()
+        settings.logging_enabled = False
+        settings.source_folder = str(source)
+        engine = Engine(data_dir=self.tmp / "app", settings=settings)
+        self.addCleanup(engine.close)
+        engine.open_folder(source)
+        return engine, source, self.tmp / "keep"
+
+    def test_undo_after_a_member_was_deleted_outside_leaves_the_app_usable(self):
+        engine, source, keep = self.build()
+        binding = config.Binding(key="1", action="move", folder=str(keep))
+        engine.classify(binding, source / "IMG_1.JPG")
+        (keep / "IMG_1.JPG").unlink()                   # a cleanup tool took it away
+        with self.assertRaises(TransactionError):
+            engine.undo()
+        self.assertTrue((keep / "IMG_1.CR2").is_file(), "the RAW was moved back and left dangling")
+        self.assertFalse(engine.has_pending())
+        engine.classify(binding, source / "IMG_2.JPG")
+        self.assertTrue((keep / "IMG_2.JPG").is_file())
+
+
+class ReplaceRecoveryTests(TempCase):
+    """Every step ran, the state commit did not: recovery must see that."""
+
+    def test_a_replace_whose_state_commit_failed_recovers_and_can_be_undone(self):
+        source, keep = self.tmp / "lib", self.tmp / "keep"
+        new = self.write(source / "IMG_1.JPG", b"NEW-" * 200)
+        old = self.write(keep / "IMG_1.JPG", b"OLD-ONLY-COPY-" * 100)
+        os.utime(old, ns=(1_600_000_000_000_000_000, 1_600_000_000_000_000_000))
+        settings = config.Settings()
+        settings.logging_enabled = False
+        settings.source_folder = str(source)
+        engine = Engine(data_dir=self.tmp / "app", settings=settings)
+        self.addCleanup(engine.close)
+        engine.open_folder(source)
+
+        def failing(delta):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        real_apply = engine.state.apply
+        engine.state.apply = failing
+        binding = config.Binding(key="1", action="move", folder=str(keep))
+        with self.assertRaises(sqlite3.OperationalError):
+            engine.classify(binding, new, resolver=lambda a, b: ops.CONFLICT_REPLACE)
+        engine.state.apply = real_apply
+        engine.recover()
+        self.assertTrue(engine.can_undo(), "the replaced file has no record to bring it back")
+        engine.undo()
+        self.assertTrue(old.read_bytes().startswith(b"OLD-"))
+        self.assertFalse(engine.has_pending())
+
+
+@unittest.skipUnless(sys.platform == "win32", "read-only only blocks deletion on Windows")
+class ReadOnlySourceTests(TempCase):
+    """A camera-protected photo must still move to another disk (F-011, F-117)."""
+
+    def build(self):
+        source = self.tmp / "lib"
+        source.mkdir()
+        settings = config.Settings()
+        settings.logging_enabled = False
+        settings.source_folder = str(source)
+        engine = Engine(data_dir=self.tmp / "app", settings=settings)
+        self.addCleanup(engine.close)
+        self.addCleanup(self.make_writable)
+        return engine, source, self.tmp / "keep"
+
+    def make_writable(self) -> None:
+        for path in self.tmp.rglob("*"):
+            if path.is_file():
+                os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+
+    def cross_volume(self) -> None:
+        original = safestore.same_volume
+        safestore.same_volume = lambda a, b: False
+        self.addCleanup(setattr, safestore, "same_volume", original)
+
+    def test_a_read_only_photo_moves_across_volumes(self):
+        engine, source, keep = self.build()
+        photo = self.write(source / "IMG_1.JPG", b"P" * 400)
+        os.chmod(photo, stat.S_IREAD)
+        engine.open_folder(source)
+        self.cross_volume()
+        engine.classify(config.Binding(key="1", action="move", folder=str(keep)), photo)
+        self.assertFalse(photo.exists(), "the protected source was left behind")
+        self.assertTrue((keep / "IMG_1.JPG").is_file())
+        self.assertFalse(engine.has_pending())
+
+    def test_a_group_whose_raw_is_read_only_arrives_complete(self):
+        engine, source, keep = self.build()
+        jpg = self.write(source / "IMG_2.JPG", b"J" * 400)
+        raw = self.write(source / "IMG_2.CR2", b"R" * 900)
+        os.chmod(raw, stat.S_IREAD)
+        engine.open_folder(source)
+        self.cross_volume()
+        engine.classify(config.Binding(key="1", action="move", folder=str(keep)), jpg)
+        self.assertEqual(["IMG_2.CR2", "IMG_2.JPG"], self.tree(keep))
+        self.assertEqual([], self.tree(source))
+        self.assertFalse(engine.has_pending())
+
+
+class CoarseMtimeTests(TempCase):
+    """FAT and exFAT round the modification time; undo must still recognise the file."""
+
+    def sort_and_undo(self, action: str):
+        root = self.tmp / action
+        usb = root / "usb"
+        photo = self.write(root / "lib" / "IMG_5.JPG", b"f" * 3000)
+        real_utime = os.utime
+
+        def rounded(path, *args, ns=None, **kwargs):
+            if ns is not None and str(usb) in str(path):
+                ns = tuple((value // 2_000_000_000) * 2_000_000_000 for value in ns)
+            if ns is None:
+                return real_utime(path, *args, **kwargs)
+            return real_utime(path, *args, ns=ns, **kwargs)
+
+        os.utime = rounded
+        self.addCleanup(setattr, os, "utime", real_utime)
+        original = safestore.same_volume
+        safestore.same_volume = lambda a, b: False
+        self.addCleanup(setattr, safestore, "same_volume", original)
+        settings = config.Settings()
+        settings.logging_enabled = False
+        settings.source_folder = str(root / "lib")
+        engine = Engine(data_dir=root / "app", settings=settings)
+        self.addCleanup(engine.close)
+        engine.open_folder(root / "lib")
+        engine.classify(config.Binding(key="1", action=action, folder=str(usb)), photo)
+        engine.undo()
+        return photo, usb / "IMG_5.JPG"
+
+    def test_undoing_a_move_to_a_coarse_mtime_volume(self):
+        photo, copy = self.sort_and_undo("move")
+        self.assertTrue(photo.is_file(), "the photo did not come back")
+        self.assertFalse(copy.exists())
+
+    def test_undoing_a_favourite_to_a_coarse_mtime_volume(self):
+        photo, copy = self.sort_and_undo("favorite")
+        self.assertTrue(photo.is_file())
+        self.assertFalse(copy.exists(), "the copy was left on the card")
+
+
+@unittest.skipUnless(sys.platform == "win32", "the 259-character limit is a Windows default")
+class LongStagedPathTests(TempCase):
+    """The staged copy is 48 characters longer than the destination that was checked."""
+
+    def refuse_long_staged_copies(self) -> None:
+        """Stand in for a default Windows install, where LongPathsEnabled is 0."""
+        real = safestore.copy_verified
+
+        def limited(source, target, *args, **kwargs):
+            text = str(target)
+            if len(text) > 259 and not text.startswith("\\\\?\\"):
+                raise FileNotFoundError(2, "The system cannot find the path specified", text)
+            return real(source, target, *args, **kwargs)
+
+        safestore.copy_verified = limited
+        self.addCleanup(setattr, safestore, "copy_verified", real)
+
+    def folder_of_length(self, parent, total: int, tag: str):
+        folder = parent / (tag + "_" * (total - len(str(parent)) - 1 - len(tag)))
+        folder.mkdir(parents=True)
+        self.assertEqual(total, len(str(folder)))
+        return folder
+
+    def engine_over(self, source):
+        settings = config.Settings()
+        settings.logging_enabled = False
+        settings.source_folder = str(source)
+        engine = Engine(data_dir=self.tmp / "app", settings=settings)
+        self.addCleanup(engine.close)
+        engine.open_folder(source)
+        return engine
+
+    def test_copying_into_a_deep_folder(self):
+        source = self.tmp / "lib"
+        photo = self.write(source / "IMG_0001.JPG", b"J" * 5000)
+        self.write(source / "IMG_0001.JPG.xmp", b"<x:xmpmeta/>")
+        target = self.folder_of_length(self.tmp, 198, "copy_target")
+        self.refuse_long_staged_copies()
+        engine = self.engine_over(source)
+        engine.classify(config.Binding(key="1", action="copy", folder=str(target)), photo)
+        self.assertEqual(["IMG_0001.JPG", "IMG_0001.JPG.xmp"], self.tree(target))
+        self.assertFalse(engine.has_pending())
+
+    def test_undoing_a_recycle_from_a_deep_folder(self):
+        base = self.tmp / "lib"
+        deep = self.folder_of_length(base, 220, "deep_folder")
+        photo = self.write(deep / "IMG_0002.JPG", b"precious" * 100)
+        content = photo.read_bytes()
+        self.refuse_long_staged_copies()
+        engine = self.engine_over(base)
+        engine.trash(photo)
+        self.assertFalse(photo.exists())
+        engine.undo()
+        self.assertEqual(content, photo.read_bytes())
+        self.assertFalse(engine.has_pending())
+
+    def test_a_slot_path_of_260_still_recycles_and_undoes(self):
+        """F-117: the slot is refused, and the restore copy behind it must work."""
+        base = self.tmp / "lib"
+        deep = self.folder_of_length(base, 207, "deep_folder")
+        photo = self.write(deep / "a.JPG", b"photo" * 300)
+        content = photo.read_bytes()
+        self.assertEqual(260, len(str(deep / safestore.TRASH_DIR / ("0" * 32 + ".JPG"))))
+        self.refuse_long_staged_copies()
+        engine = self.engine_over(base)
+        engine.trash(photo)
+        self.assertFalse(photo.exists())
+        self.assertFalse((deep / safestore.TRASH_DIR).exists(), "a 260-character slot was used")
+        engine.undo()
+        self.assertEqual(content, photo.read_bytes())
+        self.assertFalse(engine.has_pending())
+
+    def test_undoing_a_replace_in_a_deep_folder(self):
+        source = self.tmp / "lib"
+        new = self.write(source / "IMG_0003.JPG", b"NEW" * 300)
+        target = self.folder_of_length(self.tmp, 217, "replace_target")
+        old = self.write(target / "IMG_0003.JPG", b"OLD" * 400)
+        self.refuse_long_staged_copies()
+        engine = self.engine_over(source)
+        engine.classify(config.Binding(key="1", action="move", folder=str(target)), new,
+                        resolver=lambda a, b: ops.CONFLICT_REPLACE)
+        self.assertTrue(old.read_bytes().startswith(b"NEW"))
+        engine.undo()
+        self.assertTrue(old.read_bytes().startswith(b"OLD"), "the replaced file did not come back")
+        self.assertFalse(engine.has_pending())
 
 
 class ExclusionTests(TempCase):

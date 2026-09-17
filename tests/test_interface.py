@@ -45,6 +45,14 @@ class QtCase(TempCase):
             QTest.qWait(20)
         return bool(predicate())
 
+    def until(self, predicate, message: str, timeout: float = 20.0) -> None:
+        """Wait for what was supposed to happen, not for a fixed delay.
+
+        Anything that arrives on a worker thread -- a thumbnail, a queued
+        move -- lands a beat after the call that asked for it.
+        """
+        self.assertTrue(self.wait_until(predicate, timeout), message)
+
 
 class WindowCase(QtCase):
     """A real window over eight photographs, sorting synchronously."""
@@ -143,6 +151,99 @@ class RecycleTests(WindowCase):
 
 
 @unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
+class RecoverExitTests(WindowCase):
+    """Recovery that cannot finish offers a way out; a clean start says nothing."""
+
+    def silence_warnings(self) -> None:
+        self.patch(QMessageBox, "warning",
+                   staticmethod(lambda *a, **k: QMessageBox.StandardButton.Ok))
+
+    def answers(self, answer: str) -> list:
+        from qingjian.ui.mainwindow import MainWindow
+        asked: list = []
+
+        def ask(_self, message, can_rollback):
+            asked.append(can_rollback)
+            return answer
+
+        self.patch(MainWindow, "_ask_recover_exit", ask)
+        return asked
+
+    def stuck_journal(self):
+        from qingjian.core.safestore import (Plan, SafeStore, TransactionError, identity,
+                                             step_move)
+        first, second = self.source / "IMG_0000.JPG", self.source / "IMG_0001.JPG"
+        target = self.tmp / "keep"
+        target.mkdir(exist_ok=True)
+        plan = Plan(forward=[step_move(first, target / first.name, identity(first)),
+                             step_move(second, target / second.name, identity(second))])
+        plan.inverse = SafeStore.invert(plan.forward)
+
+        def break_second(name, percent):
+            if name == second.name and second.exists():
+                second.write_bytes(b"changed while the plan was running")
+
+        with self.assertRaises(TransactionError):
+            self.engine.store.run(plan, progress=break_second)
+        self.assertTrue(self.engine.has_pending())
+        return first
+
+    def test_a_damaged_journal_offers_an_exit_instead_of_crashing(self):
+        self.silence_warnings()
+        asked = self.answers("keep")
+        self.engine.store.journal_path.write_text("{ not json", encoding="utf-8")
+        self.window.recover_pending()
+        self.app.processEvents()
+        self.assertEqual([False], asked, "a damaged journal cannot be rolled back")
+        self.assertFalse(self.engine.has_pending())
+
+    def test_a_recovery_that_cannot_finish_offers_to_roll_back(self):
+        self.silence_warnings()
+        first = self.stuck_journal()
+        asked = self.answers("rollback")
+        self.window.recover_pending()
+        self.app.processEvents()
+        self.assertEqual([True], asked)
+        self.assertTrue(first.is_file(), "the finished step was not rolled back")
+        self.assertFalse(self.engine.has_pending())
+
+    def test_trying_again_later_leaves_the_journal_and_the_files_alone(self):
+        """"Later" is the escape: nothing is undone, nothing is cleared."""
+        self.silence_warnings()
+        first = self.stuck_journal()
+        moved = self.tmp / "keep" / first.name
+        asked = self.answers("")
+        self.window.recover_pending()
+        self.app.processEvents()
+        self.assertEqual([True], asked)
+        self.assertTrue(self.engine.has_pending(), "the pending operation was cleared anyway")
+        self.assertFalse(first.exists(), "the finished step was rolled back without being asked")
+        self.assertTrue(moved.is_file())
+
+    def test_cancelling_the_rollback_keeps_the_journal_and_says_so(self):
+        from qingjian.core.engine import Engine
+        from qingjian.core.safestore import Cancelled
+        self.silence_warnings()
+        self.stuck_journal()
+        self.answers("rollback")
+
+        def cancelled(_self, rollback, progress=None):
+            raise Cancelled("cancelled")
+
+        self.patch(Engine, "abandon_pending", cancelled)
+        self.window.recover_pending()
+        self.app.processEvents()
+        self.assertTrue(self.engine.has_pending(), "the journal went away on a cancel")
+
+    def test_a_clean_start_asks_nothing(self):
+        """The exit is for failures only; it must never look like a delete confirmation."""
+        self.silence_warnings()
+        asked = self.answers("keep")
+        self.window.recover_pending()
+        self.app.processEvents()
+        self.assertEqual([], asked)
+
+
 class BackgroundQueueTests(WindowCase):
     """The shipped default: keys file photographs on the queue thread.
 
@@ -174,10 +275,6 @@ class BackgroundQueueTests(WindowCase):
         self.activate()
         QTest.keyClick(self.window, key, modifier)
         self.assertTrue(self.settled(), "the queue never went idle")
-
-    def until(self, predicate, message: str, timeout: float = 20.0) -> None:
-        """Wait for what the key was supposed to do, not for a fixed delay."""
-        self.assertTrue(self.wait_until(predicate, timeout), message)
 
     def slow_classify(self, seconds: float = 15.0):
         """Hold the next queued classify open, so the queue is really busy.
@@ -593,16 +690,24 @@ class HoldArrowTests(WindowCase):
         self.patch(self.window.preview, "show_still", spy)
         self.hold()
         current = self.engine.current_path()
+        # Hold the settle back: it would render this very picture in full, and
+        # the case would then pass without the arrival being shown at all.
+        self.window._settle_timer.stop()
+        drawn = len(shown)
         self.window.thumbs.ready.emit(str(current), mainwindow.HOLD_EDGE, self.still())
-        self.app.processEvents()
-        self.assertEqual(current.name, shown[-1] if shown else None)
+        # The decoder's own thumbnails keep arriving for the pictures the hold
+        # went past, so wait for this one to be drawn rather than for it to be
+        # the last thing drawn.
+        self.until(lambda: current.name in shown[drawn:],
+                   f"the arrival was not shown; drew {shown[drawn:]}")
 
     def test_a_late_thumbnail_does_not_replace_the_full_render(self):
         from qingjian.ui import mainwindow
         self.hold()
         early = list(self.window._flipped)[0]
         self.right(press=False)
-        self.app.processEvents()
+        self.until(lambda: self.window.preview.current_path == self.engine.current_path(),
+                   "letting go never rendered the picture it stopped on")
         self.window.thumbs.ready.emit(early, mainwindow.HOLD_EDGE, self.still())
         self.app.processEvents()
         self.assertEqual(self.engine.current_path(), self.window.preview.current_path)
@@ -610,11 +715,14 @@ class HoldArrowTests(WindowCase):
     def test_a_lost_release_still_settles_on_the_picture(self):
         self.hold()
         name = self.engine.current_path().name
-        self.assertTrue(self.wait_until(lambda: self.rendered[-1] == name, 3.0),
-                        f"still showing {self.rendered[-1]}, not {name}")
+        self.until(lambda: self.rendered[-1] == name,
+                   f"the timer never settled; still showing {self.rendered[-1]}, not {name}")
 
     def test_the_settle_waits_for_an_open_dialog(self):
         self.hold()
+        # Only this case's own `timeout` may drive the settle, or the timer
+        # could go off while the dialog is still on its way up.
+        self.window._settle_timer.stop()
         drawn = len(self.rendered)
         dialog = QDialog(self.window)
         dialog.setModal(True)
@@ -626,8 +734,7 @@ class HoldArrowTests(WindowCase):
         self.assertEqual(drawn, len(self.rendered), "rendered in full behind a dialog")
         dialog.close()
         name = self.engine.current_path().name
-        self.assertTrue(self.wait_until(lambda: self.rendered[-1] == name, 3.0),
-                        "never rendered after the dialog closed")
+        self.until(lambda: self.rendered[-1] == name, "never rendered after the dialog closed")
 
 
 @unittest.skipUnless(HAVE_QT, "PySide6 is not installed")

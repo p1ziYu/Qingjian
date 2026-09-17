@@ -132,6 +132,15 @@ class Engine:
             self.store.sweep_partials(self._folders_in_play())
         return done
 
+    def abandon_pending(self, rollback: bool, progress=_noop) -> bool:
+        """The way out of a journal that can never be replayed (see SafeStore.abandon)."""
+        done = self.store.abandon(rollback, progress, save_state=self.state.apply)
+        if self.source_root:
+            self.store.sweep_partials(self._folders_in_play())
+        # Files moved back or left where they are: the per-folder name index is stale.
+        self._stem_index.clear()
+        return done
+
     def _folders_in_play(self) -> list[Path]:
         folders = set(self.settings.target_folders())
         if self.source_root:

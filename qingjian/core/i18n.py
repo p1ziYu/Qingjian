@@ -111,6 +111,16 @@ CATALOG: dict[str, tuple[str, str]] = {
     "tool.stats": ("统计 / 导出", "Stats / Export"),
     "tool.backups": ("备份管理", "Backups"),
     "tool.recover": ("恢复未完成操作", "Finish pending operation"),
+    "recover.exit_text": (
+        "未完成的操作没能恢复：\n{error}\n\n"
+        "可以撤回这次操作已完成的部分，或者保留文件现在的样子并清除这条未完成记录。",
+        "The pending operation could not be finished:\n{error}\n\n"
+        "You can undo the part that already ran, or keep the files as they are now "
+        "and clear the pending operation.",
+    ),
+    "recover.rollback": ("撤回已完成的部分", "Undo the part that ran"),
+    "recover.keep": ("保留现状", "Keep files as they are"),
+    "recover.later": ("稍后再试", "Try again later"),
     "tool.info": ("信息", "Info"),
     "tool.more": ("更多", "More"),
     "tool.rotate_left": ("预览向左转（不改动文件）", "Turn the preview left (the file is not changed)"),
@@ -172,6 +182,11 @@ CATALOG: dict[str, tuple[str, str]] = {
     "status.undo_done": ("撤销完成", "Undone"),
     "status.redo_done": ("已恢复上一步", "Redone"),
     "status.recover_done": ("恢复检查完成", "Recovery check complete"),
+    "status.recover_rolled_back": ("已撤回未完成的操作", "The pending operation was undone"),
+    "status.recover_kept": (
+        "已保留现状，未完成记录已清除",
+        "Files kept as they are; the pending operation was cleared",
+    ),
     "status.session_progress": ("本次已处理 {done} / {total}", "{done} / {total} handled"),
     "status.snapshot_usage": ("快照 {used} / {cap}", "Snapshots {used} / {cap}"),
     "status.snapshot_manage": ("管理", "Manage"),
@@ -226,6 +241,15 @@ CATALOG: dict[str, tuple[str, str]] = {
         "The restore copy is missing or damaged: {path}",
     ),
     "error.changed_midway": ("文件在操作期间改变：{path}", "The file changed during the operation: {path}"),
+    "error.plan_collision": (
+        "同一次操作里有两个文件要用同一个位置，已停止，文件未改动：{path}",
+        "Stopped before changing anything: two files in this operation need the same "
+        "place: {path}",
+    ),
+    "error.journal_damaged": (
+        "未完成操作的记录已损坏，无法继续恢复",
+        "The record of the pending operation is damaged and cannot be replayed",
+    ),
     "error.copy_verify": ("副本校验失败：{path}", "Copy verification failed: {path}"),
     "error.source_changed": ("复制期间源文件发生变化：{path}", "The source changed while copying: {path}"),
     "error.not_regular_file": ("仅处理普通文件：{path}", "Only regular files are handled: {path}"),

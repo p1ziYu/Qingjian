@@ -1,4 +1,5 @@
 import os
+import subprocess
 from datetime import datetime
 
 from base import TempCase, unittest
@@ -22,6 +23,16 @@ class ScannerTests(TempCase):
     def tearDown(self):
         self.state.close()
         super().tearDown()
+
+    def test_unusual_digits_sort_instead_of_raising(self):
+        folder = self.tmp / "odd"
+        paths = [self.write(folder / name, b"x" * 64)
+                 for name in ("\u246010.jpg", "\u24602.jpg", "1\u00b23.jpg")]
+        self.assertEqual(["\u24602.jpg", "\u246010.jpg"],
+                         [p.name for p in scanner.sort_paths(paths[:2], "name")])
+        for mode in scanner.SORTS:
+            with self.subTest(mode=mode):
+                scanner.sort_paths(paths, mode, ratings={})
 
     def test_recursive_and_flat_scans_differ(self):
         self.assertEqual(0, len(scanner.scan(self.root, recursive=False)))
@@ -361,6 +372,20 @@ class EngineTests(TempCase):
         with self.assertRaises(Exception):
             self.engine.open_folder(self.tmp / "nope")
 
+    def test_a_cancelled_open_keeps_the_previous_folder(self):
+        other = self.tmp / "other"
+        self.write(other / "z.jpg", b"x" * 64)
+        self.assertGreater(len(self.engine.queue_paths), 3)
+        self.engine.index = 3
+        shown = self.engine.current_path()
+        with self.assertRaises(Cancelled):
+            self.engine.open_folder(other, cancel=lambda: True)
+        self.assertEqual(self.root.resolve(), self.engine.source_root)
+        self.assertEqual(3, self.engine.index)
+        self.assertEqual(shown, self.engine.current_path())
+        self.assertEqual(str(self.root.resolve()), self.engine.settings.source_folder)
+        self.assertFalse(self.engine.review_mode)
+
     def test_classify_move_and_undo(self):
         self.engine.go_to(self.root / "Day3" / "IMG_5511.JPG")
         outcome = self.engine.classify(self.engine.settings.bindings[0])
@@ -581,6 +606,103 @@ class EngineTests(TempCase):
         self.assertEqual("512 B", human_size(512))
         self.assertEqual("1.0 KB", human_size(1024))
         self.assertEqual("1.0 GB", human_size(1024 ** 3))
+
+
+def _junction(link, target) -> bool:
+    if os.name != "nt":
+        return False
+    done = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                          capture_output=True)
+    return done.returncode == 0 and os.path.isjunction(link)
+
+
+class JunctionTests(TempCase):
+    def setUp(self):
+        super().setUp()
+        self.src = self.tmp / "src"
+        self.real = self.src / "real"
+        self.only = self.write(self.real / "only.jpg", bytes(range(256)) * 64)
+        self.link = self.src / "link"
+        if not _junction(self.link, self.real):
+            self.skipTest("directory junctions unavailable")
+        self.addCleanup(self.drop, self.link)
+
+    def drop(self, link) -> None:
+        try:
+            os.rmdir(link)
+        except OSError:
+            pass
+
+    def test_a_junction_is_not_walked_into(self):
+        self.assertEqual([self.only], scanner.scan(self.src, recursive=True))
+
+    def test_one_file_reached_twice_is_not_a_duplicate(self):
+        self.assertEqual([], dedupe.find_exact([self.link / "only.jpg", self.only]))
+
+    def test_a_self_referential_junction_still_finishes(self):
+        loop = self.src / "loop"
+        if not _junction(loop, self.src):
+            self.skipTest("directory junctions unavailable")
+        self.addCleanup(self.drop, loop)
+        self.assertEqual([self.only], scanner.scan(self.src, recursive=True))
+
+    def test_a_file_under_a_junction_does_not_belong(self):
+        settings = config.Settings()
+        settings.recursive = True
+        engine = Engine(self.data, settings)
+        self.addCleanup(engine.close)
+        engine.open_folder(self.src)
+        self.assertFalse(engine._belongs(self.link / "only.jpg", engine.source_root, []))
+
+
+class PrunedTargetTests(TempCase):
+    def setUp(self):
+        super().setUp()
+        self.root = self.tmp / "lib"
+        self.write(self.root / "sub" / "deep.jpg", b"x" * 64)
+        self.write(self.root / "top.jpg", b"x" * 64)
+
+    def names(self, excluded):
+        return sorted(p.name for p in scanner.scan(self.root, True, excluded=excluded))
+
+    def test_a_target_at_or_above_the_root_prunes_nothing(self):
+        self.assertEqual(["deep.jpg", "top.jpg"], self.names([self.root]))
+        self.assertEqual(["deep.jpg", "top.jpg"], self.names([self.root.parent]))
+
+    def test_a_target_below_the_root_is_still_pruned(self):
+        self.assertEqual(["top.jpg"], self.names([self.root / "sub"]))
+
+
+class BelongsTests(TempCase):
+    def setUp(self):
+        super().setUp()
+        self.lib = self.tmp / "lib"
+        self.inbox = self.lib / "inbox"
+        for name in ("a.jpg", "b.jpg"):
+            self.write(self.inbox / name, b"x" * 64)
+        settings = config.Settings()
+        settings.recursive = True
+        settings.bindings[0].action = "move"
+        settings.bindings[0].folder = str(self.lib)
+        self.engine = Engine(self.data, settings)
+        self.engine.open_folder(self.inbox)
+        self.addCleanup(self.engine.close)
+
+    def test_an_undone_recycle_returns_to_the_queue(self):
+        photo = self.inbox / "a.jpg"
+        self.engine.absorb(self.engine.trash(photo).record)
+        self.assertNotIn(photo, self.engine.queue_paths)
+        change = self.engine.absorb(self.engine.undo().record)
+        self.assertEqual([photo], [path for _where, path in change["added"]])
+        self.assertIn(photo, self.engine.queue_paths)
+
+    def test_a_favourite_target_equal_to_the_source_also_belongs(self):
+        settings = self.engine.settings
+        settings.bindings[0].action = "favorite"
+        settings.bindings[0].folder = str(self.inbox)
+        self.assertTrue(self.engine._belongs(
+            self.inbox / "b.jpg", self.engine.source_root,
+            scanner.pruned_targets(self.engine.source_root, settings.target_folders())))
 
 
 if __name__ == "__main__":

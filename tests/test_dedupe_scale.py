@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import os
 import threading
 from collections import defaultdict
 from pathlib import Path
@@ -22,6 +23,16 @@ PACKAGE = ROOT / "qingjian"
 
 class ExactPrefilterTests(TempCase):
     """Byte-identical files, without reading the library end to end."""
+
+    def test_one_file_under_two_names_is_not_reclaimable(self):
+        folder = self.tmp / "links"
+        original = self.write(folder / "shot.jpg", b"L" * (16 << 10))
+        alias = folder / "alias.jpg"
+        try:
+            os.link(original, alias)
+        except (OSError, NotImplementedError, AttributeError):
+            self.skipTest("hard links unavailable")
+        self.assertEqual([], dedupe.find_exact([original, alias]))
 
     def library(self) -> list[Path]:
         """Files that share sizes without sharing content, plus real twins."""

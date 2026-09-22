@@ -1589,5 +1589,21 @@ class G03EditorTests(QtCase):
         self.assertIn("0004_", editor2.preview.item(0).text())
 
 
+class OpenFolderFailureTests(WindowCase):
+    def test_an_unexpected_scan_failure_is_reported(self):
+        shown = []
+        self.patch(QMessageBox, "warning", staticmethod(lambda *a, **k: shown.append(a)))
+
+        def explode(folder, progress=None, cancel=None):
+            raise ValueError("invalid literal for int() with base 10: '\u2460'")
+
+        self.patch(self.engine, "open_folder", explode)
+        self.window.open_folder(self.tmp / "other")
+        self.app.processEvents()
+        self.assertTrue(shown, "the failure was never shown")
+        self.assertFalse(self.window._busy)
+        self.assertEqual("error", self.window.status_label.property("tone"))
+
+
 if __name__ == "__main__":
     unittest.main()

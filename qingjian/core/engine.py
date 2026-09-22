@@ -43,8 +43,7 @@ def _never() -> bool:
 class _FolderIndex:
     """One folder's files, grouped by the stem that identifies a shot.
 
-    ``mine`` records that the last change to this directory was one this
-    program made and already applied, so the stamp does not need distrusting.
+    ``mine`` records that the entry came from a fresh listing after our change.
     """
 
     buckets: dict[str, list[Path]]
@@ -152,12 +151,20 @@ class Engine:
         root = Path(folder).expanduser()
         if not root.is_dir():
             raise TransactionError("error.folder_missing", str(root))
+        previous = (self.source_root, self.settings.source_folder, self.review_mode,
+                    self.index, self.all_files, self.queue_paths)
         self.source_root = root.resolve()
         self.settings.source_folder = str(self.source_root)
         self.review_mode = False
         self.index = 0
         self._stem_index.clear()
-        return self.rescan(progress, cancel)
+        try:
+            return self.rescan(progress, cancel)
+        except BaseException:
+            (self.source_root, self.settings.source_folder, self.review_mode,
+             self.index, self.all_files, self.queue_paths) = previous
+            self._stem_index.clear()
+            raise
 
     def rescan(self, progress=_noop, cancel=_never) -> int:
         if not self.source_root:
@@ -324,25 +331,38 @@ class Engine:
             settled = entry.mine or (now - stamp[1]) > self.INDEX_GRACE_SECONDS
             if settled and (now - entry.listed_at) < self.INDEX_MAX_AGE_SECONDS:
                 return entry.buckets
+        buckets = self._bucket_folder(folder)
+        if buckets is None:
+            self._stem_index.pop(key, None)
+            return {}
+        self._stem_index[key] = _FolderIndex(buckets, stamp, now, False)
+        return buckets
+
+    @staticmethod
+    def _bucket_folder(folder: Path) -> dict[str, list[Path]] | None:
         buckets: dict[str, list[Path]] = {}
         try:
             for item in folder.iterdir():
                 buckets.setdefault(sidecar_mod.base_stem(item).casefold(), []).append(item)
         except OSError:
-            buckets = {}
-        self._stem_index[key] = _FolderIndex(buckets, self._folder_stamp(folder), now, False)
+            return None
         return buckets
 
     def _index_entry(self, folder: Path):
         entry = self._stem_index.get(str(folder))
         return entry.buckets if entry else None
 
-    def _restamp(self, folder: Path) -> None:
-        """Accept the folder's new state: this program is what changed it."""
-        entry = self._stem_index.get(str(folder))
-        if entry:
-            entry.stamp = self._folder_stamp(folder)
-            entry.mine = True
+    def _refresh_index(self, folder: Path) -> None:
+        """Re-list an indexed folder after our work; include outside writes."""
+        key = str(folder)
+        if key not in self._stem_index:
+            return
+        stamp = self._folder_stamp(folder)
+        buckets = self._bucket_folder(folder)
+        if buckets is None:
+            del self._stem_index[key]
+            return
+        self._stem_index[key] = _FolderIndex(buckets, stamp, time.time(), True)
 
     def _index_forget(self, path: Path) -> None:
         index = self._index_entry(path.parent)
@@ -351,7 +371,6 @@ class Engine:
         bucket = index.get(sidecar_mod.base_stem(path).casefold())
         if bucket and path in bucket:
             bucket.remove(path)
-        self._restamp(path.parent)
 
     def _index_note(self, path: Path) -> None:
         index = self._index_entry(path.parent)
@@ -360,7 +379,6 @@ class Engine:
         bucket = index.setdefault(sidecar_mod.base_stem(path).casefold(), [])
         if path not in bucket:
             bucket.append(path)
-        self._restamp(path.parent)
 
     def listing_for(self, folder: Path) -> list[Path]:
         """Every indexed entry of *folder*, for callers that want them all."""
@@ -450,14 +468,19 @@ class Engine:
         if record is None:
             return
         payload = record.payload or {}
+        touched: dict[str, Path] = {}
         for moved in payload.get("paths") or []:
             candidate = Path(moved)
+            touched.setdefault(str(candidate.parent), candidate.parent)
             if not candidate.exists():
                 self._index_forget(candidate)
         for created in payload.get("targets") or []:
             candidate = Path(created)
+            touched.setdefault(str(candidate.parent), candidate.parent)
             if candidate.exists():
                 self._index_note(candidate)
+        for folder in touched.values():
+            self._refresh_index(folder)
 
     def _note(self, record: Record) -> None:
         self.stats.ids.add(record.id)
@@ -707,7 +730,7 @@ class Engine:
         removed: list[Path] = []
         metadata.forget(touched)
         root = self.source_root
-        excluded = [Path(f) for f in self.settings.target_folders()]
+        excluded = scanner.pruned_targets(root, self.settings.target_folders())
         spec = self._filter_spec(touched)
         queued = set(self.queue_paths)
         known = set(self.all_files)
@@ -762,18 +785,7 @@ class Engine:
         """
         if self.source_root is None or not self.settings.recursive:
             return None
-        blocked = []
-        for folder in self.settings.target_folders():
-            try:
-                resolved = Path(folder).resolve()
-            except (OSError, RuntimeError):
-                continue
-            # Strictly below the root. `scan` only ever prunes subdirectories, so
-            # a destination that *is* the source folder excludes nothing -- and
-            # treating it as exclusion emptied the whole library on one mis-click
-            # in the folder picker, which opens at the source folder.
-            if resolved != self.source_root and resolved.is_relative_to(self.source_root):
-                blocked.append(resolved)
+        blocked = scanner.pruned_targets(self.source_root, self.settings.target_folders())
         if not blocked:
             return None
 
@@ -857,26 +869,23 @@ class Engine:
                                 self.capture_time)
 
     def _belongs(self, path: Path, root: Path, excluded: Sequence[Path]) -> bool:
-        """Would `scan` have returned *path* for the current source folder?"""
+        """Would `scan` return *path*? *excluded* is resolved and pruned."""
         try:
             if not path.is_file() or path.is_symlink():
                 return False
             if path.suffix.lower() not in mediatypes.MEDIA_EXTENSIONS:
                 return False
             parent = path.parent.resolve()
+            if parent != path.parent:
+                return False
             if parent != root and not (self.settings.recursive
                                        and parent.is_relative_to(root)):
                 return False
             # The recycle folder and anything else `scan` steps over.
             if any(part.startswith(".qingjian") for part in parent.relative_to(root).parts):
                 return False
-            for folder in excluded:
-                try:
-                    resolved = Path(folder).resolve()
-                except (OSError, RuntimeError):
-                    continue
-                if parent == resolved or parent.is_relative_to(resolved):
-                    return False
+            if any(parent == folder or parent.is_relative_to(folder) for folder in excluded):
+                return False
         except (OSError, RuntimeError, ValueError):
             return False
         return True

@@ -1,3 +1,6 @@
+import os
+from pathlib import Path
+
 from base import TempCase, unittest
 from qingjian.core import mediatypes
 from qingjian.core.sidecar import (KIND_LIVE, KIND_METADATA, KIND_RAW, SidecarRules,
@@ -115,6 +118,89 @@ class SidecarTests(TempCase):
         except (OSError, NotImplementedError):
             self.skipTest("symlinks unavailable")
         self.assertEqual(1, find_group(folder / "IMG_1.JPG").count)
+
+
+class CompanionIndexTests(TempCase):
+    def build(self, name: str):
+        from qingjian.core import config
+        from qingjian.core.engine import Engine
+        source = self.tmp / name / "src"
+        target = self.tmp / name / "dst"
+        settings = config.Settings()
+        settings.bindings[0].action = "move"
+        settings.bindings[0].folder = str(target)
+        settings.bindings[0].name_template = "{name}"
+        engine = Engine(self.tmp / name / "data", settings)
+        self.addCleanup(engine.close)
+        return source, target, engine
+
+    def age(self, folder: Path) -> None:
+        old = os.stat(folder).st_mtime - 10
+        os.utime(folder, (old, old))
+
+    def test_an_outside_write_during_our_move_is_not_swallowed(self):
+        source, target, engine = self.build("during")
+        self.write(source / "a.jpg", b"x" * 64)
+        self.write(source / "b.jpg", b"y" * 64)
+        engine.open_folder(source)
+        real_run = engine.store.run
+
+        def run_and_write(plan, *args, **kwargs):
+            (source / "b.xmp").write_text("<x/>", encoding="utf-8")
+            return real_run(plan, *args, **kwargs)
+
+        engine.store.run = run_and_write
+        engine.classify(engine.settings.bindings[0], source / "a.jpg")
+        engine.store.run = real_run
+        engine.classify(engine.settings.bindings[0], source / "b.jpg")
+        self.assertEqual(["a.jpg", "b.jpg", "b.xmp"], self.tree(target))
+
+    def test_a_failed_listing_is_not_cached(self):
+        source, target, engine = self.build("failed")
+        self.write(source / "c.jpg", b"x" * 64)
+        (source / "c.xmp").write_text("<x/>", encoding="utf-8")
+        self.age(source)
+        engine.open_folder(source)
+        engine._stem_index.clear()
+        real_iterdir = Path.iterdir
+        fail = {"once": True}
+
+        def flaky(self):
+            if fail["once"] and self == source:
+                fail["once"] = False
+                raise OSError(59, "simulated")
+            return real_iterdir(self)
+
+        Path.iterdir = flaky
+        self.addCleanup(setattr, Path, "iterdir", real_iterdir)
+        engine.group_for(source / "c.jpg")
+        Path.iterdir = real_iterdir
+        engine.classify(engine.settings.bindings[0], source / "c.jpg")
+        self.assertEqual(["c.jpg", "c.xmp"], self.tree(target))
+
+    def test_a_file_written_during_the_listing_is_seen(self):
+        source, target, engine = self.build("listing")
+        self.write(source / "d.jpg", b"x" * 64)
+        engine.open_folder(source)
+        engine.INDEX_GRACE_SECONDS = 0.0
+        engine._stem_index.clear()
+        self.age(source)
+        real_iterdir = Path.iterdir
+        added = {"done": False}
+
+        def listing_then_write(self):
+            items = list(real_iterdir(self))
+            if self == source and not added["done"]:
+                added["done"] = True
+                (source / "d.xmp").write_text("<x/>", encoding="utf-8")
+            return iter(items)
+
+        Path.iterdir = listing_then_write
+        self.addCleanup(setattr, Path, "iterdir", real_iterdir)
+        engine.group_for(source / "d.jpg")
+        Path.iterdir = real_iterdir
+        engine.classify(engine.settings.bindings[0], source / "d.jpg")
+        self.assertEqual(["d.jpg", "d.xmp"], self.tree(target))
 
 
 if __name__ == "__main__":

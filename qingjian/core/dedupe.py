@@ -42,15 +42,22 @@ def _never() -> bool:
 
 
 def _sized(paths: Sequence[Path], minimum: int = MIN_SIZE) -> list[tuple[Path, int]]:
-    """Files that exist and are worth comparing, with their sizes."""
+    """Files worth comparing, keeping one name for each physical file."""
     out: list[tuple[Path, int]] = []
+    seen: set[tuple[int, int]] = set()
     for path in paths:
         try:
             stat = path.stat()
         except OSError:
             continue
-        if stat.st_size >= minimum:
-            out.append((path, stat.st_size))
+        if stat.st_size < minimum:
+            continue
+        identity = (stat.st_dev, stat.st_ino)
+        if identity[1]:
+            if identity in seen:
+                continue
+            seen.add(identity)
+        out.append((path, stat.st_size))
     return out
 
 

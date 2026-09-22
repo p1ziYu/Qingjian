@@ -829,10 +829,12 @@ class MainWindow(QMainWindow):
             self._with_progress(tr("scan.scanning"),
                                 lambda progress, cancel: self.engine.open_folder(
                                     folder, progress, cancel))
-        except TransactionError as error:
-            self._report(error)
-            return
         except Cancelled:
+            self._after_queue_change("")
+            return
+        except Exception as error:      # noqa: BLE001 - report every scan failure
+            self._report(error)
+            self._after_queue_change("")
             return
         self.preloader.clear()
         self._update_slip()

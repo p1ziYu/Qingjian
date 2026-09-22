@@ -32,13 +32,30 @@ _NUMBER = re.compile(r"(\d+)")
 
 
 def natural_key(path: Path) -> list:
-    return [int(part) if part.isdigit() else part.casefold()
+    return [int(part) if part.isdecimal() else part.casefold()
             for part in _NUMBER.split(path.name)]
+
+
+def pruned_targets(root: str | Path, targets: Sequence[str | Path]) -> list[Path]:
+    """Resolved destinations strictly below the source root, once per scan."""
+    try:
+        base = Path(root).resolve()
+    except (OSError, RuntimeError):
+        return []
+    kept: list[Path] = []
+    for item in targets:
+        try:
+            resolved = Path(item).resolve()
+        except (OSError, RuntimeError):
+            continue
+        if resolved != base and resolved.is_relative_to(base):
+            kept.append(resolved)
+    return kept
 
 
 def scan(root: str | Path, recursive: bool = False, excluded: Sequence[Path] = (),
          progress: Progress = _noop, cancel: Cancel = _never) -> list[Path]:
-    """Every media file under *root*, skipping target trees and symlinks.
+    """Every media file under *root*, skipping targets, symlinks and junctions.
 
     The directory listing already says whether each entry is a file, a folder
     or a link. Asking every ``Path`` again is a system call per file, and on
@@ -46,12 +63,7 @@ def scan(root: str | Path, recursive: bool = False, excluded: Sequence[Path] = (
     thousand photographs, against a twentieth of a second for the listing.
     """
     root = Path(root)
-    blocked = []
-    for item in excluded:
-        try:
-            blocked.append(Path(item).resolve())
-        except (OSError, RuntimeError):
-            continue
+    blocked = pruned_targets(root, excluded)
     found: list[Path] = []
 
     def is_blocked(folder: Path) -> bool:
@@ -74,7 +86,7 @@ def scan(root: str | Path, recursive: bool = False, excluded: Sequence[Path] = (
                         raise Cancelled("cancelled")
                     name = entry.name
                     try:
-                        if entry.is_symlink():
+                        if entry.is_symlink() or entry.is_junction():
                             continue
                         if entry.is_dir(follow_symlinks=False):
                             if recursive and not name.startswith(".qingjian") \

@@ -375,6 +375,13 @@ class Engine:
         target = Path(path)
         return self.planner.group_for(target, self.siblings_of(target))
 
+    def _operation_group(self, group: sidecar_mod.SidecarGroup) -> sidecar_mod.SidecarGroup:
+        rules = self.settings.sidecar
+        if rules.enabled and rules.prompt == sidecar_mod.PROMPT_NEVER:
+            return sidecar_mod.SidecarGroup(group.master,
+                [member for member in group.members if member.path == group.master])
+        return group
+
     # ------------------------------------------------------ operations
     @contextmanager
     def exclusive(self):
@@ -471,7 +478,8 @@ class Engine:
     def classify(self, binding: config.Binding, path: str | Path | None = None,
                  resolver: ops.Resolver = ops.always_sequence,
                  progress=_noop, cancel=_never,
-                 group: sidecar_mod.SidecarGroup | None = None) -> ops.Outcome:
+                 group: sidecar_mod.SidecarGroup | None = None,
+                 allow_system: bool = True) -> ops.Outcome:
         target = Path(path) if path else self.current_path()
         if target is None:
             return ops.Outcome(skipped=True)
@@ -479,7 +487,7 @@ class Engine:
             platform_.reveal(target)
             return ops.Outcome(skipped=True, message_key="status.revealed")
         with self.exclusive():
-            group = group if group is not None else self.group_for(target)
+            group = self._operation_group(group if group is not None else self.group_for(target))
             action = binding.action
             if action in ("move", "copy", "favorite"):
                 outcome = self.planner.plan_folder_action(action, group, binding,
@@ -487,8 +495,7 @@ class Engine:
             elif action == "skip":
                 outcome = self.planner.plan_skip(group, self.source_root or target.parent)
             elif action == "trash":
-                outcome = self.planner.plan_trash(group, self.source_root)
-                return self._commit_trash(outcome, group, progress, cancel)
+                return self._commit_trash(group, progress, cancel, allow_system)
             else:
                 return ops.Outcome(skipped=True)
             return self._commit(outcome, progress, cancel)
@@ -523,17 +530,17 @@ class Engine:
                 self.state.rename_tag(str(target), result.record.destination)
             return result
 
-    def trash(self, path: str | Path | None = None, progress=_noop, cancel=_never) -> ops.Outcome:
+    def trash(self, path: str | Path | None = None, progress=_noop, cancel=_never,
+              allow_system: bool = True) -> ops.Outcome:
         target = Path(path) if path else self.current_path()
         if target is None:
             return ops.Outcome(skipped=True)
         with self.exclusive():
-            group = self.group_for(target)
-            outcome = self.planner.plan_trash(group, self.source_root)
-            return self._commit_trash(outcome, group, progress, cancel)
+            group = self._operation_group(self.group_for(target))
+            return self._commit_trash(group, progress, cancel, allow_system)
 
-    def _commit_trash(self, outcome: ops.Outcome, group: sidecar_mod.SidecarGroup,
-                      progress, cancel) -> ops.Outcome:
+    def _commit_trash(self, group: sidecar_mod.SidecarGroup,
+                      progress, cancel, allow_system: bool = True) -> ops.Outcome:
         """Recycle, honouring the single-copy setting.
 
         The previous version always kept an application snapshot *and* pushed a
@@ -542,25 +549,55 @@ class Engine:
         the file itself is now the default when the user asks for the system
         bin at all.
         """
-        if self.settings.recycle_mode == config.RECYCLE_SYSTEM and platform_.trash_available():
+        system_requested = self.settings.recycle_mode == config.RECYCLE_SYSTEM
+        if (system_requested and allow_system and platform_.trash_available()
+                and all(platform_.can_recycle(m.path, group.total_bytes())
+                        for m in group.members)):
             paths = [m.path for m in group.members]
-            record = Record(id=uuid.uuid4().hex, action="trash", original=str(group.master),
-                            root=str(self.source_root or group.master.parent),
-                            undoable=False,
-                            bytes=sum(m.size for m in group.members),
-                            payload={"forward": [], "inverse": [],
-                                     "paths": [str(p) for p in paths],
-                                     "system_recycle": True})
-            for member in paths:
-                platform_.move_to_trash(member)
-            delta = self.planner._delta_for(record, group, "trash")
-            self.state.apply(delta)
-            self._note(record)
-            self._discard_orphans()
-            for member in paths:
-                self._index_forget(member)
-            return ops.Outcome(record=record, delta=delta)
-        return self._commit(outcome, progress, cancel)
+            if not paths:
+                return ops.Outcome(skipped=True)
+            for path in paths:
+                if not path.is_file() or path.is_symlink():
+                    raise OSError(f"Cannot recycle non-regular file: {path}")
+            sent: list[Path] = []
+            def commit_sent() -> ops.Outcome:
+                sent_group = sidecar_mod.SidecarGroup(group.master,
+                    [m for m in group.members if m.path in sent])
+                record = Record(id=uuid.uuid4().hex, action="trash", original=str(group.master),
+                                root=str(self.source_root or group.master.parent),
+                                undoable=False, bytes=sent_group.total_bytes(),
+                                payload={"forward": [], "inverse": [],
+                                         "paths": [str(p) for p in sent],
+                                         "system_recycle": True})
+                delta = self.planner._delta_for(record, sent_group, "trash")
+                if group.master not in sent:
+                    delta["reviews_remove"] = []
+                self.state.apply(delta)
+                self._note(record)
+                self._discard_orphans()
+                for path in sent:
+                    self._index_forget(path)
+                return ops.Outcome(record=record, delta=delta)
+            try:
+                for path in paths:
+                    platform_.move_to_trash(path)
+                    if path.exists():
+                        raise OSError(f"Recycle did not remove source: {path}")
+                    sent.append(path)
+            except OSError as error:
+                if not path.exists() and path not in sent:
+                    sent.append(path)
+                if sent:
+                    commit_sent()
+                remaining = ", ".join(str(p) for p in paths if p not in sent)
+                raise OSError(tr("status.partial_recycle", paths=remaining,
+                                 error=str(error))) from error
+            return commit_sent()
+        outcome = self.planner.plan_trash(group, self.source_root)
+        result = self._commit(outcome, progress, cancel)
+        if system_requested and result.record:
+            result.message_key = "status.soft_recycle_fallback"
+        return result
 
     def tag(self, paths: Sequence[Path], rating: int | None = None,
             label: str | None = None) -> ops.Outcome:
@@ -572,7 +609,8 @@ class Engine:
         return self.state.top(STACK_HISTORY) is not None
 
     def can_redo(self) -> bool:
-        return self.state.top(STACK_REDO, undoable_only=False) is not None
+        top = self.state.top(STACK_REDO, undoable_only=False)
+        return top is not None and top.undoable
 
     def undo(self, progress=_noop, cancel=_never) -> ops.Outcome:
         with self.exclusive():
@@ -594,6 +632,13 @@ class Engine:
         with self.exclusive():
             record = self.state.top(STACK_REDO, undoable_only=False)
             if record is None:
+                return ops.Outcome(skipped=True)
+            if not record.undoable:
+                from .state import empty_delta
+                delta = empty_delta()
+                delta["records_clear_stack"].append(STACK_REDO)
+                self.state.apply(delta)
+                self._discard_orphans()
                 return ops.Outcome(skipped=True)
             outcome = self.planner.plan_redo(record)
             result = self._commit_transition(outcome, progress, cancel)
@@ -971,8 +1016,12 @@ class Engine:
         if not force and not policy.automatic:
             return (0, 0)
         records = self.state.oldest_undoable(limit=5000)
-        rows = [{"time_epoch": r.time_epoch, "snapshots": r.snapshots} for r in records]
-        drop = reclaim_candidates(rows, policy)
+        rows = [{"time_epoch": r.time_epoch, "snapshots": r.snapshots,
+                 "snapshot_bytes": r.payload.get("snapshot_bytes", None)} for r in records]
+        for row in rows:
+            if row["snapshot_bytes"] is None:
+                del row["snapshot_bytes"]
+        drop = reclaim_candidates(rows, policy, keep_newest=not force)
         if not drop:
             return (0, 0)
         refs: list[str] = []
@@ -989,13 +1038,15 @@ class Engine:
         policy = self.settings.quota
         if not policy.automatic:
             return
-        # Cheap gate: only walk the history when the area is actually large.
-        if policy.max_bytes and self.store.usage() <= policy.max_bytes:
-            counts = self.state.counts()
-            if not policy.max_operations or counts["history"] + counts["redo"] <= policy.max_operations:
-                return
+        count, oldest = self.state.retention_gate()
+        over_count = policy.max_operations > 0 and count > policy.max_operations
+        over_age = (policy.max_days > 0 and oldest is not None
+                    and oldest < time.time() - policy.max_days * 86400)
+        over_bytes = policy.max_bytes > 0 and self.store.usage() > policy.max_bytes
+        if not (over_count or over_age or over_bytes):
+            return
         try:
-            self.reclaim(force=True)
+            self.reclaim()
         except OSError as error:  # pragma: no cover - defensive
             log.warning("reclaim failed: %s", error)
 

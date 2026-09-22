@@ -27,7 +27,7 @@ from ..core.i18n import LANGUAGE_CODES, get_language, set_language, tr
 from ..core.logsetup import get_logger
 from ..core.naming import NameError_
 from ..core.safestore import Cancelled, TransactionError
-from ..core.sidecar import PROMPT_ALWAYS, PROMPT_EACH, PROMPT_NEVER, PROMPT_ONCE
+from ..core.sidecar import PROMPT_ALWAYS, PROMPT_EACH, PROMPT_ONCE
 from . import icons, theme
 from .browsers import Filmstrip, ThumbnailGrid
 from .dialogs import BackupDialog, ConflictDialog, SidecarDialog, TableDialog
@@ -1529,7 +1529,7 @@ class MainWindow(QMainWindow):
 
     def _classify_one(self, binding: config.Binding, path: Path) -> bool:
         """File one item. True when an operation was started for it."""
-        group = self.engine.group_for(path)
+        group = self.engine._operation_group(self.engine.group_for(path))
         rules = self.settings.sidecar
         if group.sidecars and rules.enabled and binding.action in ("move", "copy", "favorite"):
             if rules.prompt in (PROMPT_EACH, PROMPT_ONCE):
@@ -1546,8 +1546,6 @@ class MainWindow(QMainWindow):
                     self.settings.sidecar = rules.with_prompt(PROMPT_ALWAYS)
                     self.engine.planner.settings = self.settings
                     self.engine.save_settings()
-            elif rules.prompt == PROMPT_NEVER:
-                group.members = [m for m in group.members if m.path == group.master]
 
         decision = ""
         if binding.action in ("move", "copy", "favorite"):
@@ -1591,7 +1589,8 @@ class MainWindow(QMainWindow):
         self._run_operation(
             path,
             lambda progress, cancel: self.engine.classify(
-                binding, path, resolver, progress, cancel, group=group),
+                binding, path, resolver, progress, cancel, group=group,
+                allow_system=self.settings.background_queue),
             f"{tr(config.ACTIONS[binding.action][0])} · {path.name}")
         return True
 
@@ -1653,6 +1652,8 @@ class MainWindow(QMainWindow):
             action_label = tr(config.ACTIONS.get(outcome.record.action, ("action.move",))[0])
             self.status(tr("status.done_action", action=action_label, name=path.name),
                         "success")
+        if outcome.message_key and not outcome.skipped:
+            self.status(tr(outcome.message_key), "warning")
         if not self.settings.background_queue:
             # Synchronous mode did a full rebuild per key press: on a folder of
             # twenty thousand files that is a sixth of a second of filtering and
@@ -1770,7 +1771,8 @@ class MainWindow(QMainWindow):
             # recycle the last item once per selected file.
             self._run_operation(
                 path,
-                lambda progress, cancel, target=path: self.engine.trash(target, progress, cancel),
+                lambda progress, cancel, target=path: self.engine.trash(
+                    target, progress, cancel, allow_system=self.settings.background_queue),
                 f"{tr('action.trash')} · {path.name}")
 
     def undo(self) -> None:

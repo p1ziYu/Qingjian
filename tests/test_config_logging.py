@@ -115,6 +115,115 @@ class LoggingTests(TempCase):
 
 
 class PlatformTests(TempCase):
+    def test_recycle_policy_percent_can_be_stricter_than_volume_limit(self):
+        import ctypes
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+        kernel, shell = Mock(), Mock()
+        kernel.GetDriveTypeW.return_value = 3
+        def space(_root, free, total, _unused):
+            free._obj.value = 100_000_000
+            total._obj.value = 100_000_000
+            return 1
+        def bin_usage(_root, info):
+            info._obj.i64Size = 900_000
+            return 0
+        kernel.GetDiskFreeSpaceExW.side_effect = space
+        shell.SHQueryRecycleBinW.side_effect = bin_usage
+        with patch.object(platform_, "IS_WINDOWS", True), \
+             patch.object(ctypes, "windll", SimpleNamespace(kernel32=kernel, shell32=shell)), \
+             patch.object(platform_, "_volume_recycle_limit", return_value=50_000_000), \
+             patch.object(platform_, "_recycle_policy", return_value=(1, True)) as policy:
+            self.assertFalse(platform_.can_recycle(self.tmp / "photo.jpg", 200_000))
+            policy.return_value = (None, False)
+            self.assertFalse(platform_.can_recycle(self.tmp / "photo.jpg", 1))
+            policy.return_value = None
+            self.assertFalse(platform_.can_recycle(self.tmp / "photo.jpg", 1))
+
+    def test_recycle_policy_registry_states_fail_closed(self):
+        import winreg
+        from unittest.mock import Mock, patch
+        key = Mock()
+        key.__enter__ = Mock(return_value=key)
+        key.__exit__ = Mock(return_value=False)
+        with patch.object(winreg, "OpenKey", return_value=key), \
+             patch.object(winreg, "QueryValueEx", side_effect=FileNotFoundError):
+            self.assertEqual((None, True), platform_._recycle_policy())
+        with patch.object(winreg, "OpenKey", side_effect=PermissionError):
+            self.assertIsNone(platform_._recycle_policy())
+        with patch.object(winreg, "OpenKey", return_value=key), \
+             patch.object(winreg, "QueryValueEx", side_effect=lambda _key, name: (
+                 ("bad", winreg.REG_SZ) if name == "RecycleBinSize" else
+                 (0, winreg.REG_DWORD))):
+            self.assertIsNone(platform_._recycle_policy())
+        with patch.object(winreg, "OpenKey", return_value=key), \
+             patch.object(winreg, "QueryValueEx", side_effect=lambda _key, name: (
+                 (1, winreg.REG_DWORD) if name == "NoRecycleFiles" else
+                 (5, winreg.REG_DWORD))):
+            self.assertEqual((5, False), platform_._recycle_policy())
+
+    def test_can_recycle_checks_fixed_volume_query_and_actual_capacity(self):
+        import ctypes
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+        kernel, shell = Mock(), Mock()
+        kernel.GetDriveTypeW.return_value = 3
+        def free_space(_root, free, total, _unused):
+            free._obj.value = 2_000_000
+            total._obj.value = 100_000_000
+            return 1
+        def bin_query(_root, info):
+            info._obj.i64Size = 500_000
+            return 0
+        kernel.GetDiskFreeSpaceExW.side_effect = free_space
+        shell.SHQueryRecycleBinW.side_effect = bin_query
+        with patch.object(platform_, "IS_WINDOWS", True), \
+             patch.object(ctypes, "windll", SimpleNamespace(kernel32=kernel, shell32=shell)), \
+             patch.object(platform_, "_volume_recycle_limit", return_value=1_000_000), \
+             patch.object(platform_, "_recycle_policy", return_value=(None, True)):
+            path = self.tmp / "photo.jpg"
+            self.assertTrue(platform_.can_recycle(path, 400_000))
+            self.assertFalse(platform_.can_recycle(path, 600_000))
+            kernel.GetDriveTypeW.return_value = 4
+            self.assertFalse(platform_.can_recycle(path, 1))
+            kernel.GetDriveTypeW.return_value = 3
+            shell.SHQueryRecycleBinW.return_value = 1
+            shell.SHQueryRecycleBinW.side_effect = None
+            self.assertFalse(platform_.can_recycle(path, 1))
+        with patch.object(platform_, "IS_WINDOWS", True), \
+             patch.object(ctypes, "windll", SimpleNamespace(kernel32=kernel, shell32=shell)), \
+             patch.object(platform_, "_volume_recycle_limit", return_value=None), \
+             patch.object(platform_, "_recycle_policy", return_value=(None, True)):
+            shell.SHQueryRecycleBinW.return_value = 0
+            self.assertFalse(platform_.can_recycle(self.tmp / "photo.jpg", 1))
+
+    def test_recycle_limit_reads_current_user_volume_setting(self):
+        import ctypes
+        import winreg
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+        kernel = Mock()
+        def volume_name(_root, buffer, _length):
+            buffer.value = "\\\\?\\Volume{12345678-1234-1234-1234-123456789abc}\\"
+            return 1
+        kernel.GetVolumeNameForVolumeMountPointW.side_effect = volume_name
+        key = Mock()
+        key.__enter__ = Mock(return_value=key)
+        key.__exit__ = Mock(return_value=False)
+        with patch.object(ctypes, "windll", SimpleNamespace(kernel32=kernel)), \
+             patch.object(winreg, "OpenKey", return_value=key) as opened, \
+             patch.object(winreg, "QueryValueEx", side_effect=[
+                 (10, winreg.REG_DWORD), (0, winreg.REG_DWORD)]):
+            self.assertEqual(10 * 1024 * 1024, platform_._volume_recycle_limit("E:\\"))
+        self.assertIn("{12345678-1234-1234-1234-123456789abc}", opened.call_args.args[1])
+
+    def test_system_recycle_rejects_unsupported_platform_and_unc(self):
+        from unittest.mock import patch
+        with patch.object(platform_, "IS_WINDOWS", False):
+            self.assertFalse(platform_.can_recycle(self.tmp / "photo.jpg"))
+        with patch.object(platform_, "IS_WINDOWS", True):
+            self.assertFalse(platform_.can_recycle(r"\\server\share\photo.jpg"))
+
     def test_reserved_names(self):
         self.assertTrue(platform_.is_reserved_name("CON"))
         self.assertTrue(platform_.is_reserved_name("com1.txt"))

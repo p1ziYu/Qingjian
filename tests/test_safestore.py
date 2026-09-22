@@ -551,6 +551,19 @@ class VerificationTests(StoreCase):
 
 
 class QuotaTests(StoreCase):
+    def test_cached_snapshot_size_avoids_stat(self):
+        from unittest.mock import patch
+        rows = [{"time_epoch": 1, "snapshots": ["missing"], "snapshot_bytes": 1000},
+                {"time_epoch": 2, "snapshots": ["missing"], "snapshot_bytes": 1000}]
+        policy = QuotaPolicy(max_operations=0, max_bytes=1500, max_days=0)
+        with patch("pathlib.Path.stat", side_effect=AssertionError("stat called")):
+            self.assertEqual([0], reclaim_candidates(rows, policy, now=3))
+
+    def test_byte_limit_spares_newest_and_empty_records(self):
+        rows, now = self.rows([3, 2, 1], sizes=[0, 1000, 5000])
+        policy = QuotaPolicy(max_operations=0, max_bytes=1500, max_days=0)
+        self.assertEqual([1], reclaim_candidates(rows, policy, now, keep_newest=True))
+
     def rows(self, ages_days, sizes=None):
         now = time.time()
         sizes = sizes or [0] * len(ages_days)

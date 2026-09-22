@@ -3,6 +3,19 @@ from qingjian.core import i18n
 
 
 class CatalogueTests(unittest.TestCase):
+    def test_clear_all_warns_of_permanent_deletion_in_both_languages(self):
+        zh, en = i18n.CATALOG["backup.clear_confirm"]
+        self.assertIn("永久", zh)
+        self.assertIn("permanent", en.lower())
+        self.assertNotIn("回收站", zh)
+        self.assertNotIn("recycle bin", en.lower())
+
+    def test_partial_recycle_message_names_remaining_paths(self):
+        for language in ("zh", "en"):
+            message = i18n.Translator(language).tr(
+                "status.partial_recycle", paths="remaining.jpg", error="failed")
+            self.assertIn("remaining.jpg", message)
+
     def test_every_key_has_both_languages_and_matching_placeholders(self):
         self.assertEqual([], i18n.catalog_problems())
 

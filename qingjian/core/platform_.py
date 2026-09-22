@@ -48,6 +48,113 @@ def trash_available() -> bool:
     return _send2trash() is not None
 
 
+def _volume_recycle_limit(root: str) -> int | None:
+    """Read this user's actual per-volume bin limit, in bytes; unknown is unsafe."""
+    import ctypes
+    import winreg
+
+    volume = ctypes.create_unicode_buffer(64)
+    if not ctypes.windll.kernel32.GetVolumeNameForVolumeMountPointW(
+            ctypes.c_wchar_p(root), volume, len(volume)):
+        return None
+    name = volume.value
+    if "{" not in name or "}" not in name:
+        return None
+    guid = "{" + name.split("{", 1)[1].split("}", 1)[0] + "}"
+    key_name = (r"Software\Microsoft\Windows\CurrentVersion\Explorer"
+                "\\BitBucket\\Volume\\" + guid)
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_name) as key:
+            cap, cap_type = winreg.QueryValueEx(key, "MaxCapacity")
+            nuke, nuke_type = winreg.QueryValueEx(key, "NukeOnDelete")
+    except OSError:
+        return None
+    if (cap_type != winreg.REG_DWORD or nuke_type != winreg.REG_DWORD
+            or not isinstance(cap, int) or cap <= 0 or nuke != 0):
+        return None
+    return cap * 1024 * 1024
+
+
+def _recycle_policy() -> tuple[int | None, bool] | None:
+    """Return (all-volume size percentage, recycle allowed); None if unreadable."""
+    import winreg
+
+    key_name = r"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer"
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_name)
+    except FileNotFoundError:
+        return None, True  # Neither user policy is configured.
+    except OSError:
+        return None
+    try:
+        with key:
+            def setting(name: str) -> tuple[object, int] | None:
+                try:
+                    return winreg.QueryValueEx(key, name)
+                except FileNotFoundError:
+                    return None
+            size = setting("RecycleBinSize")
+            no_recycle = setting("NoRecycleFiles")
+    except OSError:
+        return None
+    for entry in (size, no_recycle):
+        if entry is not None and (entry[1] != winreg.REG_DWORD
+                                  or type(entry[0]) is not int):
+            return None
+    if size is not None and not 1 <= size[0] <= 100:
+        return None
+    if no_recycle is not None and no_recycle[0] not in (0, 1):
+        return None
+    return (size[0] if size is not None else None,
+            no_recycle is None or no_recycle[0] == 0)
+
+
+def can_recycle(path: str | Path, bytes_needed: int = 0) -> bool:
+    """Conservatively verify that Windows can recycle this volume and payload."""
+    if not IS_WINDOWS:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        value = str(Path(path).resolve())
+        if value.startswith("\\\\"):
+            return False
+        root = Path(value).anchor
+        if not root or not root.endswith("\\"):
+            return False
+        kernel = ctypes.windll.kernel32
+        if kernel.GetDriveTypeW(ctypes.c_wchar_p(root)) != 3:  # DRIVE_FIXED
+            return False
+
+        class BinInfo(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("i64Size", ctypes.c_longlong),
+                        ("i64NumItems", ctypes.c_longlong)]
+
+        info = BinInfo()
+        info.cbSize = ctypes.sizeof(info)
+        shell = ctypes.windll.shell32
+        if shell.SHQueryRecycleBinW(ctypes.c_wchar_p(root), ctypes.byref(info)) != 0:
+            return False
+        limit = _volume_recycle_limit(root)
+        if limit is None:
+            return False
+        policy = _recycle_policy()
+        if policy is None or not policy[1]:
+            return False
+        free = ctypes.c_ulonglong()
+        total = ctypes.c_ulonglong()
+        if not kernel.GetDiskFreeSpaceExW(ctypes.c_wchar_p(root), ctypes.byref(free),
+                                          ctypes.byref(total), None):
+            return False
+        if policy[0] is not None:
+            limit = min(limit, total.value * policy[0] // 100)
+        return (bytes_needed <= free.value
+                and bytes_needed + info.i64Size <= limit)
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
 def move_to_trash(path: str | Path) -> None:
     """Send *path* to the platform recycle bin.
 

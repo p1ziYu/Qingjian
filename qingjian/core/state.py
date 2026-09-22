@@ -284,9 +284,17 @@ class StateStore:
         with self._lock:
             rows = self._db.execute(
                 "SELECT id,seq,stack,action,original,destination,root,conflict,time_epoch,"
-                "from_review,undoable,bytes,payload FROM records WHERE undoable=1 "
-                "ORDER BY seq ASC LIMIT ?", (limit,)).fetchall()
+                "from_review,undoable,bytes,payload FROM records WHERE undoable=1 AND stack=? "
+                "ORDER BY seq ASC LIMIT ?", (STACK_HISTORY, limit)).fetchall()
         return [Record.from_row(row) for row in rows]
+
+    def retention_gate(self) -> tuple[int, float | None]:
+        """Count undoable history and get its oldest timestamp in one query."""
+        with self._lock:
+            count, oldest = self._db.execute(
+                "SELECT COUNT(*), MIN(time_epoch) FROM records "
+                "WHERE stack=? AND undoable=1", (STACK_HISTORY,)).fetchone()
+        return int(count), oldest
 
     def retire(self, ids: Iterable[str]) -> None:
         """Mark records non-undoable after their restore copies were reclaimed."""

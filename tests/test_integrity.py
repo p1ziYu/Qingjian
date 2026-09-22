@@ -49,6 +49,17 @@ def assert_each_content_once(case: unittest.TestCase, root: Path,
 
 
 class HistoryBranchTests(TempCase):
+    def test_retired_redo_top_is_rejected_without_replaying_files(self):
+        engine, source, binding = self.build()
+        target = source / "img0.jpg"
+        engine.classify(binding, target)
+        engine.undo()
+        top = engine.state.top("redo", undoable_only=False)
+        engine.state.retire([top.id])
+        self.assertFalse(engine.can_redo())
+        self.assertTrue(engine.redo().skipped)
+        self.assertTrue(target.exists())
+
     """A new operation ends the branch that undo created."""
 
     def build(self, files: int = 3) -> tuple[Engine, Path, config.Binding]:

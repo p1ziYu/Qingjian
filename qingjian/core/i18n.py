@@ -476,8 +476,16 @@ CATALOG: dict[str, tuple[str, str]] = {
                          "Reclaimed {size}; {count} records are no longer undoable"),
     "backup.clear_all": ("清理全部历史和备份", "Clear all history and backups"),
     "backup.clear_confirm": (
-        "这会清空全部撤销/重做记录，并将恢复副本移入系统回收站。继续？",
-        "This clears every undo/redo record and sends the restore copies to the recycle bin. Continue?",
+        "这会清空全部撤销/重做记录，并永久删除已回收文件与恢复副本。继续？",
+        "This clears every undo/redo record and permanently deletes recycled files and restore copies. Continue?",
+    ),
+    "status.soft_recycle_fallback": (
+        "系统回收站不可用；文件已移入旁边的 .qingjian-trash，可按 Ctrl+Z 撤销",
+        "System recycle bin unavailable; file moved to nearby .qingjian-trash. Press Ctrl+Z to undo",
+    ),
+    "status.partial_recycle": (
+        "部分文件已移入系统回收站；以下文件仍在原处：{paths}。错误：{error}",
+        "Some files entered the system recycle bin; these remain in place: {paths}. Error: {error}",
     ),
     "backup.keep_last": ("保留最近", "Keep last"),
     "backup.disk_cap": ("磁盘上限", "Disk cap"),

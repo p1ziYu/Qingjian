@@ -101,6 +101,150 @@ class WindowCase(QtCase):
 
 
 class RecycleTests(WindowCase):
+    def test_background_delete_keeps_reclaim_and_volume_checks_off_ui_thread(self):
+        import ctypes
+        import threading
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+        from qingjian.core import config, platform_
+        self.settings.background_queue = True
+        self.settings.recycle_mode = config.RECYCLE_SYSTEM
+        ui_thread = threading.get_ident()
+        gate_threads = []
+        probe_threads = []
+        limit_threads = []
+        policy_threads = []
+        errors = []
+        original = self.engine.state.retention_gate
+        original_probe = platform_.can_recycle
+        kernel, shell = Mock(), Mock()
+        kernel.GetDriveTypeW.return_value = 3
+        shell.SHQueryRecycleBinW.return_value = 0
+        def gate():
+            gate_threads.append(threading.get_ident())
+            return original()
+        def probe(path, bytes_needed=0):
+            probe_threads.append(threading.get_ident())
+            with patch.object(ctypes, "windll",
+                              SimpleNamespace(kernel32=kernel, shell32=shell)):
+                return original_probe(path, bytes_needed)
+        def limit(_root):
+            limit_threads.append(threading.get_ident())
+            return 1_000_000
+        def policy():
+            policy_threads.append(threading.get_ident())
+            return None, False  # Force the safe soft-recycle fallback.
+        with patch.object(self.engine.state, "retention_gate", side_effect=gate), \
+             patch.object(platform_, "trash_available", return_value=True), \
+             patch.object(platform_, "IS_WINDOWS", True), \
+             patch.object(platform_, "can_recycle", side_effect=probe), \
+             patch.object(platform_, "_volume_recycle_limit", side_effect=limit), \
+             patch.object(platform_, "_recycle_policy", side_effect=policy), \
+             patch.object(platform_, "move_to_trash",
+                          side_effect=AssertionError("real system recycle attempted")), \
+             patch.object(QMessageBox, "warning",
+                          side_effect=lambda _parent, _title, message: errors.append(message)):
+            self.window.trash_current()
+            self.engine.queue.wait_idle(10)
+            self.app.processEvents()
+        self.assertEqual([], errors)
+        self.assertEqual(1, len(probe_threads))
+        self.assertEqual(1, len(limit_threads))
+        self.assertEqual(1, len(policy_threads))
+        self.assertTrue(all(thread != ui_thread for thread in
+                            probe_threads + limit_threads + policy_threads))
+        self.assertTrue(gate_threads)
+        self.assertTrue(all(thread != ui_thread for thread in gate_threads))
+        self.assertTrue(self.recycled())
+
+    def test_background_file_key_filters_group_on_ui_then_worker(self):
+        import threading
+        from unittest.mock import patch
+        from qingjian.core.sidecar import SidecarRules, PROMPT_NEVER
+        from qingjian.ui.dialogs import ConflictDialog
+        self.settings.background_queue = True
+        self.settings.sidecar = SidecarRules(prompt=PROMPT_NEVER)
+        self.engine.planner.settings = self.settings
+        jpg = self.source / "IMG_0000.JPG"
+        raw = self.source / "IMG_0000.CR2"
+        raw.write_bytes(b"raw")
+        self.keep.mkdir(exist_ok=True)
+        conflicting_raw = self.keep / raw.name
+        conflicting_raw.write_bytes(b"existing")
+        self.window.rescan()
+        ui_thread = threading.get_ident()
+        calls = []
+        original = self.engine._operation_group
+        def group(actual):
+            filtered = original(actual)
+            calls.append((threading.get_ident(),
+                          [member.path for member in actual.members],
+                          [member.path for member in filtered.members]))
+            return filtered
+        with patch.object(self.engine, "_operation_group", side_effect=group), \
+             patch.object(ConflictDialog, "ask",
+                          side_effect=AssertionError("unused RAW target conflict asked")):
+            self.window.classify_index(0)
+            self.engine.queue.wait_idle(10)
+            self.app.processEvents()
+        self.assertEqual(2, len(calls))
+        self.assertEqual(ui_thread, calls[0][0])
+        self.assertNotEqual(ui_thread, calls[1][0])
+        self.assertCountEqual([jpg, raw], calls[0][1])
+        self.assertEqual([jpg], calls[0][2])
+        self.assertEqual([jpg], calls[1][1])
+        self.assertEqual([jpg], calls[1][2])
+        self.assertTrue(conflicting_raw.exists())
+        self.assertFalse(jpg.exists())
+        self.assertTrue((self.keep / jpg.name).exists())
+        self.assertTrue(raw.exists())
+
+    def test_never_sidecar_conflict_does_not_prompt_for_unused_target(self):
+        from unittest.mock import patch
+        from qingjian.core.sidecar import SidecarRules, PROMPT_NEVER
+        from qingjian.ui.dialogs import ConflictDialog
+        jpg = self.source / "IMG_0000.JPG"
+        raw = self.source / "IMG_0000.CR2"
+        raw.write_bytes(b"raw")
+        self.keep.mkdir(exist_ok=True)
+        (self.keep / raw.name).write_bytes(b"existing")
+        self.settings.sidecar = SidecarRules(prompt=PROMPT_NEVER)
+        self.engine.planner.settings = self.settings
+        self.window.rescan()
+        with patch.object(ConflictDialog, "ask",
+                          side_effect=AssertionError("unused sidecar conflict asked")):
+            self.window.classify_index(0)
+        self.assertFalse(jpg.exists())
+        self.assertTrue((self.keep / jpg.name).exists())
+        self.assertTrue(raw.exists())
+
+    def test_synchronous_delete_uses_soft_recycle_without_volume_probe(self):
+        from unittest.mock import patch
+        from qingjian.core import config, platform_
+        self.settings.recycle_mode = config.RECYCLE_SYSTEM
+        current = self.engine.current_path()
+        with patch.object(platform_, "can_recycle") as probe, \
+             patch.object(platform_, "move_to_trash") as sender:
+            self.window.trash_current()
+        probe.assert_not_called()
+        sender.assert_not_called()
+        self.assertFalse(current.exists())
+        self.assertTrue(self.recycled())
+
+    def test_synchronous_trash_binding_uses_soft_recycle(self):
+        from unittest.mock import patch
+        from qingjian.core import config, platform_
+        self.settings.recycle_mode = config.RECYCLE_SYSTEM
+        self.settings.bindings[2].action = "trash"
+        current = self.engine.current_path()
+        with patch.object(platform_, "can_recycle") as probe, \
+             patch.object(platform_, "move_to_trash") as sender:
+            self.window.classify_index(2)
+        probe.assert_not_called()
+        sender.assert_not_called()
+        self.assertFalse(current.exists())
+        self.assertTrue(self.recycled())
+
     def refuse_questions(self) -> list:
         asked = []
 

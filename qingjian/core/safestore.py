@@ -1083,6 +1083,8 @@ def _keep_record_delta(payload: dict) -> dict | None:
 
 def snapshot_bytes(record: dict) -> int:
     """Bytes of restore copies a history record is holding open."""
+    if "snapshot_bytes" in record:
+        return int(record["snapshot_bytes"])
     total = 0
     for ref in record.get("snapshots") or []:
         try:
@@ -1093,7 +1095,7 @@ def snapshot_bytes(record: dict) -> int:
 
 
 def reclaim_candidates(records: list[dict], policy: QuotaPolicy,
-                       now: float | None = None) -> list[int]:
+                       now: float | None = None, keep_newest: bool = False) -> list[int]:
     """Indices of the oldest records to retire so *policy* is satisfied.
 
     Records are assumed oldest-first. Retiring a record means deleting its
@@ -1104,6 +1106,7 @@ def reclaim_candidates(records: list[dict], policy: QuotaPolicy,
     total = sum(sizes)
     live = list(range(len(records)))
     drop: list[int] = []
+    protected = len(records) - 1 if keep_newest and records else None
 
     def retire(index: int) -> None:
         nonlocal total
@@ -1115,12 +1118,18 @@ def reclaim_candidates(records: list[dict], policy: QuotaPolicy,
         horizon = now - policy.max_days * 86400
         for index in list(live):
             when = records[index].get("time_epoch")
-            if isinstance(when, (int, float)) and when < horizon:
+            if index != protected and isinstance(when, (int, float)) and when < horizon:
                 retire(index)
     if policy.max_operations > 0:
         while len(live) > policy.max_operations:
-            retire(live[0])
+            candidate = next((i for i in live if i != protected), None)
+            if candidate is None:
+                break
+            retire(candidate)
     if policy.max_bytes > 0:
         while live and total > policy.max_bytes:
-            retire(live[0])
+            candidate = next((i for i in live if i != protected and sizes[i] > 0), None)
+            if candidate is None:
+                break
+            retire(candidate)
     return sorted(drop)

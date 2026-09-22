@@ -286,7 +286,9 @@ class Planner:
             bytes=sum(m.size for m in group.members),
             payload={"forward": forward, "inverse": plan.inverse, "verify": self.verify,
                      "snapshots": snapshots, "paths": [str(p) for p, _ in pairs],
-                     "targets": [str(t) for _, t in pairs]})
+                     "targets": [str(t) for _, t in pairs],
+                     "snapshot_bytes": sum((step.get("snapshot") or {}).get("size", 0)
+                                           for step in forward)})
         plan.state = self._delta_for(record, group, action)
         return Outcome(plan=plan, record=record, delta=plan.state)
 
@@ -320,7 +322,9 @@ class Planner:
                         payload={"forward": forward, "inverse": plan.inverse,
                                  "verify": self.verify, "snapshots": snapshots,
                                  "paths": [str(p) for p, _ in pairs],
-                                 "targets": [str(t) for _, t in pairs]})
+                                 "targets": [str(t) for _, t in pairs],
+                                 "snapshot_bytes": sum((step.get("snapshot") or {}).get("size", 0)
+                                                       for step in forward)})
         plan.state = self._delta_for(record, group, "rename")
         return Outcome(plan=plan, record=record, delta=plan.state)
 
@@ -356,7 +360,8 @@ class Planner:
                         bytes=sum(m.size for m in group.members),
                         payload={"forward": forward, "inverse": plan.inverse,
                                  "verify": self.verify, "snapshots": snapshots,
-                                 "paths": [str(m.path) for m in group.members]})
+                                 "paths": [str(m.path) for m in group.members],
+                                 "snapshot_bytes": sum(m.size for m in group.members)})
         plan.state = self._delta_for(record, group, "trash")
         return Outcome(plan=plan, record=record, delta=plan.state)
 

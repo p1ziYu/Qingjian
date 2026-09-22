@@ -187,6 +187,152 @@ class QueueTests(TempCase):
 
 
 class EngineTests(TempCase):
+    def test_recycling_a_shot_larger_than_the_cap_stays_undoable(self):
+        from qingjian.core.safestore import QuotaPolicy
+        target = self.root / "Day4" / "solo_01.JPG"
+        self.engine.settings.quota = QuotaPolicy(max_operations=0, max_bytes=1,
+                                                 max_days=0, automatic=True)
+        self.engine.trash(target)
+        self.assertTrue(self.engine.can_undo())
+        self.engine.undo()
+        self.assertTrue(target.exists())
+
+    def test_an_old_restore_copy_is_retired_on_the_next_tag(self):
+        import time
+        from qingjian.core.safestore import QuotaPolicy
+        target = self.root / "Day4" / "solo_01.JPG"
+        self.engine.settings.quota = QuotaPolicy(max_operations=200, max_bytes=20000,
+                                                 max_days=30, automatic=True)
+        record = self.engine.trash(target).record
+        newer = self.engine.skip(self.root / "Day4" / "solo_02.JPG").record
+        with self.engine.state._lock, self.engine.state._db:
+            self.engine.state._db.execute("UPDATE records SET time_epoch=? WHERE id=?",
+                                          (time.time() - 31 * 86400, record.id))
+        self.engine.tag([target], rating=3)
+        self.assertFalse(self.engine.state.record(record.id).undoable)
+        self.assertTrue(self.engine.state.record(newer.id).undoable)
+
+    def test_only_expired_record_keeps_last_undo_chance(self):
+        import time
+        from qingjian.core.safestore import QuotaPolicy
+        target = self.root / "Day4" / "solo_01.JPG"
+        self.engine.settings.quota = QuotaPolicy(max_operations=200, max_bytes=20000,
+                                                 max_days=30, automatic=True)
+        record = self.engine.trash(target).record
+        with self.engine.state._lock, self.engine.state._db:
+            self.engine.state._db.execute("UPDATE records SET time_epoch=? WHERE id=?",
+                                          (time.time() - 31 * 86400, record.id))
+        self.engine.tag([target], rating=3)
+        self.assertTrue(self.engine.state.record(record.id).undoable)
+        self.engine.undo()
+        self.assertTrue(target.exists())
+
+    def test_retired_history_does_not_open_the_reclaim_gate(self):
+        from unittest.mock import patch
+        from qingjian.core.safestore import QuotaPolicy
+        target = self.root / "Day4" / "solo_01.JPG"
+        self.engine.settings.quota = QuotaPolicy(max_operations=200, max_bytes=0,
+                                                 max_days=0, automatic=False)
+        for _ in range(250):
+            self.engine.skip(target)
+        ids = [r.id for r in self.engine.state.oldest_undoable(limit=5000)[:200]]
+        self.engine.state.retire(ids)
+        self.engine.settings.quota = QuotaPolicy(max_operations=200, max_bytes=0,
+                                                 max_days=0, automatic=True)
+        with patch.object(self.engine.state, "oldest_undoable",
+                          wraps=self.engine.state.oldest_undoable) as query:
+            self.engine.tag([target], rating=3)
+        query.assert_not_called()
+
+    def test_system_recycle_falls_back_where_the_volume_has_no_bin(self):
+        from unittest.mock import Mock, patch
+        from qingjian.core import platform_
+        target = self.root / "Day4" / "solo_01.JPG"
+        self.engine.settings.recycle_mode = config.RECYCLE_SYSTEM
+        sender = Mock()
+        with patch.object(platform_, "trash_available", return_value=True), \
+             patch.object(platform_, "can_recycle", return_value=False, create=True), \
+             patch.object(platform_, "move_to_trash", sender):
+            self.engine.trash(target)
+        sender.assert_not_called()
+        self.assertTrue(self.engine.can_undo())
+        self.assertFalse(target.exists())
+
+    def test_system_recycle_leaves_no_hidden_folder_or_restore_copy(self):
+        from pathlib import Path
+        from unittest.mock import patch
+        from qingjian.core import platform_
+        target = self.root / "Day4" / "solo_01.JPG"
+        self.engine.settings.recycle_mode = config.RECYCLE_SYSTEM
+        with patch.object(platform_, "trash_available", return_value=True), \
+             patch.object(platform_, "can_recycle", return_value=True, create=True), \
+             patch.object(platform_, "move_to_trash", side_effect=lambda p: Path(p).unlink()):
+            self.engine.trash(target)
+        self.assertFalse((target.parent / ".qingjian-trash").exists())
+        self.assertEqual(0, self.engine.store.usage(refresh=True))
+
+    def test_system_recycle_partial_failure_records_sent_members(self):
+        from pathlib import Path
+        from unittest.mock import patch
+        from qingjian.core import platform_
+        jpg = self.root / "Day3" / "IMG_5511.JPG"
+        self.engine.settings.recycle_mode = config.RECYCLE_SYSTEM
+        sent = []
+        def send(path):
+            sent.append(Path(path))
+            if len(sent) == 2:
+                raise OSError("second failed")
+            Path(path).unlink()
+        with patch.object(platform_, "trash_available", return_value=True), \
+             patch.object(platform_, "can_recycle", return_value=True, create=True), \
+             patch.object(platform_, "move_to_trash", side_effect=send):
+            with self.assertRaises(OSError) as failure:
+                self.engine.trash(jpg)
+        self.assertIn(str(sent[1]), str(failure.exception))
+        import json
+        rows = self.engine.state._db.execute(
+            "SELECT payload FROM records WHERE action='trash'").fetchall()
+        self.assertTrue(any(str(sent[0]) in json.loads(row[0])["paths"] for row in rows))
+
+    def test_system_recycle_success_must_remove_source(self):
+        from unittest.mock import Mock, patch
+        from qingjian.core import platform_
+        jpg = self.root / "Day4" / "solo_01.JPG"
+        self.engine.settings.recycle_mode = config.RECYCLE_SYSTEM
+        with patch.object(platform_, "trash_available", return_value=True), \
+             patch.object(platform_, "can_recycle", return_value=True), \
+             patch.object(platform_, "move_to_trash", Mock()):
+            with self.assertRaises(OSError):
+                self.engine.trash(jpg)
+        self.assertTrue(jpg.exists())
+        self.assertFalse(self.engine.state.records())
+
+    def test_never_linking_recycles_only_the_master(self):
+        from qingjian.core.sidecar import SidecarRules, PROMPT_NEVER
+        folder = self.root / "Day3"
+        jpg, raw = folder / "IMG_5511.JPG", folder / "IMG_5511.CR2"
+        self.engine.settings.sidecar = SidecarRules(prompt=PROMPT_NEVER)
+        self.engine.planner.settings = self.engine.settings
+        self.engine.trash(jpg)
+        self.assertTrue(raw.exists())
+        self.engine.undo()
+        self.assertTrue(jpg.exists())
+
+    def test_never_linking_folder_actions_leave_companions(self):
+        from qingjian.core.sidecar import SidecarRules, PROMPT_NEVER
+        folder = self.root / "Day3"
+        jpg, raw = folder / "IMG_5511.JPG", folder / "IMG_5511.CR2"
+        self.engine.settings.sidecar = SidecarRules(prompt=PROMPT_NEVER)
+        self.engine.planner.settings = self.engine.settings
+        for action in ("move", "copy", "favorite"):
+            binding = config.Binding(key="1", action=action,
+                                     folder=str(self.tmp / action), name_template="{name}")
+            result = self.engine.classify(binding, jpg)
+            self.assertEqual([str(jpg)], result.record.payload["paths"])
+            self.assertTrue(raw.exists())
+            self.engine.undo()
+            self.assertTrue(jpg.exists())
+
     def setUp(self):
         super().setUp()
         self.root = self.tmp / "lib"

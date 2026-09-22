@@ -80,6 +80,13 @@ class HashCache:
                     "INSERT INTO cache_meta(key,value) VALUES('algorithm',?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     (str(ALGORITHM_VERSION),))
+            captured_row = self._db.execute(
+                "SELECT value FROM cache_meta WHERE key='captured'").fetchone()
+            if not captured_row or captured_row[0] != "2":
+                self._db.execute("UPDATE entries SET captured=NULL")
+                self._db.execute(
+                    "INSERT INTO cache_meta(key,value) VALUES('captured','2') "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value")
             self._db.commit()
         except sqlite3.Error as error:
             log.warning("hash cache migration skipped: %s", error)
@@ -179,13 +186,18 @@ class HashCache:
                 self._db.execute(
                     "INSERT INTO entries(path,size,mtime_ns,sha256,phash,dhash,sharpness,"
                     "captured,updated) VALUES(?,?,?,?,?,?,?,?,?) "
-                    "ON CONFLICT(path) DO UPDATE SET size=excluded.size, mtime_ns=excluded.mtime_ns,"
-                    " sha256=COALESCE(excluded.sha256, entries.sha256),"
-                    " phash=COALESCE(excluded.phash, entries.phash),"
-                    " dhash=COALESCE(excluded.dhash, entries.dhash),"
-                    " sharpness=COALESCE(excluded.sharpness, entries.sharpness),"
-                    " captured=COALESCE(excluded.captured, entries.captured),"
-                    " updated=excluded.updated",
+                    "ON CONFLICT(path) DO UPDATE SET"
+                    " sha256=CASE WHEN entries.size=excluded.size AND entries.mtime_ns=excluded.mtime_ns"
+                    " THEN COALESCE(excluded.sha256,entries.sha256) ELSE excluded.sha256 END,"
+                    " phash=CASE WHEN entries.size=excluded.size AND entries.mtime_ns=excluded.mtime_ns"
+                    " THEN COALESCE(excluded.phash,entries.phash) ELSE excluded.phash END,"
+                    " dhash=CASE WHEN entries.size=excluded.size AND entries.mtime_ns=excluded.mtime_ns"
+                    " THEN COALESCE(excluded.dhash,entries.dhash) ELSE excluded.dhash END,"
+                    " sharpness=CASE WHEN entries.size=excluded.size AND entries.mtime_ns=excluded.mtime_ns"
+                    " THEN COALESCE(excluded.sharpness,entries.sharpness) ELSE excluded.sharpness END,"
+                    " captured=CASE WHEN entries.size=excluded.size AND entries.mtime_ns=excluded.mtime_ns"
+                    " THEN COALESCE(excluded.captured,entries.captured) ELSE excluded.captured END,"
+                    " size=excluded.size, mtime_ns=excluded.mtime_ns, updated=excluded.updated",
                     (key[0], key[1], key[2], row.get("sha256"),
                      _to_text(row.get("phash")), _to_text(row.get("dhash")),
                      row.get("sharpness"), row.get("captured"), time.time()),

@@ -1184,6 +1184,13 @@ class MainWindow(QMainWindow):
         target = self._preview_target()
         ready = self.preloader.take(current, target)
         if ready is None:
+            error = self.preloader.error(current, target)
+            if error:
+                self._preview_retries.pop(path, None)
+                message = tr("status.preview_failed", name=Path(path).name, error=error)
+                self.preview.show_empty(message)
+                self.status(message, "warning")
+                return
             # The target size is part of the cache key, so a window resized
             # while this was decoding misses. Ask again at the size we want now
             # rather than declaring the file unreadable.

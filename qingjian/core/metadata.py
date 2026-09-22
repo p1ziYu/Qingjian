@@ -9,7 +9,7 @@ from __future__ import annotations
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import exifread, isobmff, mediatypes
@@ -109,7 +109,7 @@ def _parse_datetime(text: str, offset: str = "") -> datetime | None:
     value = value.replace("Z", "+00:00")
     try:
         parsed = datetime.fromisoformat(value)
-        return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+        return parsed
     except ValueError:
         pass
     for fmt in _DATE_FORMATS:
@@ -140,6 +140,7 @@ class MediaInfo:
     shutter: str = ""
     focal: str = ""
     orientation: int = 1
+    rotation: int = 0
     captured: datetime | None = None
     captured_is_fallback: bool = True
     error: str = ""
@@ -147,22 +148,42 @@ class MediaInfo:
 
     @property
     def is_landscape(self) -> bool:
-        return bool(self.width and self.height) and self.width > self.height
+        return bool(self.display_width and self.display_height) and self.display_width > self.display_height
 
     @property
     def is_portrait(self) -> bool:
-        return bool(self.width and self.height) and self.height > self.width
+        return bool(self.display_width and self.display_height) and self.display_height > self.display_width
 
     @property
     def is_square(self) -> bool:
-        return bool(self.width) and self.width == self.height
+        return bool(self.display_width) and self.display_width == self.display_height
+
+    @property
+    def display_width(self) -> int:
+        return self.height if self.orientation in (5, 6, 7, 8) or self.rotation % 180 else self.width
+
+    @property
+    def display_height(self) -> int:
+        return self.width if self.orientation in (5, 6, 7, 8) or self.rotation % 180 else self.height
 
     @property
     def megapixels(self) -> float:
         return (self.width * self.height) / 1_000_000 if self.width and self.height else 0.0
 
     def when(self) -> datetime:
-        return self.captured or datetime.fromtimestamp(self.mtime or 0)
+        if self.captured is not None:
+            return self.captured
+        try:
+            return datetime.fromtimestamp(self.mtime or 0)
+        except (OSError, OverflowError, ValueError):
+            return datetime(1970, 1, 1) + timedelta(seconds=self.mtime or 0)
+
+    def timestamp(self) -> float:
+        when = self.when()
+        try:
+            return when.timestamp()
+        except (OSError, OverflowError, ValueError):
+            return (when - datetime(1970, 1, 1)).total_seconds()
 
 
 def _apply_exif(info: MediaInfo, tags: dict) -> None:
@@ -210,7 +231,7 @@ def _read_image(info: MediaInfo) -> None:
             info.fmt = image.format or ""
             info.frames = getattr(image, "n_frames", 1)
             try:
-                exif = image.getexif()
+                exif = image.getexif() if image.format != "PNG" or "exif" in image.info else {}
                 tags = {ExifTags.TAGS.get(t, str(t)): v for t, v in dict(exif).items()}
                 try:
                     inner = exif.get_ifd(0x8769)
@@ -260,10 +281,17 @@ def _read_video(info: MediaInfo) -> None:
                 info.height = int(stream.height or 0)
                 info.codec = str(stream.codec_context.name or "")
                 info.framerate = str(stream.average_rate or "")
+                header = isobmff.read_header(info.path)
+                info.rotation = int(header.get("rotation") or 0)
                 created = container.metadata.get("creation_time") or \
                     stream.metadata.get("creation_time") or ""
                 parsed = _parse_datetime(created)
                 if parsed:
+                    if parsed.tzinfo is not None:
+                        try:
+                            parsed = parsed.astimezone().replace(tzinfo=None)
+                        except (OSError, OverflowError, ValueError):
+                            parsed = parsed.replace(tzinfo=None)
                     info.captured = parsed
                     info.captured_is_fallback = False
                 return
@@ -277,6 +305,7 @@ def _read_video(info: MediaInfo) -> None:
             info.duration = float(duration)
         info.width = int(header.get("width") or info.width)
         info.height = int(header.get("height") or info.height)
+        info.rotation = int(header.get("rotation") or 0)
         created = header.get("created")
         if isinstance(created, datetime):
             info.captured = created.astimezone().replace(tzinfo=None)
@@ -312,7 +341,10 @@ def read(path: str | Path, use_cache: bool = True) -> MediaInfo:
         info.error = str(error)
 
     if info.captured is None:
-        info.captured = datetime.fromtimestamp(stat.st_mtime)
+        try:
+            info.captured = datetime.fromtimestamp(stat.st_mtime)
+        except (OSError, OverflowError, ValueError):
+            info.captured = datetime(1970, 1, 1) + timedelta(seconds=stat.st_mtime)
         info.captured_is_fallback = True
 
     if use_cache:
@@ -348,6 +380,8 @@ def capture_only(path: str | Path) -> float | None:
         return None
     try:
         with Image.open(source) as image:
+            if image.format == "PNG" and "exif" not in image.info:
+                return source.stat().st_mtime
             exif = image.getexif()
             inner = {}
             try:

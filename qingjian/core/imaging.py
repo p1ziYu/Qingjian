@@ -26,7 +26,7 @@ _HASH_SIDE = 8
 #: Bumped whenever the decode path changes in a way that moves hash values.
 #: Cached hashes from an older algorithm are discarded rather than compared
 #: with fresh ones, which would silently break near-match grouping.
-ALGORITHM_VERSION = 3
+ALGORITHM_VERSION = 4
 
 # JPEG start/end markers, used to lift the preview out of a raw container.
 _SOI = b"\xff\xd8\xff"
@@ -52,9 +52,12 @@ def extract_embedded_jpeg(path: str | Path, search_bytes: int = 16 * 1024 * 1024
     best: bytes | None = None
     start = blob.find(_SOI)
     while start != -1:
-        end = blob.find(_EOI, start + 3)
-        if end == -1:
-            break
+        end = _jpeg_end(blob, start)
+        if end is None:
+            end = blob.find(_EOI, start + 3)
+            if end < 0:
+                start = blob.find(_SOI, start + 3)
+                continue
         candidate = blob[start:end + 2]
         if best is None or len(candidate) > len(best):
             best = candidate
@@ -63,6 +66,38 @@ def extract_embedded_jpeg(path: str | Path, search_bytes: int = 16 * 1024 * 1024
     # soft picture still beats refusing to show the file, and the perceptual
     # hash is computed at 32 pixels either way.
     return best
+
+
+def _jpeg_end(blob: bytes, start: int) -> int | None:
+    """Find EOI after parsing header segments, which may contain JPEG bytes."""
+    cursor = start + 2
+    while cursor + 1 < len(blob):
+        if blob[cursor] != 0xFF:
+            return None
+        while cursor < len(blob) and blob[cursor] == 0xFF:
+            cursor += 1
+        if cursor >= len(blob):
+            return None
+        marker = blob[cursor]
+        cursor += 1
+        if marker == 0xD9:
+            return cursor - 2
+        if marker == 0xD8 or marker == 0x01 or 0xD0 <= marker <= 0xD7:
+            continue
+        if cursor + 2 > len(blob):
+            return None
+        length = int.from_bytes(blob[cursor:cursor + 2], "big")
+        if length < 2 or cursor + length > len(blob):
+            return None
+        cursor += length
+        if marker == 0xDA:
+            while cursor + 1 < len(blob):
+                if blob[cursor] == 0xFF and blob[cursor + 1] == 0xD9:
+                    return cursor
+                if blob[cursor] == 0xFF and blob[cursor + 1] not in (0x00, *range(0xD0, 0xD8)):
+                    return None
+                cursor += 1
+    return None
 
 
 def _open_drafted(source, target: tuple[int, int] | None):
@@ -115,6 +150,8 @@ def decodes_slowly(path: str | Path) -> bool:
     target = Path(path)
     if mediatypes.is_video(target):
         return False
+    if mediatypes.suffix(target) in {".heic", ".heif", ".hif"}:
+        return True
     try:
         size = target.stat().st_size
     except OSError:
@@ -139,10 +176,27 @@ def open_image(path: str | Path, target: tuple[int, int] | None = None):
         if blob:
             import io
             try:
-                return ImageOps.exif_transpose(_open_drafted(io.BytesIO(blob), target))
+                return _orient_raw_preview(path, _open_drafted(io.BytesIO(blob), target), ImageOps)
             except Exception:
                 pass
     return ImageOps.exif_transpose(_open_drafted(path, target))
+
+
+def _orient_raw_preview(path: Path, image, image_ops):
+    if image.getexif().get(0x112):
+        return image_ops.exif_transpose(image)
+    from . import metadata  # noqa: PLC0415 - avoids a metadata/imaging import cycle
+
+    orientation = metadata.read(path).orientation
+    from PIL import Image  # noqa: PLC0415
+
+    transforms = {
+        2: Image.Transpose.FLIP_LEFT_RIGHT, 3: Image.Transpose.ROTATE_180,
+        4: Image.Transpose.FLIP_TOP_BOTTOM, 5: Image.Transpose.TRANSPOSE,
+        6: Image.Transpose.ROTATE_270, 7: Image.Transpose.TRANSVERSE,
+        8: Image.Transpose.ROTATE_90,
+    }
+    return image.transpose(transforms[orientation]) if orientation in transforms else image
 
 
 def thumbnail(path: str | Path, size: tuple[int, int] = (320, 320)):
@@ -174,7 +228,20 @@ def _gray_array(path: str | Path, side: int) -> np.ndarray | None:
         except (AttributeError, ValueError, OSError):
             pass
         handle.load()
-        image = ImageOps.exif_transpose(handle)
+        image = (_orient_raw_preview(source, handle, ImageOps)
+                 if mediatypes.is_raw(source) else ImageOps.exif_transpose(handle))
+        if image.mode.startswith("I;16") or image.mode in ("I", "F"):
+            values = np.asarray(image, dtype=np.float64)
+            finite = np.isfinite(values)
+            if values.size and finite.any():
+                low, high = float(values[finite].min()), float(values[finite].max())
+                scaled = np.zeros_like(values)
+                if high > low:
+                    scaled[finite] = (values[finite] - low) * (255.0 / (high - low))
+                values = scaled
+            else:
+                values = np.zeros_like(values)
+            image = Image.fromarray(np.clip(np.rint(values), 0, 255).astype(np.uint8), "L")
         if image.mode != "L":
             image = image.convert("L")
         image = image.resize((side, side), Image.Resampling.LANCZOS)

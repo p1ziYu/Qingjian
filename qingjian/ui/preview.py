@@ -61,6 +61,8 @@ def decode_qimage(path: str | Path, target: QSize) -> tuple[QImage, str]:
         pil.thumbnail(wanted)
         return pil_to_qimage(pil), ""
     except Exception as pillow_error:
+        if suffix in {"heic", "heif", "hif", "jxl"} and not mediatypes.is_decodable(target_path):
+            return QImage(), tr("error.decoder_missing", format=suffix.upper())
         return QImage(), error or str(pillow_error)
 
 
@@ -71,7 +73,7 @@ def decode_pixmap(path: str | Path, target: QSize) -> tuple[QPixmap, str]:
 
 
 class _PreloadSignals(QObject):
-    ready = Signal(object, int, object, bool)
+    ready = Signal(object, int, object, bool, str)
 
 
 class _PreloadTask(QRunnable):
@@ -90,19 +92,19 @@ class _PreloadTask(QRunnable):
         # is in flight, and two sizes of one file must not be filed under each
         # other's key.
         if not self.still_wanted(self.key, self.generation):
-            self.signals.ready.emit(self.key, self.generation, None, False)
+            self.signals.ready.emit(self.key, self.generation, None, False, "")
             return
         # Stat on the worker, never in set_wanted on the interface thread.
         # A queued task may now point to a newer file at the same path.
         if self.key != PreviewPrefetcher._key(self.path, self.target):
-            self.signals.ready.emit(self.key, self.generation, None, False)
+            self.signals.ready.emit(self.key, self.generation, None, False, "")
             return
-        image, _error = decode_qimage(self.path, self.target)
+        image, error = decode_qimage(self.path, self.target)
         if self.key != PreviewPrefetcher._key(self.path, self.target):
-            self.signals.ready.emit(self.key, self.generation, None, False)
+            self.signals.ready.emit(self.key, self.generation, None, False, "")
             return
         self.signals.ready.emit(self.key, self.generation,
-                                None if image.isNull() else image, True)
+                                None if image.isNull() else image, True, error)
 
 
 class PreviewPrefetcher(QObject):
@@ -119,6 +121,7 @@ class PreviewPrefetcher(QObject):
     def __init__(self, depth: int = 4, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._cache: "OrderedDict[tuple, QImage]" = OrderedDict()
+        self._errors: dict[tuple, str] = {}
         self._pending: set[tuple] = set()
         # Interest tracks names and viewport size. Full cache keys below still
         # include file identity, but recomputing four stats on every view refresh
@@ -147,6 +150,10 @@ class PreviewPrefetcher(QObject):
         if image is None or image.isNull():
             return None
         return QPixmap.fromImage(image)
+
+    def error(self, path: str | Path, target: QSize) -> str:
+        """The last worker decode error for this exact file and viewport."""
+        return self._errors.get(self._key(Path(path), target), "")
 
     def prefetch(self, paths, target: QSize) -> None:
         for path in list(paths)[:self._depth]:
@@ -185,7 +192,7 @@ class PreviewPrefetcher(QObject):
                                       generation, self._still_wanted), priority)
         return True
 
-    def _store(self, key, generation, image, current) -> None:
+    def _store(self, key, generation, image, current, error) -> None:
         if generation != self._generation:
             return
         self._pending.discard(key)
@@ -193,6 +200,9 @@ class PreviewPrefetcher(QObject):
             return
         if image is not None:
             self._cache[key] = image
+            self._errors.pop(key, None)
+        elif error:
+            self._errors[key] = error
         while len(self._cache) > self._depth:
             self._cache.popitem(last=False)
         self.arrived.emit(key[0])
@@ -207,6 +217,7 @@ class PreviewPrefetcher(QObject):
             self._wanted.clear()
         self._pool.clear()
         self._cache.clear()
+        self._errors.clear()
         self._pending.clear()
 
     def shutdown(self) -> None:

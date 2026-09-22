@@ -376,3 +376,27 @@ class IgnoreListTests(TempCase):
         keys = {dedupe.identity_key(m.path, m.digest or "")
                 for g in found for m in g.members}
         self.assertEqual(dedupe.find_bursts(paths, minimum=3, ignored=keys), [])
+
+
+
+class G09DedupeTests(TempCase):
+    def test_f062_old_files_do_not_break_dedupe_or_filter(self):
+        import numpy as np
+        from PIL import Image
+        from qingjian.core import metadata, scanner
+
+        metadata.clear_cache()
+        noise = np.random.default_rng(5).integers(0, 256, (128, 128, 3), dtype=np.uint8)
+        exif = Image.Exif()
+        exif[306] = '1970:01:01 00:00:00'
+        a, b = self.tmp / 'a.jpg', self.tmp / 'b.jpg'
+        Image.fromarray(noise).save(a, exif=exif)
+        b.write_bytes(a.read_bytes())
+        self.assertEqual(len(dedupe.find_exact([a, b])), 1)
+        self.assertEqual(len(dedupe.find_similar([a, b])), 1)
+        self.assertEqual(len(dedupe.find_bursts([a, b], minimum=2)), 1)
+        old = self.tmp / 'old.png'
+        Image.new('RGB', (64, 48)).save(old)
+        os.utime(old, (-34560000, -34560000))
+        self.assertIsNotNone(metadata.read(old, use_cache=False).captured)
+        scanner.apply_filter([old], scanner.FilterSpec(mode='portrait'))

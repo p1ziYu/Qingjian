@@ -101,7 +101,6 @@ class Settings:
     sort_mode: str = "name"
     sort_reverse: bool = False
     short_video_seconds: int = 60
-    header_only_orientation: bool = True
     # safety
     verification: str = VERIFY_FULL
     fast_path: bool = True
@@ -136,7 +135,6 @@ class Settings:
             "recursive": self.recursive, "filter_mode": self.filter_mode,
             "sort_mode": self.sort_mode, "sort_reverse": self.sort_reverse,
             "short_video_seconds": self.short_video_seconds,
-            "header_only_orientation": self.header_only_orientation,
             "verification": self.verification, "fast_path": self.fast_path,
             "recycle_mode": self.recycle_mode, "quota": self.quota.to_dict(),
             "logging_enabled": self.logging_enabled, "log_days": self.log_days,
@@ -187,7 +185,6 @@ class Settings:
         settings.sort_mode = text("sort_mode", default="name")
         settings.sort_reverse = flag("sort_reverse", False)
         settings.short_video_seconds = number("short_video_seconds", 60, 1, 86400)
-        settings.header_only_orientation = flag("header_only_orientation", True)
         settings.verification = text("verification", (VERIFY_FULL, VERIFY_FAST), VERIFY_FULL)
         settings.fast_path = flag("fast_path", True)
         settings.recycle_mode = text("recycle_mode", (RECYCLE_SOFT, RECYCLE_SYSTEM), RECYCLE_SOFT)

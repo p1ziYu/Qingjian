@@ -191,7 +191,7 @@ def find_exact(paths: Sequence[Path], cache=None, ignored: set[str] | None = Non
             info = metadata.read(path)
             candidates.append(Candidate(
                 path=path, size=info.size, width=info.width, height=info.height,
-                captured=info.when().timestamp(), digest=digest, similarity=1.0))
+                captured=info.timestamp(), digest=digest, similarity=1.0))
         candidates.sort(key=lambda c: (len(str(c.path)), str(c.path)))
         groups.append(Group(mode=MODE_EXACT, members=candidates, keeper=0))
     progress("", 100)
@@ -322,7 +322,7 @@ def _build_candidates(paths: list[Path], hashes: list[int], cache, score_quality
             else:
                 sharp = float(cached)
         out.append(Candidate(path=path, size=info.size, width=info.width, height=info.height,
-                             sharpness=sharp, captured=info.when().timestamp(),
+                             sharpness=sharp, captured=info.timestamp(),
                              digest=digest, phash=value, defect=defect))
     return out
 
@@ -376,7 +376,7 @@ def find_bursts(paths: Sequence[Path], gap_seconds: float = 2.0, minimum: int = 
         value = int(cached) if cached is not None else imaging.phash(path)
         if value is None:
             return None
-        return (info.when().timestamp(), int(value))
+        return (info.timestamp(), int(value))
 
     entries = []
     with (cache.batch() if cache is not None else nullcontext()):

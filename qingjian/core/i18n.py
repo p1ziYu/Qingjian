@@ -217,6 +217,7 @@ CATALOG: dict[str, tuple[str, str]] = {
 
     # ---- errors --------------------------------------------------------
     "error.title": ("操作未完成", "Operation not completed"),
+    "error.decoder_missing": ("缺少 {format} 解码器", "{format} decoder is not installed"),
     "error.folder_missing": ("文件夹不存在或无法访问", "That folder is missing or unreadable"),
     "error.target_is_source": (
         "目标是当前文件所在文件夹，请选择其他位置",
@@ -610,11 +611,6 @@ CATALOG: dict[str, tuple[str, str]] = {
     "settings.hash_cache.desc": (
         "按路径 + 大小 + 修改时间缓存 SHA-256，重复查重不再整盘重算",
         "Keys SHA-256 by path + size + mtime, so a re-scan does not re-read the disk",
-    ),
-    "settings.header_only_orientation": ("方向筛选只读文件头", "Read headers only for orientation filters"),
-    "settings.header_only_orientation.desc": (
-        "横向 / 纵向筛选不再整张解码，几千张图从分钟级降到秒级",
-        "Landscape / portrait filters stop fully decoding each image — minutes become seconds",
     ),
     "settings.version": ("版本", "Version"),
     "settings.up_to_date": ("已是最新", "Up to date"),

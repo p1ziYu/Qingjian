@@ -13,6 +13,9 @@ from pathlib import Path
 
 # Only the tags that drive sorting, templates and the info panel.
 IFD0_TAGS = {
+    0x00FE: "_NewSubfileType",
+    0x014A: "_SubIFDs",
+    0xC620: "_DefaultCropSize",
     0x010F: "Make",
     0x0110: "Model",
     0x0112: "Orientation",
@@ -107,9 +110,9 @@ def _read_ifd(blob: bytes, endian: str, offset: int, names: dict[int, str]) -> d
         except struct.error:
             break
         name = names.get(tag)
-        if not name:
+        if not name or name in out:
             continue
-        if length > 65535:
+        if (kind in (2, 7) and length > 4096) or (kind not in (2, 7) and length > 16):
             continue
         value = _read_value(blob, endian, kind, length, entry + 8)
         if value is not None:
@@ -141,11 +144,26 @@ def read_tiff_exif(path: str | Path, max_bytes: int = 2 * 1024 * 1024) -> dict:
         magic, first = struct.unpack_from(endian + "HI", blob, 2)
     except struct.error:
         return {}
-    if magic not in (42, 43):  # 43 is BigTIFF, whose IFDs differ; bail out.
-        return {}
-    if magic == 43:
+    if magic not in (42, 0x4F52, 0x5352, 0x0055):
         return {}
     data = _read_ifd(blob, endian, first, IFD0_TAGS)
+    sub_offset = data.pop("_SubIFDs", None)
+    thumbnail = bool(int(data.pop("_NewSubfileType", 0) or 0) & 1)
+    crop = data.pop("_DefaultCropSize", None)
+    if isinstance(sub_offset, list):
+        sub_offset = sub_offset[0] if sub_offset else None
+    main = _read_ifd(blob, endian, sub_offset, IFD0_TAGS) if isinstance(sub_offset, int) else {}
+    if main:
+        main.pop("_NewSubfileType", None)
+        main.pop("_SubIFDs", None)
+        crop = main.pop("_DefaultCropSize", crop)
+        if main.get("ImageWidth") and main.get("ImageLength"):
+            data.update({key: main[key] for key in ("ImageWidth", "ImageLength")})
+    elif thumbnail:
+        data.pop("ImageWidth", None)
+        data.pop("ImageLength", None)
+    if isinstance(crop, list) and len(crop) >= 2:
+        data["ImageWidth"], data["ImageLength"] = int(crop[0]), int(crop[1])
     exif_offset = data.pop("_ExifIFD", None)
     data.pop("_DNGVersion", None)
     if isinstance(exif_offset, int):

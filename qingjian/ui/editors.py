@@ -570,10 +570,6 @@ class SettingsDialog(QDialog):
         card.add_row(SettingRow(
             tr("settings.hash_cache"), tr("settings.hash_cache.desc"),
             self._switch("hash_cache", self.settings.hash_cache)))
-        card.add_row(SettingRow(
-            tr("settings.header_only_orientation"),
-            tr("settings.header_only_orientation.desc"),
-            self._switch("header_only", self.settings.header_only_orientation)))
         threshold = QDoubleSpinBox()
         threshold.setRange(0.80, 1.0)
         threshold.setSingleStep(0.01)
@@ -625,7 +621,6 @@ class SettingsDialog(QDialog):
         settings.workers = get("workers").value()
         settings.thumb_cache_mb = get("thumb_cache").value()
         settings.hash_cache = get("hash_cache").isChecked()
-        settings.header_only_orientation = get("header_only").isChecked()
         settings.similar_threshold = float(get("similar_threshold").value())
         settings.quota = QuotaPolicy(
             max_operations=get("quota_ops").value(),

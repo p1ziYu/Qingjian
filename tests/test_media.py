@@ -466,3 +466,365 @@ class G06Task6Tests(TestCase):
                 release.set()
                 results = [first.result(2)] + [f.result(2) for f in others]
         self.assertEqual([True] * 4, results)
+
+
+# G09 media parsing and decoding regressions.
+import io
+import sqlite3
+import struct
+from datetime import timezone
+
+import numpy as np
+from PIL import PngImagePlugin
+from PySide6.QtCore import QSize
+from unittest.mock import MagicMock
+
+from qingjian.core import scanner
+from qingjian.core.hashcache import HashCache
+from qingjian.ui import preview as preview_module
+from qingjian.ui.mainwindow import MainWindow
+
+
+def g09_jpeg_bytes(size=(128, 96)):
+    stream = io.BytesIO()
+    Image.new('RGB', size, (90, 140, 190)).save(stream, 'JPEG')
+    return stream.getvalue()
+
+
+def g09_tiff_ifd(entries, offset):
+    data = b''
+    out = struct.pack('<H', len(entries))
+    base = offset + 2 + 12 * len(entries) + 4
+    for tag, kind, count, value in sorted(entries):
+        if isinstance(value, bytes):
+            if len(value) <= 4:
+                encoded = value.ljust(4, b'\0')
+            else:
+                encoded = struct.pack('<I', base + len(data))
+                data += value + b'\0' * (len(value) % 2)
+        elif kind == 3:
+            encoded = struct.pack('<H', value) + b'\0\0'
+        else:
+            encoded = struct.pack('<I', value)
+        out += struct.pack('<HHI', tag, kind, count) + encoded
+    return out + struct.pack('<I', 0) + data
+
+
+class G09MediaTests(TempCase):
+    def setUp(self):
+        super().setUp()
+        self.root = self.tmp
+
+    def test_f061_undecodable_extensions_and_heic_worker(self):
+        heic = self.root / 'a.heic'
+        heic.write_bytes(b'not-a-heic')
+        self.assertTrue(mediatypes.is_media(heic))
+        self.assertFalse(mediatypes.is_decodable(heic))
+        self.assertFalse(mediatypes.is_decodable(self.root / 'a.heif'))
+        self.assertFalse(mediatypes.is_decodable(self.root / 'a.jxl'))
+        self.assertTrue(imaging.decodes_slowly(heic))
+
+    def test_f061_missing_decoder_message(self):
+        from PySide6.QtCore import QSize
+        from qingjian.ui.preview import decode_qimage
+        path = self.root / 'sample.heic'
+        path.write_bytes(b'bad HEIC')
+        image, error = decode_qimage(path, QSize(640, 480))
+        self.assertTrue(image.isNull())
+        self.assertIn('HEIC', error.upper())
+        self.assertTrue('decoder' in error.lower() or '解码器' in error)
+
+    def test_f052_png_metadata_does_not_load_pixels(self):
+        path = self.root / 'picture.png'
+        Image.new('RGB', (64, 48)).save(path)
+        original = PngImagePlugin.PngImageFile.load
+        calls = []
+        def counted(image, *args, **kwargs):
+            calls.append(1)
+            return original(image, *args, **kwargs)
+        with patch.object(PngImagePlugin.PngImageFile, 'load', counted):
+            info = metadata.read(path, use_cache=False)
+            captured = metadata.capture_only(path)
+        self.assertEqual((info.width, info.height), (64, 48))
+        self.assertIsNotNone(captured)
+        self.assertEqual(calls, [])
+        tagged = self.root / 'tagged.png'
+        exif = Image.Exif()
+        exif[306] = '2024:05:01 07:00:00'
+        Image.new('RGB', (32, 24)).save(tagged, exif=exif)
+        self.assertFalse(metadata.read(tagged, use_cache=False).captured_is_fallback)
+
+    def test_f053_f055_subifd_dimensions_and_duplicate_tags(self):
+        preview = g09_jpeg_bytes((1500, 1000))
+        make = b'NIKON\0'
+        date = b'2024:05:01 07:00:00\0'
+        ifd0_at = 8
+        shell = [(0xFE, 4, 1, 1), (0x100, 4, 1, 160), (0x101, 4, 1, 120),
+                 (0x10F, 2, len(make), make), (0x14A, 4, 1, 0), (0x8769, 4, 1, 0)]
+        sub_at = ifd0_at + len(g09_tiff_ifd(shell, ifd0_at))
+        sub = [(0xFE, 4, 1, 0), (0x100, 4, 1, 1500), (0x101, 4, 1, 1000)]
+        exif_at = sub_at + len(g09_tiff_ifd(sub, sub_at))
+        blob = b'II*\0' + struct.pack('<I', 8)
+        blob += g09_tiff_ifd(shell[:-2] + [(0x14A, 4, 1, sub_at), (0x8769, 4, 1, exif_at)], ifd0_at)
+        blob += g09_tiff_ifd(sub, sub_at)
+        blob += g09_tiff_ifd([(0x9003, 2, len(date), date)], exif_at)
+        path = self.root / 'sample.nef'
+        path.write_bytes(blob + preview)
+        info = metadata.read(path, use_cache=False)
+        self.assertEqual((info.width, info.height), (1500, 1000))
+        self.assertIn('NIKON', info.camera)
+        self.assertFalse(info.captured_is_fallback)
+        jpg = self.root / 'sample.jpg'
+        jpg.write_bytes(preview)
+        groups = dedupe.find_similar([path, jpg])
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0].keep().path, path)
+
+    def test_f055_duplicate_values_are_skipped(self):
+        count = 128
+        data_at = 8 + 2 + 12 * count + 4
+        one = struct.pack('<HHII', 0x100, 3, 500, data_at)
+        path = self.root / 'crafted.dng'
+        path.write_bytes(b'II*\0' + struct.pack('<I', 8) + struct.pack('<H', count)
+                         + one * count + struct.pack('<I', 0) + b'\0' * 1000)
+        original = exifread._read_value
+        calls = []
+        def counted(*args):
+            calls.append(1)
+            return original(*args)
+        with patch.object(exifread, '_read_value', counted):
+            exifread.read_tiff_exif(path)
+        self.assertLessEqual(len(calls), 1)
+
+    def test_f055_oversized_numeric_tag_is_skipped(self):
+        data_at = 8 + 2 + 12 + 4
+        path = self.root / 'oversized.dng'
+        path.write_bytes(b'II*\0' + struct.pack('<I', 8) + struct.pack('<H', 1)
+                         + struct.pack('<HHII', 0x100, 3, 65535, data_at)
+                         + struct.pack('<I', 0) + b'\0' * (65535 * 2))
+        with patch.object(exifread, '_read_value', side_effect=AssertionError('large array parsed')):
+            self.assertNotIn('ImageWidth', exifread.read_tiff_exif(path))
+
+    def test_f054_variant_tiff_magic(self):
+        date = b'2024:05:01 07:00:00\0'
+        exif_at = 8 + len(g09_tiff_ifd([(0x8769, 4, 1, 0)], 8))
+        body = g09_tiff_ifd([(0x8769, 4, 1, exif_at)], 8)
+        body += g09_tiff_ifd([(0x9003, 2, len(date), date)], exif_at)
+        for magic, ext in ((0x4F52, '.orf'), (0x5352, '.orf'), (0x0055, '.rw2')):
+            with self.subTest(magic=magic):
+                path = self.root / f'{magic}{ext}'
+                path.write_bytes(b'II' + struct.pack('<HI', magic, 8) + body)
+                self.assertEqual(exifread.read_tiff_exif(path)['DateTimeOriginal'], '2024:05:01 07:00:00')
+                self.assertFalse(metadata.read(path, use_cache=False).captured_is_fallback)
+
+    def test_f051_jpeg_display_orientation(self):
+        path = self.root / 'rotated.jpg'
+        exif = Image.Exif()
+        exif[0x112] = 6
+        Image.new('RGB', (400, 300)).save(path, exif=exif)
+        self.assertTrue(metadata.read(path).is_portrait)
+        self.assertEqual(scanner.apply_filter([path], scanner.FilterSpec(mode='portrait')), [path])
+        self.assertEqual(scanner.apply_filter([path], scanner.FilterSpec(mode='landscape')), [])
+
+    def test_f051_video_tkhd_rotation(self):
+        path = self.root / 'rotated.mp4'
+        matrix = struct.pack('>9i', 0, 65536, 0, -65536, 0, 0, 0, 0, 0x40000000)
+        tkhd = b'\0\0\0\0' + b'\0' * 8 + struct.pack('>I', 1) + b'\0' * 4
+        tkhd += b'\0' * 4 + b'\0' * 8 + b'\0' * 8 + matrix
+        tkhd += struct.pack('>II', 400 << 16, 300 << 16)
+        box = lambda kind, body: struct.pack('>I4s', len(body) + 8, kind) + body
+        path.write_bytes(box(b'ftyp', b'isom') + box(b'moov', box(b'trak', box(b'tkhd', tkhd))))
+        with patch.object(metadata, '_av', return_value=None):
+            info = metadata.read(path, use_cache=False)
+        self.assertEqual((info.width, info.height), (400, 300))
+        self.assertTrue(info.is_portrait)
+        with patch.object(metadata, '_av', return_value=None):
+            self.assertEqual(scanner.apply_filter([path], scanner.FilterSpec(mode='portrait')), [path])
+            self.assertEqual(scanner.apply_filter([path], scanner.FilterSpec(mode='landscape')), [])
+
+    def test_f051_pyav_path_uses_tkhd_rotation(self):
+        path = self.root / 'rotated-with-av.mp4'
+        matrix = struct.pack('>9i', 0, 65536, 0, -65536, 0, 0, 0, 0, 0x40000000)
+        tkhd = b'\0\0\0\0' + b'\0' * 8 + struct.pack('>I', 1) + b'\0' * 4
+        tkhd += b'\0' * 4 + b'\0' * 8 + b'\0' * 8 + matrix
+        tkhd += struct.pack('>II', 400 << 16, 300 << 16)
+        box = lambda kind, body: struct.pack('>I4s', len(body) + 8, kind) + body
+        path.write_bytes(box(b'ftyp', b'isom') + box(b'moov', box(b'trak', box(b'tkhd', tkhd))))
+
+        class Stream:
+            duration = None
+            time_base = None
+            width = 400
+            height = 300
+            codec_context = type('Codec', (), {'name': 'mpeg4'})()
+            average_rate = None
+            metadata = {}
+
+        class Container:
+            duration = None
+            streams = type('Streams', (), {'video': [Stream()]})()
+            metadata = {}
+            def __enter__(self): return self
+            def __exit__(self, *args): return None
+
+        fake_av = type('AV', (), {'open': lambda *args: Container(), 'time_base': 1000000})()
+        with patch.object(metadata, '_av', return_value=fake_av):
+            info = metadata.read(path, use_cache=False)
+        self.assertEqual(info.rotation, 90)
+        self.assertTrue(info.is_portrait)
+
+    def test_f058_embedded_jpeg_internal_eoi(self):
+        image = g09_jpeg_bytes((128, 96))
+        thumb = g09_jpeg_bytes((32, 24))
+        tiff = b'II*\0' + struct.pack('<I', 8)
+        tiff += struct.pack('<H', 0) + struct.pack('<I', 14)
+        tiff += struct.pack('<H', 2)
+        tiff += struct.pack('<HHII', 0x201, 4, 1, 44)
+        tiff += struct.pack('<HHII', 0x202, 4, 1, len(thumb)) + struct.pack('<I', 0)
+        payload = b'Exif\0\0' + tiff + thumb
+        app1 = b'\xff\xe1' + struct.pack('>H', len(payload) + 2) + payload
+        embedded = image[:2] + app1 + image[2:]
+        path = self.root / 'sample.raf'
+        path.write_bytes(b'FUJIFILM' + b'\0' * 40 + embedded + b'RAW DATA')
+        self.assertEqual(imaging.extract_embedded_jpeg(path), embedded)
+        self.assertEqual(imaging.open_image(path).size, (128, 96))
+        self.assertIsNotNone(imaging.phash(path))
+
+    def test_f059_f060_raw_orientation_and_16_bit_hash(self):
+        preview = g09_jpeg_bytes((90, 60))
+        entries = [(0x112, 3, 1, 6), (0x201, 4, 1, 0), (0x202, 4, 1, len(preview))]
+        image_at = 8 + len(g09_tiff_ifd(entries, 8))
+        path = self.root / 'sample.nef'
+        path.write_bytes(b'II*\0' + struct.pack('<I', 8) + g09_tiff_ifd(
+            [(0x112, 3, 1, 6), (0x201, 4, 1, image_at), (0x202, 4, 1, len(preview))], 8) + preview)
+        self.assertEqual(imaging.open_image(path).size, (60, 90))
+        self.assertEqual(imaging.thumbnail(path, (100, 100)).size, (60, 90))
+        values = np.tile((np.arange(64) * 255 // 63).astype(np.uint8), (64, 1))
+        p8, p16 = self.root / '8.png', self.root / '16.png'
+        Image.fromarray(values).save(p8)
+        Image.fromarray(values.astype(np.uint16) * 257).save(p16)
+        self.assertEqual(imaging.phash(p16), imaging.phash(p8))
+
+    def test_f060_distinct_16_bit_hashes(self):
+        yy, xx = np.mgrid[:64, :64]
+        patterns = [xx * 4, yy * 4, ((xx + yy) % 16) * 16]
+        hashes = []
+        for index, values in enumerate(patterns):
+            path = self.root / f'{index}.png'
+            Image.fromarray(values.astype(np.uint16) * 257).save(path)
+            hashes.append(imaging.phash(path))
+        self.assertEqual(len(set(hashes)), 3)
+
+    def test_f060_16_bit_matches_8_bit(self):
+        yy, xx = np.mgrid[:64, :64]
+        values = np.where((xx - 32) ** 2 + (yy - 32) ** 2 < 225, 200, 20).astype(np.uint8)
+        p8, p16 = self.root / '8.png', self.root / '16.png'
+        Image.fromarray(values).save(p8)
+        Image.fromarray(values.astype(np.uint16) * 257).save(p16)
+        self.assertEqual(imaging.phash(p16), imaging.phash(p8))
+
+    def test_f050_video_utc_to_local(self):
+        class Stream:
+            duration = None
+            time_base = None
+            width = 64
+            height = 48
+            codec_context = type('Codec', (), {'name': 'mpeg4'})()
+            average_rate = None
+            metadata = {}
+        class Container:
+            duration = None
+            streams = type('Streams', (), {'video': [Stream()]})()
+            metadata = {'creation_time': '2024-04-30T23:00:00Z'}
+            def __enter__(self): return self
+            def __exit__(self, *args): return None
+        fake_av = type('AV', (), {'open': lambda *args: Container(), 'time_base': 1000000})()
+        path = self.root / 'clip.mp4'
+        path.write_bytes(b'clip')
+        with patch.object(metadata, '_av', return_value=fake_av):
+            info = metadata.read(path, use_cache=False)
+        expected = datetime(2024, 4, 30, 23, tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
+        self.assertEqual(info.captured, expected)
+
+    def test_f050_captured_cache_version(self):
+        path = self.root / 'clip.mp4'
+        path.write_bytes(b'clip')
+        db = self.root / 'old.sqlite'
+        from qingjian.core.hashcache import SCHEMA
+        stat = path.stat()
+        connection = sqlite3.connect(db)
+        try:
+            connection.executescript(SCHEMA)
+            connection.execute('INSERT INTO entries(path,size,mtime_ns,captured,updated) VALUES(?,?,?,?,?)',
+                               (str(path), stat.st_size, stat.st_mtime_ns, 123.0, 0.0))
+            connection.commit()
+        finally:
+            connection.close()
+        cache = HashCache(db)
+        self.addCleanup(cache.close)
+        self.assertIsNone(cache.get(path, 'captured'))
+
+    def test_f050_f056_hashcache_migration_and_replace(self):
+        path = self.root / 'media.bin'
+        path.write_bytes(b'A' * 100)
+        db = self.root / 'cache.sqlite'
+        cache = HashCache(db)
+        self.addCleanup(cache.close)
+        cache.put(path, sha256='old', phash=42, sharpness=8.0, captured=1.0)
+        cache.close()
+        path.write_bytes(b'B' * 200)
+        cache = HashCache(db)
+        self.addCleanup(cache.close)
+        cache.put(path, captured=2.0)
+        cache.close()
+        cache = HashCache(db)
+        self.addCleanup(cache.close)
+        self.assertIsNone(cache.get(path, 'sha256'))
+        self.assertIsNone(cache.get(path, 'phash'))
+        self.assertIsNone(cache.get(path, 'sharpness'))
+        cache.close()
+        parsed = metadata._parse_datetime('2024-04-30T23:00:00Z')
+        self.assertEqual(parsed.tzinfo, timezone.utc)
+
+    def test_f062_safe_timestamp(self):
+        info = metadata.MediaInfo(path=self.root / 'old.jpg', captured=datetime(1970, 1, 1))
+        self.assertEqual(info.timestamp(), 0)
+
+    def test_f061_slow_decode_error_reaches_existing_status_bar(self):
+        path = self.root / 'sample.heic'
+        path.write_bytes(b'bad HEIC')
+        target = QSize(640, 480)
+        self.assertTrue(imaging.decodes_slowly(path))
+        fetcher = preview_module.PreviewPrefetcher()
+        self.addCleanup(fetcher.shutdown)
+        fetcher.request(path, target)
+        fetcher._pool.waitForDone(3000)
+        APP.processEvents()
+        error = fetcher.error(path, target)
+        self.assertIn('HEIC', error.upper())
+        self.assertTrue('decoder' in error.lower() or '解码器' in error)
+
+        fake = MagicMock()
+        fake.engine.current_path.return_value = path
+        fake.preview.EMPTY = 0
+        fake.preview.stack.currentIndex.return_value = 0
+        fake._preview_target.return_value = target
+        fake.preloader = fetcher
+        fake._preview_retries = {}
+        MainWindow._preview_arrived(fake, str(path))
+        shown = fake.status.call_args.args[0]
+        self.assertIn(error, shown)
+        fake.status.assert_called_once_with(shown, 'warning')
+
+    def test_f060_10_and_12_bit_containers_use_their_actual_range(self):
+        yy, xx = np.mgrid[:64, :64]
+        pattern = ((xx * 3 + yy * 5) % 256).astype(np.uint16)
+        for bits in (10, 12):
+            with self.subTest(bits=bits):
+                maximum = (1 << bits) - 1
+                values = np.rint(pattern * (maximum / 255.0)).astype(np.uint16)
+                path = self.root / f'{bits}-bit.png'
+                Image.fromarray(values).save(path)
+                gray = imaging._gray_array(path, 64)
+                self.assertEqual(0.0, float(gray.min()))
+                self.assertEqual(255.0, float(gray.max()))

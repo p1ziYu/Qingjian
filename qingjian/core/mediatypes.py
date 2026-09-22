@@ -96,5 +96,20 @@ def is_media(path: str | Path) -> bool:
     return suffix(path) in MEDIA_EXTENSIONS
 
 
+def is_decodable(path: str | Path) -> bool:
+    """Whether an installed still-image reader supports this extension."""
+    ext = suffix(path)
+    if ext not in IMAGE_EXTENSIONS:
+        return ext in RAW_EXTENSIONS or ext in VIDEO_EXTENSIONS
+    if ext not in {".heic", ".heif", ".hif", ".jxl"}:
+        return True
+    from PIL import Image  # noqa: PLC0415 - optional codec registration
+
+    Image.init()
+    if ext == ".jxl":
+        return "JXL" in Image.OPEN
+    return any(name in Image.OPEN for name in ("HEIF", "HEIC"))
+
+
 def may_animate(path: str | Path) -> bool:
     return suffix(path) in ANIMATABLE_EXTENSIONS

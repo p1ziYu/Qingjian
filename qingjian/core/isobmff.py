@@ -75,7 +75,14 @@ def read_header(path: str | Path) -> dict:
                     stream.read(16 if version == b"\x01" else 8)   # times
                     stream.read(4 + 4)                              # track id + reserved
                     stream.read(8 if version == b"\x01" else 4)     # duration
-                    stream.read(8 + 2 + 2 + 2 + 2 + 36)             # reserved + matrix
+                    stream.read(8 + 2 + 2 + 2 + 2)                  # reserved + layer/volume
+                    matrix = stream.read(36)
+                    if len(matrix) == 36:
+                        a, b, _, c, d, *_ = struct.unpack(">9i", matrix)
+                        if a == d == 0 and b == 65536 and c == -65536:
+                            result["rotation"] = 90
+                        elif a == d == 0 and b == -65536 and c == 65536:
+                            result["rotation"] = -90
                     raw = stream.read(8)
                     if len(raw) == 8:
                         width, height = struct.unpack(">II", raw)

@@ -1195,21 +1195,8 @@ class ViewSwitchRenderTests(WindowCase):
         self.app.processEvents()
 
     def let_go_of_the_gif(self) -> None:
-        """Close the handle QMovie keeps open; that leak is F-026, not this group.
-
-        `release()` only drops the reference, so on Windows the temp directory
-        cannot be removed while any movie this case made is still alive.
-        """
-        import gc
-        import shiboken6
-        from PySide6.QtGui import QMovie
+        """Release the preview before its temporary source is removed."""
         self.window.preview.release()
-        self.app.processEvents()
-        for movie in [obj for obj in gc.get_objects() if isinstance(obj, QMovie)]:
-            if shiboken6.isValid(movie):
-                movie.stop()
-                shiboken6.delete(movie)
-        gc.collect()
         self.app.processEvents()
 
     def test_coming_back_to_the_single_view_draws_the_animation_again(self):
@@ -1607,3 +1594,185 @@ class OpenFolderFailureTests(WindowCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+from tempfile import TemporaryDirectory
+from unittest import TestCase
+from PIL import Image
+from PySide6.QtGui import QPixmap
+from qingjian.ui import preview
+from qingjian.ui.app import create_app
+APP = create_app(["qingjian-tests"])
+
+class G06Task1Tests(TestCase):
+    def setUp(self):
+        self.temp = TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        os.environ["QINGJIAN_DATA_DIR"] = str(self.root / "data")
+
+    def gif(self, size=(120, 90)):
+        path = self.root / "moving.gif"
+        frames = [Image.new("RGB", size, c) for c in ("red", "green")]
+        frames[0].save(path, save_all=True, append_images=frames[1:], duration=100, loop=0)
+        return path
+
+    def test_f026_release_closes_movie_device(self):
+        pane = preview.MediaPreview()
+        pane.resize(800, 600)
+        pane.show()
+        path = self.gif()
+        self.assertTrue(pane.show_path(path)[0])
+        movie = pane._movie
+        device = movie.device()
+        self.addCleanup(device.close)
+        self.assertTrue(device.isOpen())
+        pane.release()
+        self.assertFalse(device.isOpen())
+        moved = path.with_name("moved.gif")
+        os.replace(path, moved)
+        self.assertTrue(moved.exists())
+        pane.close()
+
+    def test_f087_large_gif_is_scaled(self):
+        pane = preview.MediaPreview()
+        pane.resize(800, 600)
+        pane.show()
+        APP.processEvents()
+        self.assertTrue(pane.show_path(self.gif((2400, 1600)))[0])
+        APP.processEvents()
+        self.addCleanup(pane._movie.device().close)
+        scaled = pane._movie.scaledSize()
+        self.assertTrue(scaled.isValid())
+        self.assertLessEqual(scaled.width(), pane.animated.width())
+        self.assertLessEqual(scaled.height(), pane.animated.height())
+        pane.resize(1100, 700)
+        APP.processEvents()
+        self.assertGreaterEqual(pane._movie.scaledSize().width(), scaled.width())
+        pane.release()
+        still = self.root / "still.jpg"
+        Image.new("RGB", (400, 300), "blue").save(still)
+        self.assertTrue(pane.show_path(still)[0])
+        self.assertLessEqual(pane.stack.minimumSizeHint().width(), 800)
+        self.assertLessEqual(pane.stack.minimumSizeHint().height(), 600)
+        pane.close()
+
+
+class G06Task3Tests(TestCase):
+    def setUp(self):
+        self.temp = TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        os.environ["QINGJIAN_DATA_DIR"] = str(self.root / "data")
+
+    def test_f085_photo_keeps_height_on_tall_view(self):
+        surface = preview.ImageSurface()
+        surface.resize(2200, 1300)
+        surface.show()
+        APP.processEvents()
+        pix = QPixmap(600, 400)
+        pix.fill(Qt.GlobalColor.red)
+        surface.set_pixmap(pix)
+        APP.processEvents()
+        shown = surface.mapFromScene(surface._item.sceneBoundingRect()).boundingRect()
+        self.assertGreaterEqual(shown.height(), surface.viewport().height() - 70)
+        surface.close()
+
+
+class G06Task7Tests(TestCase):
+    def setUp(self):
+        self.temp = TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        os.environ["QINGJIAN_DATA_DIR"] = str(self.root / "data")
+
+    def test_f091_release_outside_card_does_not_activate(self):
+        from qingjian.ui.widgets import BindingCard
+        card = BindingCard(3)
+        got = []
+        card.activated.connect(got.append)
+        def send(kind, point, button, buttons):
+            APP.sendEvent(card, QMouseEvent(kind, point, point, button, buttons,
+                                            Qt.KeyboardModifier.NoModifier))
+        send(QEvent.Type.MouseButtonPress, QPointF(10, 10),
+             Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton)
+        send(QEvent.Type.MouseButtonRelease, QPointF(900, 500),
+             Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton)
+        self.assertEqual([], got)
+        card.deleteLater()
+
+    def test_f091_middle_double_click_does_not_eat_left_click(self):
+        from qingjian.ui.widgets import BindingCard
+        card = BindingCard(3)
+        got = []
+        card.activated.connect(got.append)
+        point = QPointF(10, 10)
+        def send(kind, button, buttons):
+            APP.sendEvent(card, QMouseEvent(kind, point, point, button, buttons,
+                                            Qt.KeyboardModifier.NoModifier))
+        send(QEvent.Type.MouseButtonPress, Qt.MouseButton.MiddleButton,
+             Qt.MouseButton.MiddleButton)
+        send(QEvent.Type.MouseButtonRelease, Qt.MouseButton.MiddleButton,
+             Qt.MouseButton.NoButton)
+        send(QEvent.Type.MouseButtonDblClick, Qt.MouseButton.MiddleButton,
+             Qt.MouseButton.MiddleButton)
+        send(QEvent.Type.MouseButtonRelease, Qt.MouseButton.MiddleButton,
+             Qt.MouseButton.NoButton)
+        send(QEvent.Type.MouseButtonPress, Qt.MouseButton.LeftButton,
+             Qt.MouseButton.LeftButton)
+        send(QEvent.Type.MouseButtonRelease, Qt.MouseButton.LeftButton,
+             Qt.MouseButton.NoButton)
+        self.assertEqual([3], got)
+        card.deleteLater()
+
+
+class G06PreviewOperationTests(WindowCase):
+    def test_empty_queue_clears_preview_prefetch_interest(self):
+        path = self.engine.current_path()
+        target = self.window._preview_target()
+        self.window.preloader.set_wanted([path], target)
+        self.assertTrue(self.window.preloader._wanted)
+        self.engine.queue_paths.clear()
+        self.window._refresh_view()
+        self.assertEqual(set(), self.window.preloader._wanted)
+
+    def moving_gif(self):
+        path = self.source / "moving.gif"
+        frames = [Image.new("RGB", (20, 20), color) for color in ("red", "blue")]
+        frames[0].save(path, save_all=True, append_images=frames[1:], duration=100)
+        self.assertTrue(self.window.preview.show_path(path)[0])
+        self.addCleanup(self.window.preview.release)
+        return path, self.window.preview._movie.device()
+
+    def test_sync_operation_releases_preview_and_restores_on_skip(self):
+        from qingjian.core.ops import Outcome
+        path, device = self.moving_gif()
+        with mock.patch.object(self.window, "_refresh_view") as refresh, \
+             mock.patch.object(self.window, "_finish_operation"):
+            self.window._run_operation(path,
+                lambda progress, cancel: (self.assertFalse(device.isOpen()) or
+                                          Outcome(skipped=True)), "classify")
+        refresh.assert_called_once()
+
+    def test_background_operation_keeps_preview_until_worker_runs(self):
+        path, device = self.moving_gif()
+        self.settings.background_queue = True
+        with mock.patch.object(self.window, "_detach", return_value=0), \
+             mock.patch.object(self.engine, "enqueue") as enqueue:
+            enqueue.return_value.id = "queued"
+            self.window._run_operation(path, lambda *_: None, "classify")
+        self.assertTrue(device.isOpen())
+
+    def test_failed_rename_releases_preview_then_restores_it(self):
+        from PySide6.QtWidgets import QInputDialog
+        path, device = self.moving_gif()
+        with mock.patch.object(QInputDialog, "getText", return_value=("new.gif", True)), \
+             mock.patch.object(self.engine, "current_path", return_value=path), \
+             mock.patch.object(self.engine, "rename", side_effect=OSError("busy")) as rename, \
+             mock.patch.object(self.window, "_refresh_view") as refresh, \
+             mock.patch.object(self.window, "_report"):
+            rename.side_effect = lambda *_: (self.assertFalse(device.isOpen()) or
+                                             (_ for _ in ()).throw(OSError("busy")))
+            self.window.rename_current()
+        refresh.assert_called_once()

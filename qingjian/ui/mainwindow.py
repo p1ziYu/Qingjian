@@ -981,6 +981,7 @@ class MainWindow(QMainWindow):
         """
         path = self.engine.current_path()
         if path is None:
+            self.preloader.set_wanted([], self._preview_target())
             return
         self.counter_label.setText(f"{self.engine.index + 1} / {len(self.engine.queue_paths)}")
         elide(self.filename_label, path.name, max(160, self.filename_label.width()))
@@ -1047,6 +1048,7 @@ class MainWindow(QMainWindow):
         self.metadata_bar.setVisible(path is not None)
         self.filmstrip_holder.setVisible(total > 0)
         if path is None:
+            self.preloader.set_wanted([], self._preview_target())
             if not self.engine.source_root:
                 self.preview.show_empty(tr("header.no_folder"), tr("scan.hint_start"))
             else:
@@ -1065,6 +1067,11 @@ class MainWindow(QMainWindow):
         # prefetching here would only spend time on a page nobody can see.
         if self.view_mode == config.VIEW_SINGLE:
             target = self._preview_target()
+            queue = self.engine.queue_paths
+            index = self.engine.index
+            wanted = [path] + ([queue[(index + step) % total]
+                                 for step in (1, 2, -1)] if total > 1 else [])
+            self.preloader.set_wanted(wanted, target)
             ready = self.preloader.take(path, target)
             if ready is None and decodes_slowly(path):
                 # A large PNG or TIFF cannot be scaled while it is decoded, so it
@@ -1078,6 +1085,8 @@ class MainWindow(QMainWindow):
                     self.status(tr("status.preview_failed", name=path.name, error=error),
                                 "warning")
             self._prefetch_neighbours()
+        else:
+            self.preloader.set_wanted([], self._preview_target())
         elide(self.filename_label, path.name, max(160, self.filename_label.width()))
         info = metadata.read(path)
         bits = []
@@ -1611,11 +1620,18 @@ class MainWindow(QMainWindow):
         if self._blocked():
             return
         if not self.settings.background_queue:
+            released = self.preview.current_path == path
+            if released:
+                self.preview.release()
             try:
                 outcome = work(lambda message, percent: None, lambda: False)
             except (TransactionError, NameError_, OSError) as error:
+                if released:
+                    self._refresh_view()
                 self._report(error)
                 return
+            if released and (outcome is None or outcome.cancelled or outcome.skipped):
+                self._refresh_view()
             self._finish_operation(path, self.engine.index, outcome)
             return
         # _detach reports the row the item really occupied. Using the
@@ -1747,10 +1763,17 @@ class MainWindow(QMainWindow):
                 if decision in (ops.CONFLICT_CANCEL, ops.CONFLICT_SKIP):
                     return
             resolver = (lambda a, b, value=decision: value) if decision else ops.always_sequence
+            released = self.preview.current_path == path
+            if released:
+                self.preview.release()
             outcome = self.engine.rename(new_name, path, resolver)
         except (NameError_, TransactionError, OSError, ValueError) as error:
+            if self.preview.current_path == path:
+                self._refresh_view()
             self._report(error)
             return
+        if released and (outcome is None or outcome.cancelled or outcome.skipped):
+            self._refresh_view()
         # `_finish_operation` owns the absorb in synchronous mode; doing it here
         # as well patched the views twice for one rename.
         if self.settings.background_queue:

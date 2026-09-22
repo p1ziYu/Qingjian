@@ -61,22 +61,24 @@ def placeholder(size: QSize, kind: str, caption: str = "") -> QPixmap:
 
 
 class _Signals(QObject):
-    ready = Signal(str, int, object)
+    ready = Signal(object, int, object)
 
 
 class _Task(QRunnable):
     """Decodes one thumbnail, unless the view has moved on by the time it runs."""
 
-    def __init__(self, path: Path, edge: int, signals: _Signals, still_wanted) -> None:
+    def __init__(self, path: Path, edge: int, key: tuple, signals: _Signals,
+                 still_wanted) -> None:
         super().__init__()
         self.path = path
         self.edge = edge
+        self.key = key
         self.signals = signals
         self.still_wanted = still_wanted
 
     def run(self) -> None:                      # noqa: D401 - Qt entry point
         if not self.still_wanted(str(self.path), self.edge):
-            self.signals.ready.emit(str(self.path), -self.edge, None)
+            self.signals.ready.emit(self.key, -self.edge, None)
             return
         image = None
         try:
@@ -91,7 +93,7 @@ class _Task(QRunnable):
                 image = pil_to_qimage(thumb)
         except Exception as error:
             log.debug("thumbnail failed for %s: %s", self.path, error)
-        self.signals.ready.emit(str(self.path), self.edge, image)
+        self.signals.ready.emit(self.key, self.edge, image)
 
 
 class ThumbnailCache(QObject):
@@ -163,18 +165,16 @@ class ThumbnailCache(QObject):
         self._pending.add(key)
         with self._lock:
             self._wanted.add((str(target), edge))
-        self._pool.start(_Task(target, edge, self._signals, self._is_wanted))
+        self._pool.start(_Task(target, edge, key, self._signals, self._is_wanted))
         return None
 
-    def _store(self, path: str, edge: int, image) -> None:
+    def _store(self, key: tuple, edge: int, image) -> None:
+        self._pending.discard(key)
         if edge < 0:
             # The task was dropped because the view had scrolled past it.
-            self._pending.discard(self._key(Path(path), -edge))
             self.dropped.emit(-edge)
             return
-        target = Path(path)
-        key = self._key(target, edge)
-        self._pending.discard(key)
+        target = Path(key[0])
         if image is None or (hasattr(image, "isNull") and image.isNull()):
             info = metadata.read(target)
             caption = metadata.format_duration(info.duration) if info.duration else ""
@@ -194,6 +194,7 @@ class ThumbnailCache(QObject):
 
     def clear(self) -> None:
         self._cache.clear()
+        self._pending.clear()
         self._bytes = 0
         with self._lock:
             self._wanted.clear()

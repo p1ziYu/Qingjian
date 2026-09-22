@@ -24,7 +24,7 @@ from .viewport import clamp_index
 from .i18n import tr
 from .logsetup import get_logger
 from .opqueue import Job, OperationQueue
-from .safestore import (SafeStore, TransactionError,
+from .safestore import (SafeStore, TransactionError, _retry_sharing,
                         reclaim_candidates)
 from .state import STACK_HISTORY, STACK_REDO, Record, StateStore
 
@@ -603,7 +603,7 @@ class Engine:
                 return ops.Outcome(record=record, delta=delta)
             try:
                 for path in paths:
-                    platform_.move_to_trash(path)
+                    _retry_sharing(platform_.move_to_trash, path)
                     if path.exists():
                         raise OSError(f"Recycle did not remove source: {path}")
                     sent.append(path)

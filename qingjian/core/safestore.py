@@ -65,6 +65,23 @@ COPY = "copy"
 WRITE = "write"
 UNLINK = "unlink"
 
+
+def _retry_sharing(operation, *args):
+    """Retry only transient Windows sharing conflicts for at most 0.6 seconds."""
+    deadline = time.monotonic() + 0.6
+    delay = 0.04
+    while True:
+        try:
+            return operation(*args)
+        except PermissionError as error:
+            if getattr(error, "winerror", None) not in (32, 33):
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(min(delay, remaining))
+            delay = min(delay * 2, 0.15)
+
 def _NOOP_PROGRESS(message: str, percent: int) -> None:
     """Progress sink used when a caller does not care."""
 
@@ -153,13 +170,15 @@ def _unlink_source(src: Path, landed: Path | None = None) -> None:
     the far end gets the protection back, so nothing silently loses it.
     """
     try:
-        src.unlink()
-    except PermissionError:
+        _retry_sharing(src.unlink)
+    except PermissionError as error:
+        if getattr(error, "winerror", None) in (32, 33):
+            raise
         mode = src.stat().st_mode
         if mode & stat.S_IWRITE:
             raise                           # locked by another program, not protected
         os.chmod(src, mode | stat.S_IWRITE)
-        src.unlink()
+        _retry_sharing(src.unlink)
         if landed is not None and landed.exists():
             os.chmod(landed, stat.S_IREAD)
 
@@ -967,7 +986,7 @@ class SafeStore:
             else:
                 dst.parent.mkdir(parents=True, exist_ok=True)
             if self.fast_path and same_volume(src, dst.parent):
-                os.replace(src, dst)
+                _retry_sharing(os.replace, src, dst)
                 self._touched = True
             else:
                 step["result"] = self._staged_copy(src, dst, stage, verify, progress)

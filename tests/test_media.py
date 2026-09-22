@@ -282,3 +282,187 @@ class HashCacheTests(TempCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+import os
+import sys
+import threading
+import time
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest import TestCase
+from unittest.mock import patch
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
+from qingjian.ui import preview
+from qingjian.core import video
+from qingjian.ui.app import create_app
+APP = create_app(["qingjian-tests"])
+
+class G06Task2Tests(TestCase):
+    def setUp(self):
+        self.temp = TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        os.environ["QINGJIAN_DATA_DIR"] = str(self.root / "data")
+
+    def test_f086_sharing_violation_retries_move(self):
+        from qingjian.core import config, safestore
+        from qingjian.core.engine import Engine
+        source = self.root / "source"
+        source.mkdir()
+        path = source / "a.jpg"
+        Image.new("RGB", (20, 20), "red").save(path)
+        settings = config.Settings()
+        settings.recycle_mode = config.RECYCLE_SOFT
+        engine = Engine(self.root / "engine-data", settings)
+        self.addCleanup(engine.close)
+        engine.open_folder(source)
+        real_replace = safestore.os.replace
+        attempts = []
+        def busy_once(src, dst):
+            if Path(src) == path:
+                attempts.append(1)
+                if len(attempts) == 1:
+                    error = PermissionError(13, "sharing violation")
+                    error.winerror = 32
+                    raise error
+            return real_replace(src, dst)
+        with patch.object(safestore.os, "replace", side_effect=busy_once):
+            engine.trash(path, allow_system=False)
+        self.assertGreaterEqual(len(attempts), 2)
+        self.assertFalse(path.exists())
+
+    def test_f086_sharing_violation_retries_system_recycle(self):
+        from qingjian.core import config, platform_
+        from qingjian.core.engine import Engine
+        source = self.root / "source"
+        source.mkdir()
+        path = source / "a.jpg"
+        Image.new("RGB", (20, 20), "red").save(path)
+        settings = config.Settings()
+        settings.recycle_mode = config.RECYCLE_SYSTEM
+        engine = Engine(self.root / "engine-data", settings)
+        self.addCleanup(engine.close)
+        engine.open_folder(source)
+        attempts = []
+        def busy_once(target):
+            attempts.append(1)
+            if len(attempts) == 1:
+                error = PermissionError(13, "sharing violation")
+                error.winerror = 32
+                raise error
+            Path(target).unlink()
+        with patch.object(platform_, "trash_available", return_value=True), \
+             patch.object(platform_, "can_recycle", return_value=True), \
+             patch.object(platform_, "move_to_trash", side_effect=busy_once):
+            engine.trash(path)
+        self.assertEqual(2, len(attempts))
+        self.assertFalse(path.exists())
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows sharing semantics")
+    def test_f117_real_windows_sharing_lock_retries_move(self):
+        import ctypes
+        from qingjian.core.safestore import _retry_sharing
+        path = self.root / "held.jpg"
+        target = self.root / "moved.jpg"
+        path.write_bytes(b"photo")
+        create = ctypes.windll.kernel32.CreateFileW
+        create.argtypes = [ctypes.c_wchar_p, ctypes.c_uint, ctypes.c_uint,
+                           ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint,
+                           ctypes.c_void_p]
+        create.restype = ctypes.c_void_p
+        handle = create(str(path), 0x80000000, 1, None, 3, 0, None)
+        self.assertNotEqual(ctypes.c_void_p(-1).value, handle)
+        release = threading.Timer(0.12, ctypes.windll.kernel32.CloseHandle,
+                                  args=(handle,))
+        release.start()
+        try:
+            _retry_sharing(os.replace, path, target)
+        finally:
+            release.join(1)
+        self.assertTrue(target.exists())
+
+
+class G06Task6Tests(TestCase):
+    def setUp(self):
+        self.temp = TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        os.environ["QINGJIAN_DATA_DIR"] = str(self.root / "data")
+
+    def test_f017_previous_frame_at_end_stops_after_one_window(self):
+        from fractions import Fraction
+        class Frame:
+            width, height = 64, 48
+            def __init__(self, number):
+                self.pts = number
+            def reformat(self, **kwargs):
+                return self
+            def to_image(self):
+                return Image.new("RGB", (64, 48))
+        class Container:
+            def __init__(self):
+                self.streams = SimpleNamespace(video=[SimpleNamespace(
+                    start_time=0, time_base=Fraction(1, 25))])
+                self.start = 0
+                self.decoded = 0
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+            def seek(self, pts, **kwargs):
+                self.start = max(0, (int(pts) // 25) * 25)
+            def decode(self, stream):
+                for number in range(self.start, 300):
+                    self.decoded += 1
+                    yield Frame(number)
+        container = Container()
+        with patch.object(video, "_av", return_value=SimpleNamespace(
+                open=lambda path: container)):
+            result = video.frame_at(self.root / "clip.mp4", 12.0, -1)
+        self.assertAlmostEqual(11.96, result[1], places=2)
+        self.assertLessEqual(container.decoded, 120)
+
+    def test_f017_step_uses_position_before_pause(self):
+        pane = preview.MediaPreview()
+        pane.current_path = self.root / "clip.mp4"
+        class Player:
+            def __init__(self):
+                self.current = 12000
+            def pause(self):
+                self.current = 0
+            def position(self):
+                return self.current
+        pane.player = Player()
+        with patch.object(video, "available", return_value=True), \
+             patch.object(video, "frame_at",
+                          return_value=(Image.new("RGB", (16, 16)), 11.96)) as frame:
+            pane.step_frame(-1)
+        self.assertEqual(12.0, frame.call_args.args[1])
+        pane.close()
+
+    def test_f057_first_import_is_atomic(self):
+        real_import = __import__
+        entered = threading.Event()
+        release = threading.Event()
+        fake_av = SimpleNamespace()
+        def slow_import(name, *args, **kwargs):
+            if name == "av":
+                entered.set()
+                release.wait(2)
+                return fake_av
+            return real_import(name, *args, **kwargs)
+        old_checked, old_av = video._CHECKED, video._AV
+        video._CHECKED, video._AV = False, None
+        self.addCleanup(setattr, video, "_CHECKED", old_checked)
+        self.addCleanup(setattr, video, "_AV", old_av)
+        with patch("builtins.__import__", side_effect=slow_import):
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                first = pool.submit(video.available)
+                self.assertTrue(entered.wait(2))
+                others = [pool.submit(video.available) for _ in range(3)]
+                time.sleep(0.05)
+                release.set()
+                results = [first.result(2)] + [f.result(2) for f in others]
+        self.assertEqual([True] * 4, results)

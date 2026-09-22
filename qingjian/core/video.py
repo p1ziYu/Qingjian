@@ -7,23 +7,27 @@ of failing to start.
 from __future__ import annotations
 
 from pathlib import Path
+import threading
 
 from .logsetup import get_logger
 
 log = get_logger("video")
 _CHECKED = False
 _AV = None
+_AV_LOCK = threading.Lock()
 
 
 def _av():
     global _CHECKED, _AV
     if not _CHECKED:
-        _CHECKED = True
-        try:
-            import av  # type: ignore
-            _AV = av
-        except Exception:
-            _AV = None
+        with _AV_LOCK:
+            if not _CHECKED:
+                try:
+                    import av  # type: ignore
+                    _AV = av
+                except Exception:
+                    _AV = None
+                _CHECKED = True
     return _AV
 
 
@@ -77,6 +81,8 @@ def frame_at(path: str | Path, position_seconds: float, direction: int = 1,
                         previous = (frame, timestamp)
                 if direction > 0 and last:
                     return _to_pil(last[0], max_width), last[1] - base
+                if direction < 0 and previous:
+                    return _to_pil(previous[0], max_width), previous[1] - base
                 if seek_time <= base:
                     selected = previous or first
                     if selected:

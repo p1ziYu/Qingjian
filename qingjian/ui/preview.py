@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import threading
 
 from collections import OrderedDict
 
@@ -13,7 +14,8 @@ from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (QComboBox, QFrame, QGraphicsPixmapItem, QGraphicsRectItem,
                                QGraphicsScene, QGraphicsView, QHBoxLayout, QLabel, QPushButton,
-                               QSlider, QStackedWidget, QToolButton, QVBoxLayout, QWidget)
+                               QSizePolicy, QSlider, QStackedWidget, QToolButton, QVBoxLayout,
+                               QWidget)
 
 from ..core import imaging, mediatypes, video
 from ..core.i18n import tr
@@ -69,24 +71,38 @@ def decode_pixmap(path: str | Path, target: QSize) -> tuple[QPixmap, str]:
 
 
 class _PreloadSignals(QObject):
-    ready = Signal(object, object)
+    ready = Signal(object, int, object, bool)
 
 
 class _PreloadTask(QRunnable):
     def __init__(self, key: tuple, path: Path, target: QSize,
-                 signals: _PreloadSignals) -> None:
+                 signals: _PreloadSignals, generation: int, still_wanted) -> None:
         super().__init__()
         self.key = key
         self.path = path
         self.target = target
         self.signals = signals
+        self.generation = generation
+        self.still_wanted = still_wanted
 
     def run(self) -> None:                       # noqa: D401 - Qt entry point
         # The key travels with the task: the pane can be resized while a decode
         # is in flight, and two sizes of one file must not be filed under each
         # other's key.
+        if not self.still_wanted(self.key, self.generation):
+            self.signals.ready.emit(self.key, self.generation, None, False)
+            return
+        # Stat on the worker, never in set_wanted on the interface thread.
+        # A queued task may now point to a newer file at the same path.
+        if self.key != PreviewPrefetcher._key(self.path, self.target):
+            self.signals.ready.emit(self.key, self.generation, None, False)
+            return
         image, _error = decode_qimage(self.path, self.target)
-        self.signals.ready.emit(self.key, None if image.isNull() else image)
+        if self.key != PreviewPrefetcher._key(self.path, self.target):
+            self.signals.ready.emit(self.key, self.generation, None, False)
+            return
+        self.signals.ready.emit(self.key, self.generation,
+                                None if image.isNull() else image, True)
 
 
 class PreviewPrefetcher(QObject):
@@ -104,6 +120,12 @@ class PreviewPrefetcher(QObject):
         super().__init__(parent)
         self._cache: "OrderedDict[tuple, QImage]" = OrderedDict()
         self._pending: set[tuple] = set()
+        # Interest tracks names and viewport size. Full cache keys below still
+        # include file identity, but recomputing four stats on every view refresh
+        # duplicates the stats done by take/request on the same paths.
+        self._wanted: set[tuple[str, int, int]] = set()
+        self._generation = 0
+        self._lock = threading.RLock()
         self._depth = max(2, depth)
         self._pool = QThreadPool(self)
         self._pool.setMaxThreadCount(2)
@@ -115,8 +137,9 @@ class PreviewPrefetcher(QObject):
         try:
             stat = Path(path).stat()
         except OSError:
-            return (str(path), target.width(), 0, 0)
-        return (str(path), target.width(), stat.st_size, stat.st_mtime_ns)
+            return (str(path), target.width(), target.height(), 0, 0)
+        return (str(path), target.width(), target.height(), stat.st_size,
+                stat.st_mtime_ns)
 
     def take(self, path: str | Path, target: QSize) -> QPixmap | None:
         """A decoded neighbour, if one was ready. Interface thread only."""
@@ -128,6 +151,17 @@ class PreviewPrefetcher(QObject):
     def prefetch(self, paths, target: QSize) -> None:
         for path in list(paths)[:self._depth]:
             self.request(path, target, priority=0)
+
+    def set_wanted(self, paths, target: QSize) -> None:
+        keys = {(str(path), target.width(), target.height()) for path in paths}
+        with self._lock:
+            self._wanted = keys
+        # Old queued tasks are cheap to discard in their run method; clearing
+        # the pool here would also discard current requests queued just before it.
+
+    def _still_wanted(self, key: tuple, generation: int) -> bool:
+        with self._lock:
+            return generation == self._generation and key[:3] in self._wanted
 
     def request(self, path: str | Path, target: QSize, priority: int = 1) -> bool:
         """Decode *path* on a worker. True when it was queued or already in hand.
@@ -144,11 +178,19 @@ class PreviewPrefetcher(QObject):
         if key in self._pending:
             return True
         self._pending.add(key)
-        self._pool.start(_PreloadTask(key, candidate, target, self._signals), priority)
+        with self._lock:
+            self._wanted.add(key[:3])
+            generation = self._generation
+        self._pool.start(_PreloadTask(key, candidate, target, self._signals,
+                                      generation, self._still_wanted), priority)
         return True
 
-    def _store(self, key, image) -> None:
+    def _store(self, key, generation, image, current) -> None:
+        if generation != self._generation:
+            return
         self._pending.discard(key)
+        if not current or not self._still_wanted(key, generation):
+            return
         if image is not None:
             self._cache[key] = image
         while len(self._cache) > self._depth:
@@ -160,6 +202,9 @@ class PreviewPrefetcher(QObject):
         # Dropping the bookkeeping alone left the previous folder's decodes
         # queued: they still ran, still landed in the cache and still evicted
         # the file now on screen.
+        with self._lock:
+            self._generation += 1
+            self._wanted.clear()
         self._pool.clear()
         self._cache.clear()
         self._pending.clear()
@@ -204,6 +249,7 @@ class ImageSurface(QGraphicsView):
             self._bands.append(band)
         #: The picture size the bands were last laid out for; most flips reuse them.
         self._band_size = QSize()
+        self._band_border = 0.0
         self._paper_rect = QRectF()
         #: Set when the user zooms or drags, so the next picture is fitted again.
         self._touched = False
@@ -234,6 +280,7 @@ class ImageSurface(QGraphicsView):
         for band in self._bands:
             band.setVisible(False)
         self._band_size = QSize()
+        self._band_border = 0.0
         self._frame = QRectF()
         self._scene.setSceneRect(0, 0, 1, 1)
 
@@ -244,11 +291,19 @@ class ImageSurface(QGraphicsView):
                                         Qt.TransformationMode.SmoothTransformation)
         self._item.setPixmap(pixmap)
         picture = self._item.boundingRect()
-        border = max(2.0, round(min(picture.width(), picture.height()) * _BORDER_SHARE))
+        natural_border = max(2.0, round(min(picture.width(), picture.height()) * _BORDER_SHARE))
+        viewport = self.viewport().size()
+        if picture.width() and picture.height() and viewport.isValid():
+            scale = min(viewport.width() / picture.width(),
+                        viewport.height() / picture.height())
+            border = min(natural_border, 12.0 / max(scale, 0.001))
+        else:
+            border = natural_border
         paper = picture.adjusted(-border, -border, border, border)
         shown = not pixmap.isNull()
-        if pixmap.size() != self._band_size:
+        if pixmap.size() != self._band_size or border != self._band_border:
             self._band_size = pixmap.size()
+            self._band_border = border
             self._lay_bands(picture, paper, border, shown)
         self._paper_rect = paper
         # Fitted to the print and its shadow, no more: the photo is what the
@@ -334,7 +389,8 @@ class ImageSurface(QGraphicsView):
 
     def resizeEvent(self, event) -> None:            # noqa: N802 - Qt naming
         super().resizeEvent(event)
-        self.fit()
+        if not self._original.isNull():
+            self._apply()
 
 
 class _Slip(QFrame):
@@ -426,6 +482,7 @@ class MediaPreview(QWidget):
         super().__init__(parent)
         self.current_path: Path | None = None
         self._movie: QMovie | None = None
+        self._movie_size = QSize()
         self._frame_time: float | None = None
         self._frame_path: Path | None = None
 
@@ -439,6 +496,7 @@ class MediaPreview(QWidget):
         self.image = ImageSurface()
         self.animated = QLabel()
         self.animated.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.animated.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.animated.setStyleSheet(f"background: {theme.MAT};")
 
         self.video_page = QWidget()
@@ -575,7 +633,11 @@ class MediaPreview(QWidget):
             movie = QMovie(str(target))
             if movie.isValid() and movie.frameCount() > 1:
                 self._movie = movie
+                self._movie_size = movie.currentImage().size()
+                if not self._movie_size.isValid():
+                    self._movie_size = movie.frameRect().size()
                 self.animated.setMovie(movie)
+                self._scale_movie()
                 movie.start()
                 self.stack.setCurrentIndex(self.ANIMATED)
                 return True, ""
@@ -615,8 +677,24 @@ class MediaPreview(QWidget):
         self.player.setSource(QUrl())
         if self._movie is not None:
             self._movie.stop()
+            device = self._movie.device()
+            if device is not None:
+                device.close()
             self.animated.setMovie(None)
             self._movie = None
+            self._movie_size = QSize()
+
+    def _scale_movie(self) -> None:
+        if self._movie is None:
+            return
+        size = self._movie_size
+        if size.isValid():
+            self._movie.setScaledSize(size.scaled(self.animated.size(),
+                                                  Qt.AspectRatioMode.KeepAspectRatio))
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        super().resizeEvent(event)
+        self._scale_movie()
 
     # -- playback ------------------------------------------------------
     def is_video_page(self) -> bool:
@@ -659,9 +737,10 @@ class MediaPreview(QWidget):
         if not video.available():
             self.seek_relative(40 * direction)
             return ""
+        player_position = self.player.position() / 1000
         self.player.pause()
         base = (self._frame_time if self._frame_path == path and self._frame_time is not None
-                else self.player.position() / 1000)
+                else player_position)
         result = video.frame_at(path, base, direction)
         if result is None:
             return tr("error.no_frame")

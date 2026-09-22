@@ -663,9 +663,11 @@ class BindingCard(QWidget):
         # Qt delivers press, release, press, double-click, release. Acting on
         # both releases filed two photographs, and changing the folder here came
         # after the first of them had already gone. The folder is a right-click.
-        self._release_ends_double_click = True
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._release_ends_double_click = True
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        was_pressed = self._pressed
         self._pressed = False
         self.update()
         if event.button() != Qt.MouseButton.LeftButton:
@@ -673,7 +675,8 @@ class BindingCard(QWidget):
         if self._release_ends_double_click:
             self._release_ends_double_click = False
             return
-        self.activated.emit(self.index)
+        if was_pressed and self.rect().contains(event.position().toPoint()):
+            self.activated.emit(self.index)
 
     def contextMenuEvent(self, event) -> None:  # noqa: N802 - Qt naming
         self.folder_requested.emit(self.index)

@@ -463,3 +463,173 @@ class RebuildCostTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+import os
+import threading
+from tempfile import TemporaryDirectory
+from unittest import TestCase
+from unittest.mock import patch
+from PIL import Image
+from PySide6.QtCore import QSize
+from PySide6.QtGui import QImage
+from qingjian.ui import preview, thumbs
+from qingjian.ui.app import create_app
+APP = create_app(["qingjian-tests"])
+
+class G06Task4Tests(TestCase):
+    def setUp(self):
+        self.temp = TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        os.environ["QINGJIAN_DATA_DIR"] = str(self.root / "data")
+
+    def test_f089_setting_interest_does_not_stat_files(self):
+        paths = [self.root / f"{index}.jpg" for index in range(4)]
+        fetcher = preview.PreviewPrefetcher()
+        self.addCleanup(fetcher.shutdown)
+        with patch.object(Path, "stat", side_effect=AssertionError("unexpected stat")):
+            fetcher.set_wanted(paths, QSize(800, 600))
+        self.assertEqual(4, len(fetcher._wanted))
+
+    def test_f089_replaced_path_rejects_inflight_result(self):
+        path = self.root / "same.jpg"
+        path.write_bytes(b"old")
+        entered = threading.Event()
+        release = threading.Event()
+        def gated_decode(*args):
+            entered.set()
+            release.wait(2)
+            image = QImage(8, 8, QImage.Format.Format_RGB32)
+            image.fill(0)
+            return image, ""
+        fetcher = preview.PreviewPrefetcher()
+        self.addCleanup(fetcher.shutdown)
+        self.addCleanup(release.set)
+        arrived = []
+        fetcher.arrived.connect(arrived.append)
+        target = QSize(800, 600)
+        with patch.object(preview, "decode_qimage", side_effect=gated_decode):
+            fetcher.request(path, target)
+            self.assertTrue(entered.wait(2))
+            path.write_bytes(b"replacement")
+            fetcher.set_wanted([path], target)
+            release.set()
+            fetcher._pool.waitForDone(3000)
+            APP.processEvents()
+        self.assertEqual({}, fetcher._cache)
+        self.assertEqual([], arrived)
+        self.assertEqual(set(), fetcher._pending)
+
+    def test_f089_replaced_path_skips_queued_old_version(self):
+        blocker = self.root / "blocker.jpg"
+        target_path = self.root / "same.jpg"
+        blocker.write_bytes(b"blocker")
+        target_path.write_bytes(b"old")
+        entered = threading.Event()
+        release = threading.Event()
+        decoded = []
+        def gated_decode(path, target):
+            decoded.append(Path(path))
+            if Path(path) == blocker:
+                entered.set()
+                release.wait(2)
+            image = QImage(8, 8, QImage.Format.Format_RGB32)
+            image.fill(0)
+            return image, ""
+        fetcher = preview.PreviewPrefetcher()
+        self.addCleanup(fetcher.shutdown)
+        self.addCleanup(release.set)
+        fetcher._pool.setMaxThreadCount(1)
+        target = QSize(800, 600)
+        with patch.object(preview, "decode_qimage", side_effect=gated_decode):
+            fetcher.request(blocker, target)
+            self.assertTrue(entered.wait(2))
+            fetcher.request(target_path, target, priority=0)
+            target_path.write_bytes(b"replacement")
+            fetcher.set_wanted([target_path], target)
+            fetcher.request(target_path, target)
+            release.set()
+            fetcher._pool.waitForDone(3000)
+            APP.processEvents()
+        self.assertEqual(1, decoded.count(target_path))
+        self.assertEqual(1, len(fetcher._cache))
+
+    def test_f089_clear_rejects_inflight_result(self):
+        path = self.root / "a.jpg"
+        path.write_bytes(b"one")
+        entered = threading.Event()
+        release = threading.Event()
+        def gated_decode(*args):
+            entered.set()
+            release.wait(2)
+            image = QImage(8, 8, QImage.Format.Format_RGB32)
+            image.fill(0)
+            return image, ""
+        fetcher = preview.PreviewPrefetcher()
+        with patch.object(preview, "decode_qimage", side_effect=gated_decode):
+            fetcher.request(path, QSize(800, 600))
+            self.assertTrue(entered.wait(2))
+            fetcher.clear()
+            release.set()
+            fetcher._pool.waitForDone(3000)
+            APP.processEvents()
+        self.assertEqual(0, len(fetcher._cache))
+        fetcher.shutdown()
+
+    def test_f089_stale_queued_decodes_are_skipped(self):
+        paths = [self.root / f"{name}.jpg" for name in ("running", "stale", "current")]
+        for path in paths:
+            path.write_bytes(b"x")
+        entered = threading.Event()
+        release = threading.Event()
+        decoded = []
+        def gated_decode(path, target):
+            decoded.append(Path(path).name)
+            if Path(path) == paths[0]:
+                entered.set()
+                release.wait(2)
+            image = QImage(8, 8, QImage.Format.Format_RGB32)
+            image.fill(0)
+            return image, ""
+        fetcher = preview.PreviewPrefetcher()
+        self.addCleanup(fetcher.shutdown)
+        self.addCleanup(release.set)
+        fetcher._pool.setMaxThreadCount(1)
+        with patch.object(preview, "decode_qimage", side_effect=gated_decode):
+            fetcher.request(paths[0], QSize(800, 600))
+            self.assertTrue(entered.wait(2))
+            fetcher.request(paths[1], QSize(800, 600))
+            fetcher.set_wanted([paths[2]], QSize(800, 600))
+            fetcher.request(paths[2], QSize(800, 600))
+            release.set()
+            fetcher._pool.waitForDone(3000)
+            APP.processEvents()
+        self.assertNotIn("stale.jpg", decoded)
+        self.assertIn("current.jpg", decoded)
+        fetcher.shutdown()
+
+    def test_f090_moved_thumbnail_leaves_no_pending_key(self):
+        path = self.root / "a.jpg"
+        Image.new("RGB", (20, 20), "red").save(path)
+        cache = thumbs.ThumbnailCache()
+        cache.request(path, 96)
+        cache._pool.waitForDone(3000)
+        moved = self.root / "moved.jpg"
+        os.replace(path, moved)
+        APP.processEvents()
+        self.assertEqual(0, cache.pending())
+        cache.shutdown()
+
+
+class G06Task5Tests(TestCase):
+    def setUp(self):
+        self.temp = TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        os.environ["QINGJIAN_DATA_DIR"] = str(self.root / "data")
+
+    def test_f088_key_tracks_target_height(self):
+        path = self.root / "a.jpg"
+        path.write_bytes(b"one")
+        self.assertTrue(preview.PreviewPrefetcher._key(path, QSize(2800, 1000)) != preview.PreviewPrefetcher._key(path, QSize(2800, 2400)), "target height is absent from key")

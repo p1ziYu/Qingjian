@@ -126,9 +126,10 @@ class Engine:
         return self.store.has_pending()
 
     def recover(self, progress=_noop) -> bool:
-        done = self.store.recover(progress, save_state=self.state.apply)
-        if self.source_root:
-            self.store.sweep_partials(self._folders_in_play())
+        with self.store._lock:
+            done = self.store.recover(progress, save_state=self.state.apply)
+            if self.source_root:
+                self.store.sweep_partials(self._folders_in_play())
         return done
 
     def abandon_pending(self, rollback: bool, progress=_noop) -> bool:
@@ -502,23 +503,26 @@ class Engine:
                  resolver: ops.Resolver = ops.always_sequence,
                  progress=_noop, cancel=_never,
                  group: sidecar_mod.SidecarGroup | None = None,
-                 allow_system: bool = True) -> ops.Outcome:
+                  allow_system: bool = True, root: Path | None = None,
+                  recycle_mode: str | None = None) -> ops.Outcome:
         target = Path(path) if path else self.current_path()
         if target is None:
             return ops.Outcome(skipped=True)
         if binding.action == "reveal":
             platform_.reveal(target)
             return ops.Outcome(skipped=True, message_key="status.revealed")
+        source_root = root if root is not None else self.source_root
         with self.exclusive():
             group = self._operation_group(group if group is not None else self.group_for(target))
             action = binding.action
             if action in ("move", "copy", "favorite"):
                 outcome = self.planner.plan_folder_action(action, group, binding,
-                                                          self.source_root, resolver)
+                                                           source_root, resolver)
             elif action == "skip":
-                outcome = self.planner.plan_skip(group, self.source_root or target.parent)
+                outcome = self.planner.plan_skip(group, source_root or target.parent)
             elif action == "trash":
-                return self._commit_trash(group, progress, cancel, allow_system)
+                return self._commit_trash(group, progress, cancel, allow_system,
+                                          recycle_mode, source_root)
             else:
                 return ops.Outcome(skipped=True)
             return self._commit(outcome, progress, cancel)
@@ -554,16 +558,18 @@ class Engine:
             return result
 
     def trash(self, path: str | Path | None = None, progress=_noop, cancel=_never,
-              allow_system: bool = True) -> ops.Outcome:
+               allow_system: bool = True, recycle_mode: str | None = None) -> ops.Outcome:
         target = Path(path) if path else self.current_path()
         if target is None:
             return ops.Outcome(skipped=True)
         with self.exclusive():
             group = self._operation_group(self.group_for(target))
-            return self._commit_trash(group, progress, cancel, allow_system)
+            return self._commit_trash(group, progress, cancel, allow_system, recycle_mode)
 
     def _commit_trash(self, group: sidecar_mod.SidecarGroup,
-                      progress, cancel, allow_system: bool = True) -> ops.Outcome:
+                       progress, cancel, allow_system: bool = True,
+                       recycle_mode: str | None = None,
+                       root: Path | None = None) -> ops.Outcome:
         """Recycle, honouring the single-copy setting.
 
         The previous version always kept an application snapshot *and* pushed a
@@ -572,7 +578,7 @@ class Engine:
         the file itself is now the default when the user asks for the system
         bin at all.
         """
-        system_requested = self.settings.recycle_mode == config.RECYCLE_SYSTEM
+        system_requested = (recycle_mode or self.settings.recycle_mode) == config.RECYCLE_SYSTEM
         if (system_requested and allow_system and platform_.trash_available()
                 and all(platform_.can_recycle(m.path, group.total_bytes())
                         for m in group.members)):
@@ -587,7 +593,7 @@ class Engine:
                 sent_group = sidecar_mod.SidecarGroup(group.master,
                     [m for m in group.members if m.path in sent])
                 record = Record(id=uuid.uuid4().hex, action="trash", original=str(group.master),
-                                root=str(self.source_root or group.master.parent),
+                                 root=str(root or self.source_root or group.master.parent),
                                 undoable=False, bytes=sent_group.total_bytes(),
                                 payload={"forward": [], "inverse": [],
                                          "paths": [str(p) for p in sent],
@@ -616,16 +622,17 @@ class Engine:
                 raise OSError(tr("status.partial_recycle", paths=remaining,
                                  error=str(error))) from error
             return commit_sent()
-        outcome = self.planner.plan_trash(group, self.source_root)
+        outcome = self.planner.plan_trash(group, root or self.source_root)
         result = self._commit(outcome, progress, cancel)
         if system_requested and result.record:
             result.message_key = "status.soft_recycle_fallback"
         return result
 
     def tag(self, paths: Sequence[Path], rating: int | None = None,
-            label: str | None = None) -> ops.Outcome:
-        with self.exclusive():
-            return self._commit(self.planner.plan_tag(list(paths), rating, label))
+             label: str | None = None) -> ops.Outcome:
+        outcome = self.planner.plan_tag(list(paths), rating, label)
+        self.state.apply(outcome.delta)
+        return outcome
 
     # ---------------------------------------------------- undo and redo
     def can_undo(self) -> bool:
@@ -735,10 +742,9 @@ class Engine:
         queued = set(self.queue_paths)
         known = set(self.all_files)
 
+        wanted_paths: list[Path] = []
         for path in touched:
-            if path.exists():
-                if not self._belongs(path, root, excluded):
-                    continue            # a copy that landed in a target folder
+            if path.exists() and self._belongs(path, root, excluded):
                 if path not in known:
                     self.all_files.append(path)
                     known.add(path)
@@ -749,23 +755,27 @@ class Engine:
                 # looked at the file rather than the filter left it on screen --
                 # and holding the key down copied it again and again.
                 wanted = bool(scanner.apply_filter([path], spec))
-                if wanted and path not in queued:
-                    where = self._insert_into_queue(path, key)
-                    if where >= 0:
-                        added.append((where, path))
-                        queued.add(path)
-                elif not wanted and path in queued:
-                    if self._drop_from_queue(path):
-                        removed.append(path)
+                if wanted:
+                    wanted_paths.append(path)
+                    continue
+                if self.drop_from_queue(path) >= 0:
+                    removed.append(path)
                     queued.discard(path)
                 continue
             if path in known:
                 self.all_files.remove(path)
                 known.discard(path)
-            if self._drop_from_queue(path):
+            if self.drop_from_queue(path) >= 0:
                 removed.append(path)
                 queued.discard(path)
             self._index_forget(path)
+
+        for path in wanted_paths:
+            if path not in queued:
+                where = self._insert_into_queue(path, key)
+                if where >= 0:
+                    added.append((where, path))
+                    queued.add(path)
 
         self.index = clamp_index(self.index, len(self.queue_paths))
         return {"added": added, "removed": removed}
@@ -904,17 +914,27 @@ class Engine:
             exclude=exclude,
             ratings=self.state.tags_for([str(p) for p in paths]))
 
-    def _drop_from_queue(self, path: Path) -> bool:
+    def drop_from_queue(self, path: Path) -> int:
         try:
             position = self.queue_paths.index(path)
         except ValueError:
-            return False
+            return -1
         self.queue_paths.pop(position)
         if position < self.index:
             self.index -= 1
         if self.index >= len(self.queue_paths):
             self.index = max(0, len(self.queue_paths) - 1)
-        return True
+        return position
+
+    def insert_at(self, path: Path, where: int) -> int:
+        if path in self.queue_paths:
+            return -1
+        where = max(0, min(where, len(self.queue_paths)))
+        current = self.current_path()
+        self.queue_paths.insert(where, path)
+        if current is not None and where <= self.index:
+            self.index += 1
+        return where
 
     def _insert_into_queue(self, path: Path, key) -> int:
         """Place *path* where a full sort would have put it; -1 if not added."""
@@ -925,8 +945,9 @@ class Engine:
             stem = sidecar_mod.base_stem(path).casefold()
             folder = path.parent
             for existing in self.queue_paths:
-                if existing.parent == folder and \
-                        sidecar_mod.base_stem(existing).casefold() == stem:
+                if (existing.parent == folder and
+                        sidecar_mod.base_stem(existing).casefold() == stem and
+                        self.settings.sidecar.classify(path, existing) is not None):
                     return -1
         try:
             value = key(path)
@@ -945,10 +966,7 @@ class Engine:
                 low = middle + 1
             else:
                 high = middle
-        self.queue_paths.insert(low, path)
-        if low <= self.index:
-            self.index += 1
-        return low
+        return self.insert_at(path, low)
 
     # ------------------------------------------------------ background
     def enqueue(self, label: str, work: Callable, context: dict | None = None) -> Job:
@@ -977,8 +995,8 @@ class Engine:
                                       ignored=ignored, progress=progress, cancel=cancel)
         return dedupe.find_exact(paths, self.cache, ignored, progress, cancel)
 
-    def ignore_duplicates(self, candidates: Sequence[dedupe.Candidate]) -> ops.Outcome:
-        root = self.source_root or Path(".")
+    def ignore_duplicates(self, candidates: Sequence[dedupe.Candidate],
+                          root: Path) -> ops.Outcome:
         keys = []
         for candidate in candidates:
             digest = candidate.digest or self.cache.get(candidate.path, "sha256") or ""
@@ -1006,13 +1024,11 @@ class Engine:
         self.rebuild_queue(progress, cancel)
         return cleared
 
-    def send_to_review(self, paths: Sequence[Path]) -> None:
-        if not self.source_root:
-            return
+    def send_to_review(self, paths: Sequence[Path], root: Path) -> None:
         from .state import empty_delta
         delta = empty_delta()
         for path in paths:
-            delta["reviews_add"].append([str(self.source_root), str(path)])
+            delta["reviews_add"].append([str(root), str(path)])
         self.state.apply(delta)
 
     # --------------------------------------------------------- backups

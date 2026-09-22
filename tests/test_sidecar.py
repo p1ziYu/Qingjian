@@ -9,6 +9,12 @@ from qingjian.core.sidecar import (KIND_LIVE, KIND_METADATA, KIND_RAW, SidecarRu
 
 
 class SidecarTests(TempCase):
+    def test_unlinked_same_stem_media_get_separate_rows(self):
+        jpg = self.write(self.tmp / "1.jpg", b"a")
+        png = self.write(self.tmp / "1.png", b"b")
+        self.assertEqual(collapse_groups(
+            [jpg, png], SidecarRules(link_same_stem_media=False)), [jpg, png])
+
     def build(self, names):
         folder = self.tmp / "shots"
         folder.mkdir(exist_ok=True)

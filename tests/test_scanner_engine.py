@@ -483,7 +483,7 @@ class EngineTests(TempCase):
 
     def test_ignoring_and_restoring_duplicates(self):
         groups = self.engine.find_duplicates(dedupe.MODE_EXACT)
-        self.engine.ignore_duplicates(groups[0].extras)
+        self.engine.ignore_duplicates(groups[0].extras, self.engine.source_root)
         self.assertEqual([], self.engine.find_duplicates(dedupe.MODE_EXACT))
         self.engine.restore_ignored()
         self.assertEqual(1, len(self.engine.find_duplicates(dedupe.MODE_EXACT)))
@@ -492,7 +492,7 @@ class EngineTests(TempCase):
         groups = self.engine.find_duplicates(dedupe.MODE_EXACT)
         extra = groups[0].extras[0]
         before = extra.path.read_bytes()
-        self.engine.ignore_duplicates([extra])
+        self.engine.ignore_duplicates([extra], self.engine.source_root)
         self.assertEqual(before, extra.path.read_bytes())
 
     def test_recycling_renames_into_a_hidden_folder_beside_the_file(self):

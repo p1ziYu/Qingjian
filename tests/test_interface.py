@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 import uuid
+from types import SimpleNamespace
 from unittest import mock
 from pathlib import Path
 
@@ -20,7 +21,7 @@ from base import ROOT, TempCase, unittest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 try:
     from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
-    from PySide6.QtGui import QContextMenuEvent, QMouseEvent
+    from PySide6.QtGui import QContextMenuEvent, QKeyEvent, QMouseEvent
     from PySide6.QtTest import QTest
     from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
     HAVE_QT = True
@@ -98,6 +99,226 @@ class WindowCase(QtCase):
     def recycled(self) -> list[Path]:
         """Files sitting in any `.qingjian-trash` under the test's directory."""
         return [p for p in self.tmp.rglob("*") if p.is_file() and ".qingjian-trash" in p.parts]
+
+
+class QueueFailureTests(WindowCase):
+    def test_twenty_failures_are_counted_and_returned(self):
+        self.settings.background_queue = True
+        warning_patch = mock.patch.object(QMessageBox, "warning")
+        warning = warning_patch.start()
+        self._cleanups.insert(0, (warning_patch.stop, (), {}))
+        paths = list(self.engine.queue_paths)
+        with mock.patch.object(self.engine.queue, "failures", return_value=[None] * 20):
+            for index in range(20):
+                path = paths[index % len(paths)]
+                self.window._inflight[index + 100] = (path, index % len(paths))
+                self.window._on_queue_event("failed", SimpleNamespace(
+                    id=index + 100, context={}, error=OSError("failed")))
+            self.assertIn("20", self.window.status_label.text())
+            self.assertEqual(self.window.status_label.property("tone"), "error")
+            self.app.processEvents()
+            self.assertLessEqual(warning.call_count, 1)
+        self.assertEqual(self.window.filmstrip._all,
+                         [str(path) for path in self.engine.queue_paths])
+
+    def test_failure_report_never_nests(self):
+        self.settings.background_queue = True
+        path = self.engine.queue_paths[0]
+        self.window._inflight[1] = (path, 0)
+        self.window._inflight[2] = (path, 0)
+        depth = peak = 0
+
+        def warning(*_args, **_kwargs):
+            nonlocal depth, peak
+            depth += 1
+            peak = max(peak, depth)
+            if depth == 1:
+                self.window._on_queue_event("failed", SimpleNamespace(
+                    id=2, context={}, error=OSError("second")))
+            depth -= 1
+            return QMessageBox.StandardButton.Ok
+
+        with mock.patch.object(QMessageBox, "warning", warning):
+            self.window._on_queue_event("failed", SimpleNamespace(
+                id=1, context={}, error=OSError("first")))
+        self.assertLessEqual(peak, 1)
+
+
+class BackgroundSyncTests(WindowCase):
+    def test_background_finish_updates_all_files(self):
+        self.settings.background_queue = True
+        path = self.engine.current_path()
+        self.window.classify_index(0)
+        self.assertTrue(self.engine.queue.wait_idle(10))
+        self.assertTrue(self.wait_until(lambda: not path.exists()))
+        self.app.processEvents()
+        self.assertNotIn(path, self.engine.all_files)
+        self.assertEqual(self.window.source_slip._count_text, "7 items")
+
+    def test_recovery_button_hidden_while_queue_pending(self):
+        with mock.patch.object(type(self.engine.queue), "pending",
+                               new_callable=mock.PropertyMock, return_value=1):
+            with mock.patch.object(self.engine, "has_pending", return_value=True):
+                self.window._refresh_view()
+                self.assertFalse(self.window.recover_button.isVisibleTo(self.window))
+
+
+class RecoverStartupTests(WindowCase):
+    def _recover_two_file_journal(self, command_line: bool) -> None:
+        second = self.source / "IMG_0001.JPG"
+        original = second.read_bytes()
+        stamp = second.stat()
+        RecoverExitTests.stuck_journal(self)
+        second.write_bytes(original)
+        os.utime(second, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+        cli_folder = self.tmp / "command_line"
+        previous_folder = self.tmp / "previous"
+        cli_folder.mkdir()
+        previous_folder.mkdir()
+        self.window.startup_folder = cli_folder if command_line else None
+        self.settings.source_folder = str(previous_folder)
+        self.settings.restore_position = True
+        self.engine.source_root = None
+        with mock.patch.object(self.window, "_offer_recover_exit",
+                               side_effect=lambda error, **_kwargs:
+                               self.fail(f"recovery failed: {error}")):
+            self.window.recover_pending()
+        self.assertEqual(self.engine.source_root,
+                         cli_folder if command_line else previous_folder)
+        self.assertFalse(self.engine.has_pending())
+        self.assertTrue((self.keep / "IMG_0000.JPG").exists())
+        self.assertTrue((self.keep / "IMG_0001.JPG").exists())
+
+    def test_two_file_recovery_then_command_line_folder(self):
+        self._recover_two_file_journal(True)
+
+    def test_two_file_recovery_then_previous_folder(self):
+        self._recover_two_file_journal(False)
+
+    def test_recovery_opens_initial_folder(self):
+        startup = self.tmp / "start"
+        startup.mkdir()
+        self.window.startup_folder = startup
+        self.engine.source_root = None
+        with mock.patch.object(self.engine, "recover", return_value=True):
+            self.window.recover_pending()
+        self.assertEqual(self.engine.source_root, startup)
+
+
+class ProgressHandoverTests(WindowCase):
+    def test_new_handover_during_scan_replaces_old_request(self):
+        from PySide6.QtCore import QTimer
+        first = self.tmp / "first_open"
+        second = self.tmp / "second_open"
+        first.mkdir()
+        second.mkdir()
+        original = self.engine.open_folder
+
+        def opening(folder, progress, cancel):
+            if folder == first:
+                QTimer.singleShot(0, lambda: self.window.open_requested(str(second)))
+                progress("scan", 5)
+            return original(folder, progress, cancel)
+
+        with mock.patch.object(self.engine, "open_folder", side_effect=opening):
+            self.window.open_requested(str(first))
+            self.assertEqual(self.window._pending_open, second)
+            self.assertTrue(self.wait_until(lambda: self.engine.source_root == second))
+        self.assertIsNone(self.window._pending_open)
+
+    def test_pending_open_survives_drain_timeout(self):
+        incoming = self.tmp / "incoming"
+        incoming.mkdir()
+        self.window._pending_open = incoming
+        with mock.patch.object(self.window, "_drain_queue", return_value=False):
+            self.window._open_pending()
+        self.assertEqual(self.window._pending_open, incoming)
+        self.window._open_pending()
+        self.assertEqual(self.engine.source_root, incoming)
+        self.assertIsNone(self.window._pending_open)
+
+    def test_pending_open_retries_when_queue_becomes_idle(self):
+        incoming = self.tmp / "incoming"
+        incoming.mkdir()
+        self.window._pending_open = incoming
+        pending = {"count": 1}
+        with mock.patch.object(type(self.engine.queue), "pending",
+                               new_callable=mock.PropertyMock,
+                               side_effect=lambda: pending["count"]):
+            self.window._open_pending()
+            self.assertEqual(self.engine.source_root, self.source)
+            pending["count"] = 0
+            self.assertTrue(self.wait_until(lambda: self.engine.source_root == incoming))
+
+    def test_pending_open_runs_after_failure_warning_closes(self):
+        incoming = self.tmp / "incoming"
+        incoming.mkdir()
+        self.window._failed_seen = 1
+        def warning(*_args, **_kwargs):
+            with mock.patch.object(QApplication, "activeModalWidget", return_value=self.window):
+                self.window.open_requested(str(incoming))
+            self.assertEqual(self.engine.source_root, self.source)
+            return QMessageBox.StandardButton.Ok
+        with mock.patch.object(QMessageBox, "warning", warning):
+            self.window._report_queue_failures()
+            self.assertTrue(self.wait_until(lambda: self.engine.source_root == incoming))
+
+    def test_nested_progress_keeps_busy(self):
+        def outer(progress, cancel):
+            self.window._with_progress("inner", lambda *_: None)
+            self.assertTrue(self.window._busy)
+        self.window._with_progress("outer", outer)
+
+    def test_handover_waits_for_progress(self):
+        incoming = self.tmp / "incoming"
+        incoming.mkdir()
+        old = self.engine.source_root
+        def work(progress, cancel):
+            self.window.open_requested(str(incoming))
+            self.assertEqual(self.engine.source_root, old)
+        self.window._with_progress("work", work)
+        self.assertTrue(self.wait_until(lambda: self.engine.source_root == incoming))
+
+
+class BusyShortcutTests(WindowCase):
+    def test_posted_shortcuts_do_not_open_dialogs_during_progress(self):
+        self.activate()
+        with mock.patch("qingjian.ui.mainwindow.DuplicatesDialog") as duplicates, \
+             mock.patch("qingjian.ui.mainwindow.SettingsDialog") as settings:
+            def work(progress, cancel):
+                for key in (Qt.Key.Key_D, Qt.Key.Key_Comma):
+                    QApplication.postEvent(self.window, QKeyEvent(
+                        QEvent.Type.KeyPress, key, Qt.KeyboardModifier.ControlModifier))
+                    QApplication.postEvent(self.window, QKeyEvent(
+                        QEvent.Type.KeyRelease, key, Qt.KeyboardModifier.ControlModifier))
+                progress("working", 5)
+            self.window._with_progress("working", work)
+            duplicates.assert_not_called()
+            settings.assert_not_called()
+
+    def test_busy_shortcuts_do_not_open_dialogs(self):
+        self.window._busy = True
+        try:
+            with mock.patch("qingjian.ui.mainwindow.DuplicatesDialog") as dialog:
+                self.window.open_duplicates()
+            dialog.assert_not_called()
+        finally:
+            self.window._busy = False
+
+
+class DuplicateRootTests(TempCase):
+    def test_review_destination_uses_explicit_root(self):
+        from qingjian.core import config
+        from qingjian.core.engine import Engine
+        first, second = self.tmp / "first", self.tmp / "second"
+        first.mkdir()
+        second.mkdir()
+        photo = self.write(first / "p.jpg", b"photo")
+        engine = Engine(self.data, config.Settings())
+        self.addCleanup(engine.close)
+        engine.open_folder(second)
+        engine.send_to_review([photo], root=first)
+        self.assertEqual(engine.state.review_queue(str(first)), [str(photo)])
 
 
 class RecycleTests(WindowCase):
@@ -678,6 +899,99 @@ class BackgroundQueueTests(WindowCase):
         self.patch(QMessageBox, "critical", lambda *a, **k: QMessageBox.StandardButton.Ok)
         self.activate()
 
+    def test_twenty_real_failed_jobs_restore_every_row_once(self):
+        from PIL import Image
+        for index in range(20):
+            Image.new("RGB", (12, 12)).save(self.source / f"extra_{index:02d}.jpg")
+        self.window.rescan()
+        before = list(self.engine.queue_paths)
+        messages = []
+        self.patch(QMessageBox, "warning",
+                   lambda _parent, _title, message: messages.append(message))
+
+        def fail(_progress, _cancel):
+            raise OSError("injected queue failure")
+
+        for path in before[-20:]:
+            self.window._run_operation(path, fail, "injected")
+        self.assertTrue(self.engine.queue.wait_idle(20))
+        self.until(lambda: len(self.window._inflight) == 0, "failure events not delivered")
+        self.app.processEvents()
+        self.assertEqual(len(self.engine.queue_paths), len(before))
+        self.assertEqual(set(self.engine.queue_paths), set(before))
+        self.assertEqual(self.window.filmstrip._all,
+                         [str(path) for path in self.engine.queue_paths])
+        self.assertEqual(self.window.status_label.property("tone"), "error")
+        self.assertTrue(messages)
+        self.assertIn("20", messages[-1])
+
+    def test_relpath_uses_root_captured_before_worker_runs(self):
+        import threading
+        nested = self.source / "nested"
+        nested.mkdir()
+        photo = self.write(nested / "nested.jpg", b"photo")
+        self.settings.recursive = True
+        self.settings.bindings[0].path_template = "{relpath}"
+        self.window.rescan()
+        self.engine.go_to(photo)
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        self.engine.enqueue("gate", lambda *_: gate.wait(10))
+        self.window.classify_index(0)
+        other = self.tmp / "other_root"
+        other.mkdir()
+        self.engine.source_root = other
+        gate.set()
+        self.assertTrue(self.engine.queue.wait_idle(20))
+        self.assertTrue((self.keep / "nested" / photo.name).exists())
+        self.engine.source_root = self.source
+
+    def test_trash_mode_is_captured_before_worker_runs(self):
+        import threading
+        from qingjian.core import config, platform_
+        self.settings.recycle_mode = config.RECYCLE_SOFT
+        photo = self.engine.current_path()
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        self.engine.enqueue("gate", lambda *_: gate.wait(10))
+        with mock.patch.object(platform_, "trash_available", return_value=True), \
+             mock.patch.object(platform_, "can_recycle", return_value=True), \
+             mock.patch.object(platform_, "move_to_trash") as system_trash:
+            self.window.trash_current()
+            self.settings.recycle_mode = config.RECYCLE_SYSTEM
+            gate.set()
+            self.assertTrue(self.engine.queue.wait_idle(20))
+            self.app.processEvents()
+            system_trash.assert_not_called()
+        self.assertFalse(photo.exists())
+        self.assertTrue(self.recycled())
+
+    def test_rating_and_label_respond_while_file_step_is_blocked(self):
+        import threading
+        entered = threading.Event()
+        release = threading.Event()
+        self.addCleanup(release.set)
+        original = self.engine.store._run_step
+
+        def blocked(*args, **kwargs):
+            entered.set()
+            if not release.wait(10):
+                raise TimeoutError("file step gate timed out")
+            return original(*args, **kwargs)
+
+        self.patch(self.engine.store, "_run_step", blocked)
+        self.window.classify_index(0)
+        self.assertTrue(entered.wait(5), "worker never entered file step")
+        current = self.engine.current_path()
+        started = time.monotonic()
+        self.window._rate_current(5)
+        self.window._label_current("red")
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 0.5)
+        self.assertEqual(self.engine.state.tag(str(current)), (5, "red"))
+        release.set()
+        self.assertTrue(self.engine.queue.wait_idle(20))
+
     def settled(self, timeout: float = 20.0) -> bool:
         return self.wait_until(lambda: self.engine.queue.pending == 0, timeout)
 
@@ -728,6 +1042,8 @@ class BackgroundQueueTests(WindowCase):
 
     def test_a_failed_move_goes_back_to_its_row(self):
         from qingjian.core.safestore import TransactionError
+        self.patch(QMessageBox, "warning", lambda *_args, **_kwargs:
+                   QMessageBox.StandardButton.Ok)
         self.engine.go_to(self.engine.queue_paths[3])
         path = self.engine.current_path()
         row = self.engine.queue_paths.index(path)

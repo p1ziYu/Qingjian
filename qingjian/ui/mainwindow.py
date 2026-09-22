@@ -89,6 +89,13 @@ class MainWindow(QMainWindow):
         self.view_mode = self.settings.default_view
         self._conflict_default = ""
         self._busy = False
+        self._pending_open: Path | None = None
+        self._pending_open_retry_queued = False
+        self._close_requested = False
+        self._closed = False
+        self._reporting = False
+        self._failed_seen = 0
+        self._failure_report_queued = False
         #: True while the grid is being filled in chunks. Rows must not be
         #: inserted into a list that is still being built from a snapshot.
         self._grid_building = False
@@ -140,8 +147,8 @@ class MainWindow(QMainWindow):
         self._build()
         self._build_shortcuts()
         self.queue_event.connect(self._on_queue_event)
-        engine.queue_listeners.append(
-            lambda event, job: self.queue_event.emit(event, job))
+        self._queue_listener = lambda event, job: self.queue_event.emit(event, job)
+        engine.queue_listeners.append(self._queue_listener)
         self._restore_geometry()
         QTimer.singleShot(0, self._first_run)
 
@@ -179,8 +186,7 @@ class MainWindow(QMainWindow):
         # clickable recovery action while startup is still settling.
         self._update_actions()
 
-    @staticmethod
-    def _run_dialog(dialog) -> int:
+    def _run_dialog(self, dialog) -> int:
         """Show a modal dialog and let go of it afterwards.
 
         Every dialog here is parented to the window, so without this the C++
@@ -191,6 +197,7 @@ class MainWindow(QMainWindow):
         finally:
             dialog.setParent(None)
             dialog.deleteLater()
+            QTimer.singleShot(0, self._open_pending)
 
     def _build_header(self) -> QHBoxLayout:
         row = QHBoxLayout()
@@ -629,6 +636,9 @@ class MainWindow(QMainWindow):
             self.status(tr("error.pending_first"), "warning")
             QTimer.singleShot(200, self.recover_pending)
             return
+        self._open_initial_folder()
+
+    def _open_initial_folder(self) -> None:
         if self.startup_folder is not None and self.startup_folder.is_dir():
             self.open_folder(self.startup_folder)
             return
@@ -825,6 +835,8 @@ class MainWindow(QMainWindow):
     def open_folder(self, folder: Path, restore: bool = False) -> None:
         if self._busy:
             return
+        if not self._drain_queue():
+            return
         try:
             self._with_progress(tr("scan.scanning"),
                                 lambda progress, cancel: self.engine.open_folder(
@@ -845,6 +857,8 @@ class MainWindow(QMainWindow):
 
     def rescan(self) -> None:
         if self._busy or not self.engine.source_root:
+            return
+        if not self._drain_queue():
             return
         try:
             self._with_progress(tr("scan.scanning"),
@@ -1169,7 +1183,8 @@ class MainWindow(QMainWindow):
         self.review_button.setProperty("active", "true" if self.engine.review_mode else "false")
         self.review_button.style().unpolish(self.review_button)
         self.review_button.style().polish(self.review_button)
-        self.recover_button.setVisible(self.engine.has_pending())
+        self.recover_button.setVisible(self.engine.has_pending() and
+                                       not self.engine.queue.pending)
         handled = self.engine.stats.total()
         total = handled + len(self.engine.queue_paths)
         self.progress_label.setText(tr("status.session_progress", done=handled, total=total))
@@ -1217,6 +1232,8 @@ class MainWindow(QMainWindow):
         self._set_view(mode)
 
     def _toggle_view(self) -> None:
+        if self._blocked():
+            return
         self._set_view(config.VIEW_GRID if self.view_mode == config.VIEW_SINGLE
                        else config.VIEW_SINGLE)
 
@@ -1225,16 +1242,22 @@ class MainWindow(QMainWindow):
 
     # =========================================================== filtering
     def _filter_changed(self) -> None:
+        if not self._drain_queue():
+            return
         self.settings.filter_mode = str(self.filter_combo.currentData() or "all")
         self.engine.save_settings()
         self._rebuild_queue()
 
     def _sort_changed(self) -> None:
+        if not self._drain_queue():
+            return
         self.settings.sort_mode = str(self.sort_combo.currentData() or "name")
         self.engine.save_settings()
         self._rebuild_queue()
 
     def _reverse_changed(self, checked: bool) -> None:
+        if not self._drain_queue():
+            return
         self.settings.sort_reverse = bool(checked)
         self.engine.save_settings()
         self._rebuild_queue()
@@ -1245,6 +1268,8 @@ class MainWindow(QMainWindow):
             self.recursive_check.blockSignals(True)
             self.recursive_check.setChecked(self.settings.recursive)
             self.recursive_check.blockSignals(False)
+            return
+        if not self._drain_queue():
             return
         self.settings.recursive = bool(checked)
         self.engine.save_settings()
@@ -1370,6 +1395,8 @@ class MainWindow(QMainWindow):
     def choose_binding_folder(self, index: int) -> None:
         if self._blocked():
             return
+        if not self._drain_queue():
+            return
         binding = self.settings.bindings[index]
         if not binding.needs_folder():
             self.open_bindings()
@@ -1398,6 +1425,8 @@ class MainWindow(QMainWindow):
 
     def open_bindings(self) -> None:
         if self._blocked():
+            return
+        if not self._drain_queue():
             return
         dialog = BindingsDialog(self.settings.bindings, self._template_samples(), self,
                                 reserved=self.reserved_keys(), engine=self.engine)
@@ -1597,11 +1626,14 @@ class MainWindow(QMainWindow):
         # Recycling asks nothing: Ctrl+Z brings the file straight back, and a
         # question per file turned a grid selection into a row of dialogs.
         resolver = (lambda a, b, value=decision: value) if decision else ops.always_sequence
+        root = self.engine.source_root
+        recycle_mode = self.settings.recycle_mode
         self._run_operation(
             path,
             lambda progress, cancel: self.engine.classify(
                 binding, path, resolver, progress, cancel, group=group,
-                allow_system=self.settings.background_queue),
+                allow_system=self.settings.background_queue, root=root,
+                recycle_mode=recycle_mode),
             f"{tr(config.ACTIONS[binding.action][0])} · {path.name}")
         return True
 
@@ -1647,14 +1679,8 @@ class MainWindow(QMainWindow):
         One row is removed from each view. Rebuilding both lists here is what
         used to make every keystroke cost as much as opening the folder.
         """
-        try:
-            position = self.engine.queue_paths.index(path)
-        except ValueError:
-            position = -1
+        position = self.engine.drop_from_queue(path)
         if position >= 0:
-            self.engine.queue_paths.pop(position)
-            if self.engine.index >= len(self.engine.queue_paths):
-                self.engine.index = max(0, len(self.engine.queue_paths) - 1)
             self.filmstrip.drop(path)
             if not self._grid_dirty and not self._grid_building:
                 self.grid.remove_path(path)
@@ -1672,16 +1698,29 @@ class MainWindow(QMainWindow):
                         "success")
         if outcome.message_key and not outcome.skipped:
             self.status(tr(outcome.message_key), "warning")
-        if not self.settings.background_queue:
+        if outcome.record:
             # Synchronous mode did a full rebuild per key press: on a folder of
             # twenty thousand files that is a sixth of a second of filtering and
             # sorting for one photograph. `absorb` reports the rows that went,
             # and `_apply_change` is what takes them out of both views -- going
             # through `_detach` would not, because absorb has already removed
             # the path from the queue it looks in.
-            change = self.engine.absorb(outcome.record) if outcome.record else None
+            change = self.engine.absorb(outcome.record)
             if change is None:
-                self._rebuild_queue()
+                if not self.settings.background_queue:
+                    self._rebuild_queue()
+                else:
+                    # Random and review queues have no stable insertion point.
+                    removed = []
+                    for touched in self.engine.touched_paths(outcome.record):
+                        if not touched.exists():
+                            if touched in self.engine.all_files:
+                                self.engine.all_files.remove(touched)
+                            if self.engine.drop_from_queue(touched) >= 0:
+                                removed.append(touched)
+                    if removed:
+                        self._apply_change({"removed": removed, "added": []})
+                self._update_slip()
             else:
                 self._apply_change(change)
                 self._update_slip()
@@ -1691,6 +1730,8 @@ class MainWindow(QMainWindow):
         self._update_handled()
 
     def _on_queue_event(self, event: str, job) -> None:
+        if self._closed:
+            return
         pending = self.engine.queue.pending
         self.queue_label.setText(tr("status.queue_pending", count=pending) if pending else "")
         if event not in ("finished", "failed"):
@@ -1708,12 +1749,13 @@ class MainWindow(QMainWindow):
 
         if event == "finished":
             self._finish_operation(path, position, job.result)
+            self._schedule_open_pending(50)
             return
         if path.exists() and path not in self.engine.queue_paths:
             # Put the item back exactly where it was so nothing is lost.
             where = (len(self.engine.queue_paths) if position < 0
                      else min(position, len(self.engine.queue_paths)))
-            self.engine.queue_paths.insert(where, path)
+            self.engine.insert_at(path, where)
             # The whole decoration map, not just this file's: set_paths replaces
             # what the strip holds, so a one-entry map wipes every other badge.
             self.filmstrip.set_queue(self.engine.queue_paths, self.engine.index,
@@ -1722,11 +1764,42 @@ class MainWindow(QMainWindow):
                 self.grid.insert_path(path, where)
             self._refresh_view()
         if job.error is not None:
-            self._report(job.error)
+            failures = self.engine.queue.failures()
+            self._failed_seen += 1
+            self.status(tr("status.queue_failed", count=max(self._failed_seen,
+                                                            len(failures))), "error")
+            if failures and not self._failure_report_queued:
+                self._failure_report_queued = True
+                QTimer.singleShot(0, self._report_queue_failures)
+        self._schedule_open_pending(50)
+
+    def _report_queue_failures(self) -> None:
+        self._failure_report_queued = False
+        if self._reporting or not self._failed_seen:
+            return
+        if self.engine.queue.pending:
+            self._failure_report_queued = True
+            QTimer.singleShot(50, self._report_queue_failures)
+            return
+        count = self._failed_seen
+        self._reporting = True
+        self.engine.queue.clear_failures()
+        try:
+            QMessageBox.warning(self, tr("error.title"),
+                                tr("status.queue_failed", count=count))
+        finally:
+            self._reporting = False
+            self._failed_seen = max(0, self._failed_seen - count)
+            if self._failed_seen:
+                self._failure_report_queued = True
+                QTimer.singleShot(0, self._report_queue_failures)
+            self._schedule_open_pending()
 
     # =============================================================== other
     def skip_current(self) -> None:
         if self._blocked():
+            return
+        if not self._drain_queue():
             return
         targets = self._targets()
         if not targets or self.engine.review_mode:
@@ -1738,6 +1811,8 @@ class MainWindow(QMainWindow):
 
     def rename_current(self) -> None:
         if self._blocked():
+            return
+        if not self._drain_queue():
             return
         if self.view_mode == config.VIEW_GRID:
             targets = self._targets()
@@ -1776,12 +1851,6 @@ class MainWindow(QMainWindow):
             self._refresh_view()
         # `_finish_operation` owns the absorb in synchronous mode; doing it here
         # as well patched the views twice for one rename.
-        if self.settings.background_queue:
-            change = self.engine.absorb(outcome.record) if outcome.record else None
-            if change is None:
-                self._rebuild_queue()
-            else:
-                self._apply_change(change)
         self._finish_operation(path, self.engine.index, outcome)
 
     def trash_current(self) -> None:
@@ -1791,13 +1860,16 @@ class MainWindow(QMainWindow):
         if not targets:
             self.status(tr("status.nothing_chosen"), "warning")
             return
+        recycle_mode = self.settings.recycle_mode
+        allow_system = self.settings.background_queue
         for path in targets:
             # `target=path` binds the loop variable now; a bare closure would
             # recycle the last item once per selected file.
             self._run_operation(
                 path,
                 lambda progress, cancel, target=path: self.engine.trash(
-                    target, progress, cancel, allow_system=self.settings.background_queue),
+                    target, progress, cancel, allow_system=allow_system,
+                    recycle_mode=recycle_mode),
                 f"{tr('action.trash')} · {path.name}")
 
     def undo(self) -> None:
@@ -1815,6 +1887,7 @@ class MainWindow(QMainWindow):
         """
         if not self.engine.queue.pending:
             return True
+        was_busy = self._busy
         self._busy = True
         dialog = None
         started = time.monotonic()
@@ -1840,7 +1913,7 @@ class MainWindow(QMainWindow):
             if dialog is not None:
                 dialog.close()
                 dialog.deleteLater()
-            self._busy = False
+            self._busy = was_busy
         return not self.engine.queue.pending
 
     def _transition(self, action, message: str) -> None:
@@ -1909,9 +1982,12 @@ class MainWindow(QMainWindow):
     def recover_pending(self) -> None:
         if self._busy:
             return
+        if not self._drain_queue():
+            return
         try:
-            self._with_progress(tr("tool.recover"),
-                                lambda progress, cancel: self.engine.recover(progress))
+            recovered = self._with_progress(
+                tr("tool.recover"),
+                lambda progress, cancel: self.engine.recover(progress))
         except (TransactionError, OSError) as error:
             self._offer_recover_exit(error, can_rollback=True)
             return
@@ -1922,10 +1998,16 @@ class MainWindow(QMainWindow):
             return
         except Cancelled:
             return
+        if not recovered:
+            self.status(tr("status.recover_none"), "normal")
+            return
         self.status(tr("status.recover_done"), "success")
-        self.recover_button.setVisible(self.engine.has_pending())
+        self.recover_button.setVisible(self.engine.has_pending() and
+                                       not self.engine.queue.pending)
         if self.engine.source_root:
             self.rescan()
+        else:
+            self._open_initial_folder()
 
     def _offer_recover_exit(self, error: BaseException, can_rollback: bool) -> None:
         """Recovery failed: let the user reverse what ran, or keep the files as they are.
@@ -2012,6 +2094,8 @@ class MainWindow(QMainWindow):
 
     # ============================================================= dialogs
     def show_info(self) -> None:
+        if self._blocked():
+            return
         path = self.engine.current_path()
         if path is None:
             return
@@ -2021,6 +2105,8 @@ class MainWindow(QMainWindow):
                                      subtitle=path.name, parent=self))
 
     def show_history(self) -> None:
+        if self._blocked():
+            return
         from ..core.state import STACK_HISTORY
         rows = []
         for record in self.engine.state.records(limit=2000):
@@ -2058,6 +2144,10 @@ class MainWindow(QMainWindow):
             self._report(error)
 
     def open_duplicates(self) -> None:
+        if self._blocked():
+            return
+        if not self._drain_queue():
+            return
         if not self.engine.source_root:
             return
         self.preview.release()
@@ -2073,6 +2163,8 @@ class MainWindow(QMainWindow):
             self._update_actions()
 
     def open_backups(self) -> None:
+        if self._blocked():
+            return
         dialog = BackupDialog(self.engine.backup_usage(), self.settings.quota, self)
         if self._run_dialog(dialog) != QDialog.DialogCode.Accepted:
             return
@@ -2093,6 +2185,10 @@ class MainWindow(QMainWindow):
         self._update_actions()
 
     def open_settings(self) -> None:
+        if self._blocked():
+            return
+        if not self._drain_queue():
+            return
         dialog = SettingsDialog(self.settings, self.engine, self)
         if self._run_dialog(dialog) != QDialog.DialogCode.Accepted:
             return
@@ -2128,13 +2224,19 @@ class MainWindow(QMainWindow):
             # caller sets _busy first, so a re-entrant scan cannot start here.
             QApplication.processEvents()
 
+        was_busy = self._busy
         self._busy = True
         try:
             return work(progress, lambda: cancelled["value"])
         finally:
-            self._busy = False
+            self._busy = was_busy
             dialog.close()
             dialog.deleteLater()
+            if not was_busy:
+                QTimer.singleShot(0, self._open_pending)
+                if self._close_requested:
+                    self._close_requested = False
+                    QTimer.singleShot(0, self.close)
 
     def open_requested(self, folder: str) -> None:
         """A later launch -- Explorer's "Open with Qingjian" -- handed over a folder."""
@@ -2143,7 +2245,31 @@ class MainWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
         if folder and Path(folder).is_dir():
-            self.open_folder(Path(folder))
+            self._pending_open = Path(folder)
+            self._open_pending()
+
+    def _open_pending(self) -> None:
+        if (self._pending_open is None or self._busy or
+                QApplication.activeModalWidget() is not None):
+            return
+        if self.engine.queue.pending:
+            self._schedule_open_pending(50)
+            return
+        target = self._pending_open
+        self.open_folder(target)
+        if self._pending_open == target and self.engine.source_root == target:
+            self._pending_open = None
+
+    def _schedule_open_pending(self, delay: int = 0) -> None:
+        if self._pending_open is None or self._pending_open_retry_queued:
+            return
+        self._pending_open_retry_queued = True
+
+        def open_later() -> None:
+            self._pending_open_retry_queued = False
+            self._open_pending()
+
+        QTimer.singleShot(delay, open_later)
 
     # -- drag and drop --------------------------------------------------
     def dragEnterEvent(self, event) -> None:      # noqa: N802 - Qt naming
@@ -2172,6 +2298,10 @@ class MainWindow(QMainWindow):
             pass
 
     def closeEvent(self, event) -> None:          # noqa: N802 - Qt naming
+        if self._busy:
+            self._close_requested = True
+            event.ignore()
+            return
         if self.engine.queue.pending:
             answer = QMessageBox.question(self, tr("queue.drain"),
                                           tr("status.queue_pending",
@@ -2192,6 +2322,10 @@ class MainWindow(QMainWindow):
                 if answer != QMessageBox.StandardButton.Yes:
                     event.ignore()
                     return
+        QApplication.processEvents()
+        self._closed = True
+        if self._queue_listener in self.engine.queue_listeners:
+            self.engine.queue_listeners.remove(self._queue_listener)
         QApplication.instance().removeEventFilter(self._arrows)
         self.preview.release()
         self.preloader.shutdown()

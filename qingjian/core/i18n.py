@@ -182,6 +182,7 @@ CATALOG: dict[str, tuple[str, str]] = {
     "status.undo_done": ("撤销完成", "Undone"),
     "status.redo_done": ("已恢复上一步", "Redone"),
     "status.recover_done": ("恢复检查完成", "Recovery check complete"),
+    "status.recover_none": ("没有待恢复操作", "No pending operation to recover"),
     "status.recover_rolled_back": ("已撤回未完成的操作", "The pending operation was undone"),
     "status.recover_kept": (
         "已保留现状，未完成记录已清除",

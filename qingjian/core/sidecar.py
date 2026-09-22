@@ -261,5 +261,9 @@ def collapse_groups(paths: list[Path], rules: SidecarRules | None = None) -> lis
     result = []
     for key in order:
         members = buckets[key]
-        result.append(members[0] if len(members) == 1 else representative(members))
+        master = representative(members)
+        linked = [path for path in members if path == master or
+                  rules.classify(path, master) is not None]
+        result.append(master)
+        result.extend(path for path in members if path not in linked)
     return result

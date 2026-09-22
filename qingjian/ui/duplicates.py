@@ -21,7 +21,7 @@ from ..core import dedupe
 from ..core.engine import human_size
 from ..core.i18n import tr
 from ..core.logsetup import get_logger
-from ..core.safestore import Cancelled
+from ..core.safestore import Cancelled, TransactionError
 from . import theme
 from .preview import MediaPreview
 from .widgets import Segmented, caption, separator
@@ -87,6 +87,7 @@ class DuplicatesDialog(QDialog):
     def __init__(self, engine, parent=None) -> None:
         super().__init__(parent)
         self.engine = engine
+        self.root = engine.source_root
         self.setWindowTitle(tr("dup.title"))
         self.resize(1420, 880)
         self.mode = dedupe.MODE_EXACT
@@ -491,19 +492,27 @@ class DuplicatesDialog(QDialog):
         chosen = self._selected(whole_group)
         if not chosen:
             return
-        self.engine.ignore_duplicates(chosen)
+        try:
+            self.engine.ignore_duplicates(chosen, self.root)
+        except TransactionError as error:
+            self.summary.setText(str(error))
+            return
         # Ignoring changes what every mode would report, and the hashes behind
         # them are cached, so a fresh scan here is cheap.
         self.reload(force=True)
 
     def _restore(self) -> None:
-        self.engine.restore_ignored()
+        try:
+            self.engine.restore_ignored()
+        except TransactionError as error:
+            self.summary.setText(str(error))
+            return
         self.reload(force=True)
 
     def _extras_to_review(self) -> None:
         extras = [member.path for group in self.groups for member in group.extras]
         if extras:
-            self.engine.send_to_review(extras)
+            self.engine.send_to_review(extras, self.root)
             self.changed_the_queue = True
             self.accept()
 

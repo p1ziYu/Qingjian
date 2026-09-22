@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
+from unittest import mock
 
 from base import ROOT, TempCase, unittest
 from qingjian.core import config, ops, safestore
@@ -23,6 +24,32 @@ from qingjian.core.engine import Engine
 from qingjian.core.safestore import TransactionError
 
 PACKAGE = ROOT / "qingjian"
+
+
+class QueueCursorTests(TempCase):
+    def test_queue_helpers_preserve_cursor(self):
+        src = self.tmp / "src"
+        src.mkdir()
+        paths = [self.write(src / f"p{i}.jpg", b"photo") for i in range(5)]
+        engine = Engine(self.data, config.Settings())
+        self.addCleanup(engine.close)
+        engine.open_folder(src)
+        engine.go_to(paths[3])
+        before = engine.current_path()
+        engine.drop_from_queue(paths[0])
+        engine.insert_at(paths[0], 0)
+        self.assertEqual(engine.current_path(), before)
+
+
+class TagWithoutQueueLockTests(TempCase):
+    def test_tag_does_not_take_exclusive_lock(self):
+        photo = self.write(self.tmp / "p.jpg", b"photo")
+        engine = Engine(self.data, config.Settings())
+        self.addCleanup(engine.close)
+        with mock.patch.object(engine, "exclusive",
+                               side_effect=AssertionError("exclusive called")):
+            engine.tag([photo], rating=5)
+        self.assertEqual(engine.state.tag(str(photo))[0], 5)
 
 
 def digests(root: Path) -> dict[str, list[str]]:
@@ -892,30 +919,42 @@ class AbsorbTests(TempCase):
 class ReentrancyGuardTests(unittest.TestCase):
     """Everything a shortcut can reach has to refuse to run mid-operation."""
 
-    #: Handlers bound to keys that mutate the queue or the two list views.
-    GUARDED = ("classify_index", "skip_current", "rename_current", "trash_current",
-               "_rate_current", "_label_current", "toggle_review", "_run_operation",
-               "_transition", "recover_pending", "open_folder", "rescan",
-               "_rebuild_queue", "_recursive_changed", "choose_binding_folder",
-               "open_bindings")
-
     def test_every_mutating_handler_checks_the_busy_flag(self):
-        """`processEvents` dispatches buffered key presses mid-transaction.
-
-        Hold a binding key, then press undo: the buffered presses used to reach
-        straight into the queue and both views while a move was in flight.
-        """
         tree = ast.parse((PACKAGE / "ui" / "mainwindow.py").read_text(encoding="utf-8"))
-        unguarded = []
-        for node in ast.walk(tree):
-            if not (isinstance(node, ast.ClassDef) and node.name == "MainWindow"):
-                continue
-            for item in node.body:
-                if not isinstance(item, ast.FunctionDef) or item.name not in self.GUARDED:
-                    continue
-                body = ast.dump(item)
-                if "_busy" not in body and "_blocked" not in body:
-                    unguarded.append(item.name)
+        window = next(node for node in tree.body if isinstance(node, ast.ClassDef)
+                      and node.name == "MainWindow")
+        methods = {node.name: node for node in window.body
+                   if isinstance(node, ast.FunctionDef)}
+        shortcuts = methods["_build_shortcuts"]
+        handlers = {node.attr for node in ast.walk(shortcuts)
+                    if isinstance(node, ast.Attribute) and
+                    isinstance(node.value, ast.Name) and node.value.id == "self" and
+                    node.attr in methods}
+        handlers.discard("_shortcut")
+        handlers.discard("_install_binding_shortcuts")
+        readonly = {"_arrow", "_escape", "_step_frame", "toggle_fullscreen"}
+
+        def guarded(name: str, seen: set[str]) -> bool:
+            if name in readonly:
+                return True
+            if name in seen:
+                return False
+            body = methods[name].body
+            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+                body = body[1:]
+            if body and isinstance(body[0], ast.If):
+                condition = body[0].test
+                if (any(isinstance(node, ast.Attribute) and node.attr in ("_busy", "_blocked")
+                        for node in ast.walk(condition)) and
+                        len(body[0].body) == 1 and isinstance(body[0].body[0], ast.Return)):
+                    return True
+            calls = {node.func.attr for node in ast.walk(methods[name])
+                     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                     and isinstance(node.func.value, ast.Name)
+                     and node.func.value.id == "self" and node.func.attr in methods}
+            return bool(calls) and all(guarded(target, seen | {name}) for target in calls)
+
+        unguarded = sorted(name for name in handlers if not guarded(name, set()))
         self.assertEqual(unguarded, [], f"unguarded handlers: {unguarded}")
 
     def test_the_grid_stays_dirty_until_its_build_finishes(self):

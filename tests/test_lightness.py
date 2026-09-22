@@ -445,7 +445,9 @@ class RebuildCostTests(unittest.TestCase):
 
     def test_renaming_one_file_does_not_rebuild_the_queue(self):
         body = ast.dump(self._method("MainWindow", "rename_current"))
-        self.assertIn("absorb", body)
+        self.assertIn("_finish_operation", body)
+        self.assertNotIn("attr='absorb'", body,
+                         "rename must use the finish handler's single absorb")
 
     def test_closing_the_duplicates_window_rebuilds_only_if_it_changed_something(self):
         body = ast.dump(self._method("MainWindow", "open_duplicates"))

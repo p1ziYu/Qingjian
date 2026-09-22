@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 import uuid
+from unittest import mock
 from pathlib import Path
 
 from base import ROOT, TempCase, unittest
@@ -1343,6 +1344,105 @@ class StampsFollowTheViewTests(WindowCase):
                 self.window._set_view(mode)
                 self.app.processEvents()
                 self.assertTrue(self.window.rating.isVisible())
+
+
+class G03WindowTests(WindowCase):
+    def test_absent_target_is_checked_once_before_classify(self):
+        from qingjian.core import config
+        source = self.source / "IMG_0000.JPG"
+        binding = config.Binding("1", "copy", str(self.keep))
+        target = self.keep / source.name
+        original = Path.exists
+        calls = 0
+        def counted(path):
+            nonlocal calls
+            if path == target:
+                calls += 1
+            return original(path)
+        with mock.patch.object(Path, "exists", counted), \
+             mock.patch.object(self.engine.planner, "_same_path",
+                               wraps=self.engine.planner._same_path) as same, \
+             mock.patch.object(self.window, "_run_operation"):
+            self.assertTrue(self.window._classify_one(binding, source))
+        self.assertEqual(1, calls)
+        same.assert_not_called()
+
+    def test_same_source_avoids_conflict_dialog(self):
+        from qingjian.core import config
+        from qingjian.ui.mainwindow import ConflictDialog
+        source = self.source / "IMG_0000.JPG"
+        binding = config.Binding("1", "copy", str(self.source))
+        with mock.patch.object(ConflictDialog, "ask") as ask, \
+             mock.patch.object(self.window, "_run_operation") as run:
+            self.assertFalse(self.window._classify_one(binding, source))
+        ask.assert_not_called()
+        run.assert_not_called()
+
+    def test_rename_precheck_uses_completed_suffix(self):
+        from PySide6.QtWidgets import QInputDialog
+        from qingjian.core import ops
+        from qingjian.ui.mainwindow import ConflictDialog
+        self.engine.go_to(self.source / "IMG_0000.JPG")
+        with mock.patch.object(QInputDialog, "getText", return_value=("IMG_0001", True)), \
+             mock.patch.object(ConflictDialog, "ask", return_value=(ops.CONFLICT_CANCEL, False)) as ask:
+            self.window.rename_current()
+        ask.assert_called_once()
+
+    def test_invalid_rename_reports_error(self):
+        from PySide6.QtWidgets import QInputDialog
+        self.engine.go_to(self.source / "IMG_0000.JPG")
+        with mock.patch.object(QInputDialog, "getText", return_value=("a/b", True)), \
+             mock.patch.object(self.window, "_report") as report:
+            self.window.rename_current()
+        report.assert_called_once()
+
+
+class G03EditorTests(QtCase):
+    def test_relative_binding_is_rejected(self):
+        from qingjian.core import config
+        from qingjian.ui.editors import BindingsDialog
+        dialog = BindingsDialog([config.Binding("1", "move", "Keep")])
+        self.addCleanup(dialog.close)
+        with mock.patch.object(QMessageBox, "warning"):
+            dialog._accept()
+        self.assertNotEqual(QDialog.DialogCode.Accepted, dialog.result())
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows drive and root path syntax")
+    def test_windows_non_absolute_bindings_are_rejected(self):
+        from qingjian.core import config
+        from qingjian.ui.editors import BindingsDialog
+        for folder in ("Keep", "D:Keep", "\\Keep"):
+            with self.subTest(folder=folder):
+                dialog = BindingsDialog([config.Binding("1", "move", folder)])
+                with mock.patch.object(QMessageBox, "warning"):
+                    dialog._accept()
+                self.assertNotEqual(QDialog.DialogCode.Accepted, dialog.result())
+                dialog.close()
+
+    def test_preview_uses_counter(self):
+        from qingjian.core import config
+        from qingjian.core.engine import Engine
+        from qingjian.ui.editors import TemplateEditor
+        source = self.tmp / "A.JPG"
+        source.write_bytes(b"x")
+        engine = Engine(self.data / "engine", config.Settings())
+        self.addCleanup(engine.close)
+        binding = config.Binding("1", "move", str(self.tmp / "out"),
+                                 name_template="{seq:4}_{name}")
+        engine.planner.sequence.take(binding, 3)
+        context = engine.planner.context_for(source, binding, self.tmp, 1)
+        editor = TemplateEditor(binding, [context], engine=engine)
+        self.addCleanup(editor.close)
+        self.assertIn("0004_", editor.preview.item(0).text())
+        editor.seq_start.setValue(500)
+        self.assertIn("0500_", editor.preview.item(0).text())
+        editor.seq_start.setValue(1)
+        self.assertIn("0004_", editor.preview.item(0).text())
+        binding.sequence_start = 500
+        editor2 = TemplateEditor(binding, [context], engine=engine)
+        self.addCleanup(editor2.close)
+        editor2.seq_start.setValue(1)
+        self.assertIn("0004_", editor2.preview.item(0).text())
 
 
 if __name__ == "__main__":

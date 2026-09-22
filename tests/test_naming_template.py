@@ -7,6 +7,10 @@ from qingjian.core.naming import NameError_
 
 
 class NamingTests(TempCase):
+    def test_suffix_only_recognizes_media_and_sidecar_extensions(self):
+        self.assertEqual("Party v1.2.jpg", naming.ensure_suffix("Party v1.2", ".jpg"))
+        self.assertEqual("photo.xmp", naming.ensure_suffix("photo.xmp", ".jpg"))
+
     def test_illegal_characters_are_replaced(self):
         self.assertEqual("a_b_c", naming.sanitize_component('a<b>c'))
         self.assertEqual("a_b", naming.sanitize_component('a"b'))
@@ -56,6 +60,28 @@ class NamingTests(TempCase):
 
 
 class TemplateTests(unittest.TestCase):
+    def test_source_text_and_template_suffix(self):
+        ctx = template.TemplateContext(source=Path("_DSC0001.JPG"),
+                                       when=datetime(2024, 5, 1))
+        self.assertEqual("_DSC0001.JPG", template.render_name("{name}", ctx))
+        ctx.source = Path("IMG_1.HEIC.jpg")
+        self.assertEqual("IMG_1.HEIC.jpg", template.render_name("{name}", ctx))
+        self.assertEqual("IMG_1.HEIC.jpg", template.render_name("{name}.{ext}", ctx))
+        self.assertEqual("Trip - Day 1.jpg", template.render_name("Trip - Day 1", ctx))
+        self.assertEqual("photo.jpg", template.render_name("photo.jpg", ctx))
+        ctx.source_root = Path("lib")
+        ctx.source = Path("lib/_Trips/Day 1/IMG_1.JPG")
+        self.assertEqual(("_Trips", "Day 1"), template.render_path("{relpath}", ctx))
+
+    def test_source_internal_spaces_are_preserved(self):
+        ctx = template.TemplateContext(source=Path("lib/Day  1/A  B.JPG"),
+                                       source_root=Path("lib"), when=datetime(2024, 5, 1))
+        self.assertEqual("A  B.JPG", template.render_name("{name}", ctx))
+        self.assertEqual(("Day  1",), template.render_path("{relpath}", ctx))
+        ctx.source = Path("lib/  Day  1/  A  B.JPG")
+        self.assertEqual("  A  B.JPG", template.render_name("{name}", ctx))
+        self.assertEqual(("  Day  1",), template.render_path("{relpath}", ctx))
+
     def ctx(self, **kw):
         base = dict(source=Path("/lib/Iceland/Day3/IMG_4821.JPG"),
                     when=datetime(2026, 8, 14, 19, 42, 8), camera="Sony ILCE-7M4",

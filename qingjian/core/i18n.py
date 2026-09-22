@@ -221,6 +221,10 @@ CATALOG: dict[str, tuple[str, str]] = {
         "目标是当前文件所在文件夹，请选择其他位置",
         "The target is the file's own folder — choose somewhere else",
     ),
+    "error.group_name_collision": (
+        "同组文件的目标名称冲突：{path}",
+        "Files in this group would share a destination: {path}",
+    ),
     "error.busy": ("请等待当前操作完成", "Wait for the current operation to finish"),
     "error.pending_first": ("请先恢复未完成操作", "Finish the pending operation first"),
     "error.pending_blocked": (

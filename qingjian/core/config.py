@@ -246,7 +246,9 @@ class Settings:
             for binding in bindings:
                 if binding.needs_folder() and binding.folder:
                     try:
-                        folders.append(Path(binding.folder).expanduser().resolve())
+                        folder = Path(binding.folder).expanduser()
+                        if folder.is_absolute():
+                            folders.append(folder.resolve())
                     except (OSError, RuntimeError):
                         continue
         return folders

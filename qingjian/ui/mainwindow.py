@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFil
                                QVBoxLayout, QWidget)
 
 from .. import __display_name__
-from ..core import config, metadata, ops, platform_, scanner
+from ..core import config, metadata, naming, ops, platform_, scanner
 from ..core.imaging import decodes_slowly
 from ..core.engine import Engine, human_size
 from ..core.i18n import LANGUAGE_CODES, get_language, set_language, tr
@@ -1389,7 +1389,7 @@ class MainWindow(QMainWindow):
         if self._blocked():
             return
         dialog = BindingsDialog(self.settings.bindings, self._template_samples(), self,
-                                reserved=self.reserved_keys())
+                                reserved=self.reserved_keys(), engine=self.engine)
         if self._run_dialog(dialog) == QDialog.DialogCode.Accepted:
             self.settings.set_bindings(dialog.result_bindings())
             self.engine.save_settings()
@@ -1552,11 +1552,32 @@ class MainWindow(QMainWindow):
         decision = ""
         if binding.action in ("move", "copy", "favorite"):
             target = self.engine.preview_target(binding, path, group)
-            if target is not None and target.exists():
+            if target is not None:
+                if len(group.members) == 1:
+                    exists = target.exists()
+                    if exists and self.engine.planner._same_path(path, target, True):
+                        self.status(tr("error.target_is_source"), "warning")
+                        return False
+                    conflicts = [(path, target)] if exists else []
+                else:
+                    pairs = self.engine.planner._group_pairs(group, target.parent, target.name)
+                    target_exists = [destination.exists() for _, destination in pairs]
+                    sources = [source for source, _ in pairs]
+                    if any(exists and any(self.engine.planner._same_path(source, destination, True)
+                                          for source in sources)
+                           for (_, destination), exists in zip(pairs, target_exists, strict=True)):
+                        self.status(tr("error.target_is_source"), "warning")
+                        return False
+                    conflicts = [pair for pair, exists in zip(pairs, target_exists, strict=True)
+                                 if exists]
+            else:
+                conflicts = []
+            if conflicts:
+                conflict_source, conflict_target = conflicts[0]
                 if self._conflict_default:
                     decision = self._conflict_default
                 else:
-                    decision, remember = ConflictDialog.ask(self, path, target)
+                    decision, remember = ConflictDialog.ask(self, conflict_source, conflict_target)
                     if decision == ops.CONFLICT_CANCEL:
                         return False
                     if remember:
@@ -1714,15 +1735,17 @@ class MainWindow(QMainWindow):
         if not ok or not name.strip():
             return
         try:
-            target = path.with_name(name.strip())
+            new_name = naming.ensure_suffix(name.strip(), path.suffix)
+            naming.validate_filename(new_name)
+            target = path.with_name(new_name)
             decision = ""
             if target.exists():
                 decision, _remember = ConflictDialog.ask(self, path, target)
                 if decision in (ops.CONFLICT_CANCEL, ops.CONFLICT_SKIP):
                     return
             resolver = (lambda a, b, value=decision: value) if decision else ops.always_sequence
-            outcome = self.engine.rename(name.strip(), path, resolver)
-        except (NameError_, TransactionError, OSError) as error:
+            outcome = self.engine.rename(new_name, path, resolver)
+        except (NameError_, TransactionError, OSError, ValueError) as error:
             self._report(error)
             return
         # `_finish_operation` owns the absorb in synchronous mode; doing it here

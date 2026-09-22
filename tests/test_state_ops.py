@@ -1,12 +1,15 @@
 import os
+import sys
 import time
+from unittest import mock
 from pathlib import Path
 
 from base import TempCase, unittest
 from fixtures import build_library
 from qingjian.core import config, ops
+from qingjian.core.engine import Engine
 from qingjian.core.naming import NameError_
-from qingjian.core.safestore import SafeStore, TransactionError
+from qingjian.core.safestore import Plan, SafeStore, TransactionError
 from qingjian.core.state import STACK_HISTORY, STACK_REDO, Record, StateStore, empty_delta
 
 
@@ -251,10 +254,11 @@ class ConflictTests(PlannerCase):
         self.assertEqual(before, self.planner.sequence.peek(self.binding()))
 
     def test_moving_into_the_files_own_folder_is_refused(self):
-        with self.assertRaises(TransactionError):
-            self.planner.plan_folder_action(
-                "move", self.planner.group_for(self.source),
-                self.binding(folder=str(self.source.parent)), source_root=self.root)
+        result = self.planner.plan_folder_action(
+            "move", self.planner.group_for(self.source),
+            self.binding(folder=str(self.source.parent)), source_root=self.root)
+        self.assertTrue(result.skipped)
+        self.assertEqual("error.target_is_source", result.message_key)
 
 
 class OtherActionTests(PlannerCase):
@@ -435,6 +439,195 @@ class RenameHistoryTests(TempCase):
         self.assertEqual(before, self.folder(master.parent), "undo did not restore the shot")
         self.assertEqual([], [p for p in self.keep.rglob("*") if p.is_file()],
                          "a file was left in the folders the template made")
+
+
+class G03PlanningTests(TempCase):
+    def test_planning_checks_absent_target_once(self):
+        source = self.tmp / "A.JPG"
+        source.write_bytes(b"photo")
+        engine = self.engine()
+        destination = self.tmp / "out" / source.name
+        original = Path.exists
+        calls = 0
+        def counted(path):
+            nonlocal calls
+            if path == destination:
+                calls += 1
+            return original(path)
+        with mock.patch.object(Path, "exists", counted):
+            engine.planner.plan_folder_action(
+                "copy", engine.group_for(source), config.Binding("1", "copy", str(destination.parent)))
+        self.assertEqual(1, calls)
+
+    def engine(self):
+        engine = Engine(self.data / "engine", config.Settings())
+        self.addCleanup(engine.close)
+        return engine
+
+    def test_same_source_copy_is_skipped(self):
+        source = self.tmp / "A.JPG"
+        source.write_bytes(b"photo")
+        engine = self.engine()
+        result = engine.classify(config.Binding("1", "copy", str(self.tmp)), source,
+                                 lambda *_: ops.CONFLICT_REPLACE)
+        self.assertTrue(result.skipped)
+        self.assertEqual(b"photo", source.read_bytes())
+        self.assertFalse(engine.has_pending())
+
+    def test_companion_source_collision_is_rejected(self):
+        for name in ("IMG_9.HEIC", "IMG_9.JPG"):
+            (self.tmp / name).write_bytes(name.encode())
+        engine = self.engine()
+        with self.assertRaises(NameError_):
+            engine.rename("IMG_9.JPG", self.tmp / "IMG_9.HEIC",
+                          lambda *_: ops.CONFLICT_REPLACE)
+        self.assertFalse(engine.has_pending())
+
+    def test_companion_conflict_sequences_whole_group(self):
+        source, dest = self.tmp / "src", self.tmp / "dst"
+        source.mkdir()
+        dest.mkdir()
+        (source / "IMG_1.JPG").write_bytes(b"j")
+        (source / "IMG_1.CR2").write_bytes(b"new")
+        (dest / "IMG_1.CR2").write_bytes(b"old")
+        engine = self.engine()
+        engine.classify(config.Binding("1", "move", str(dest)), source / "IMG_1.JPG",
+                        lambda *_: ops.CONFLICT_SEQUENCE)
+        self.assertTrue((dest / "IMG_1 (2).JPG").exists())
+        self.assertEqual(b"new", (dest / "IMG_1 (2).CR2").read_bytes())
+        self.assertEqual(b"old", (dest / "IMG_1.CR2").read_bytes())
+
+    def test_template_cannot_collapse_group_names(self):
+        source = self.tmp / "src"
+        source.mkdir()
+        for name in ("IMG_1.HEIC", "IMG_1.JPG"):
+            (source / name).write_bytes(name.encode())
+        engine = self.engine()
+        binding = config.Binding("1", "copy", str(self.tmp / "out"),
+                                 name_template="photo.jpg")
+        with self.assertRaises(NameError_):
+            engine.classify(binding, source / "IMG_1.HEIC")
+        self.assertFalse(engine.has_pending())
+        self.assertEqual(2, len(list(source.iterdir())))
+
+    def test_replace_companion_conflict_is_undoable(self):
+        source, dest = self.tmp / "src", self.tmp / "dst"
+        source.mkdir()
+        dest.mkdir()
+        (source / "IMG_1.JPG").write_bytes(b"master")
+        (source / "IMG_1.CR2").write_bytes(b"new")
+        (dest / "IMG_1.CR2").write_bytes(b"old")
+        engine = self.engine()
+        engine.classify(config.Binding("1", "move", str(dest)), source / "IMG_1.JPG",
+                        lambda *_: ops.CONFLICT_REPLACE)
+        self.assertEqual(b"new", (dest / "IMG_1.CR2").read_bytes())
+        engine.undo()
+        self.assertEqual(b"old", (dest / "IMG_1.CR2").read_bytes())
+        self.assertEqual(b"new", (source / "IMG_1.CR2").read_bytes())
+
+    def test_relative_folder_is_cancelled(self):
+        source = self.tmp / "A.JPG"
+        source.write_bytes(b"j")
+        engine = self.engine()
+        binding = config.Binding("1", "move", "Keep")
+        result = engine.classify(binding, source)
+        self.assertTrue(result.cancelled)
+        self.assertIsNone(engine.planner.preview_target(engine.group_for(source), binding))
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows drive and root path syntax")
+    def test_windows_non_absolute_folders_are_cancelled(self):
+        source = self.tmp / "A.JPG"
+        source.write_bytes(b"j")
+        engine = self.engine()
+        for folder in ("Keep", "D:Keep", "\\Keep"):
+            with self.subTest(folder=folder):
+                binding = config.Binding("1", "move", folder)
+                self.assertTrue(engine.classify(binding, source).cancelled)
+                self.assertIsNone(engine.planner.preview_target(engine.group_for(source), binding))
+
+    def test_plain_action_does_not_advance_sequence(self):
+        source = self.tmp / "A.JPG"
+        source.write_bytes(b"j")
+        engine = self.engine()
+        binding = config.Binding("1", "copy", str(self.tmp / "out"))
+        before = engine.planner.sequence.peek(binding)
+        engine.classify(binding, source)
+        self.assertEqual(before, engine.planner.sequence.peek(binding))
+
+    def test_sequence_rolls_back_when_commit_fails(self):
+        source = self.tmp / "A.JPG"
+        source.write_bytes(b"x" * 10000)
+        engine = self.engine()
+        binding = config.Binding("1", "copy", str(self.tmp / "out"),
+                                 name_template="{seq:4}_{name}")
+        before = engine.planner.sequence.peek(binding)
+        with mock.patch("qingjian.core.safestore.free_space", return_value=1):
+            with self.assertRaises(TransactionError):
+                engine.classify(binding, source)
+        self.assertEqual(before, engine.planner.sequence.peek(binding))
+
+    def test_path_template_sequence_advances(self):
+        source = self.tmp / "A.JPG"
+        source.write_bytes(b"j")
+        engine = self.engine()
+        binding = config.Binding("1", "copy", str(self.tmp / "out"),
+                                 path_template="{seq:4}")
+        engine.classify(binding, source)
+        self.assertEqual(2, engine.planner.sequence.peek(binding))
+
+    def test_planning_failure_discards_earlier_snapshot(self):
+        source, dest = self.tmp / "src", self.tmp / "dst"
+        source.mkdir()
+        dest.mkdir()
+        (source / "IMG_1.JPG").write_bytes(b"master")
+        (source / "IMG_1.CR2").write_bytes(b"new")
+        (dest / "IMG_1.JPG").write_bytes(b"old")
+        engine = self.engine()
+        binding = config.Binding("1", "move", str(dest), name_template="{seq}_{name}")
+        # Force a replacement at the first member, then fail planning the second.
+        (dest / "1_IMG_1.JPG").write_bytes(b"old")
+        real_check = ops.naming.check_path_length
+        calls = 0
+        def check(path):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise NameError_("error.name_too_long")
+            return real_check(path)
+        with mock.patch.object(ops.naming, "check_path_length", side_effect=check):
+            with self.assertRaises(NameError_):
+                engine.classify(binding, source / "IMG_1.JPG",
+                                lambda *_: ops.CONFLICT_REPLACE)
+        self.assertEqual([], list(engine.store.snapshot_root.iterdir()))
+        self.assertEqual(1, engine.planner.sequence.peek(binding))
+
+    def test_failed_commit_discards_snapshot_when_old_pending_exists(self):
+        engine = self.engine()
+        binding = config.Binding("1", "copy", str(self.tmp / "out"))
+        engine.planner.sequence.take(binding)
+        snapshot = engine.store.snapshot_root / "test-snapshot"
+        snapshot.write_bytes(b"old")
+        outcome = ops.Outcome(plan=Plan(forward=[], snapshots=[str(snapshot)]))
+        with mock.patch.object(engine.store, "has_pending", return_value=True), \
+             mock.patch.object(engine.store, "run", side_effect=TransactionError("error.disk_full")):
+            with self.assertRaises(TransactionError):
+                engine._commit(outcome)
+        self.assertFalse(snapshot.exists())
+        self.assertEqual(1, engine.planner.sequence.peek(binding))
+
+    def test_failed_commit_keeps_snapshot_for_new_pending_journal(self):
+        engine = self.engine()
+        binding = config.Binding("1", "copy", str(self.tmp / "out"))
+        engine.planner.sequence.take(binding)
+        snapshot = engine.store.snapshot_root / "test-snapshot"
+        snapshot.write_bytes(b"old")
+        outcome = ops.Outcome(plan=Plan(forward=[], snapshots=[str(snapshot)]))
+        with mock.patch.object(engine.store, "has_pending", side_effect=[False, True]), \
+             mock.patch.object(engine.store, "run", side_effect=TransactionError("error.disk_full")):
+            with self.assertRaises(TransactionError):
+                engine._commit(outcome)
+        self.assertTrue(snapshot.exists())
+        self.assertEqual(2, engine.planner.sequence.peek(binding))
 
 
 if __name__ == "__main__":

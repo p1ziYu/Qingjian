@@ -7,8 +7,10 @@ lets every branch here be tested without a filesystem race.
 from __future__ import annotations
 
 import uuid
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from pathlib import PureWindowsPath
 from typing import Callable, Sequence
 
 from . import sidecar as sidecar_mod
@@ -16,7 +18,7 @@ from . import metadata, naming, template
 from .config import Binding, Settings
 from .logsetup import get_logger
 from .naming import NameError_
-from .safestore import (VERIFY_FAST, Plan, SafeStore, TransactionError, identity, step_copy,
+from .safestore import (VERIFY_FAST, Plan, SafeStore, identity, step_copy,
                         step_move, step_unlink)
 from .state import STACK_REDO, Record, StateStore, empty_delta
 
@@ -81,10 +83,10 @@ class SequenceCounter:
     def peek(self, binding: Binding) -> int:
         key = self._key(binding)
         if key in self._pending:
-            return self._pending[key]
+            return max(self._pending[key], binding.sequence_start, 1)
         stored = self.state.meta(key, "")
         try:
-            return int(stored) if stored else max(1, binding.sequence_start)
+            return max(int(stored), binding.sequence_start, 1) if stored else max(1, binding.sequence_start)
         except ValueError:
             return max(1, binding.sequence_start)
 
@@ -117,6 +119,95 @@ class Planner:
     def group_for(self, path: str | Path, listing: list[Path] | None = None) -> sidecar_mod.SidecarGroup:
         return sidecar_mod.find_group(path, self.settings.sidecar, listing)
 
+    @staticmethod
+    def _absolute_folder(folder: str) -> bool:
+        path = Path(folder).expanduser()
+        return path.is_absolute() and (os.name != "nt" or bool(PureWindowsPath(str(path)).anchor.rstrip("\\")))
+
+    @staticmethod
+    def _same_path(source: Path, target: Path, target_exists: bool | None = None) -> bool:
+        if target_exists is None:
+            target_exists = target.exists()
+        if target_exists:
+            try:
+                return os.path.samefile(source, target)
+            except OSError:
+                pass
+        return os.path.normcase(str(source.resolve())) == os.path.normcase(str(target.resolve()))
+
+    @staticmethod
+    def _group_pairs(group: sidecar_mod.SidecarGroup, folder: Path,
+                     master_name: str) -> list[tuple[Path, Path]]:
+        stem = sidecar_mod.base_stem(group.master)
+        return [(member.path, folder / (master_name if member.path == group.master else
+                 sidecar_target_name(master_name, stem, member.path.name)))
+                for member in group.members]
+
+    def _resolve_pairs(self, group: sidecar_mod.SidecarGroup, folder: Path,
+                       name: str, resolver: Resolver) -> tuple[list[tuple[Path, Path]], str, list[bool]] | Outcome:
+        pairs = self._group_pairs(group, folder, name)
+        sources = [source for source, _ in pairs]
+        exists = [target.exists() for _, target in pairs]
+        keys = [str(target).casefold() for _, target in pairs]
+        if len(keys) != len(set(keys)):
+            raise NameError_("error.group_name_collision", path=str(folder / name))
+        for (source, target), target_exists in zip(pairs, exists, strict=True):
+            if any(self._same_path(other, target, target_exists) for other in sources):
+                if source == group.master and self._same_path(source, target, target_exists):
+                    return Outcome(skipped=True, message_key="error.target_is_source")
+                raise NameError_("error.group_name_collision", path=str(target))
+        conflicts = [pair for pair, target_exists in zip(pairs, exists, strict=True)
+                     if target_exists]
+        if not conflicts:
+            return pairs, "", exists
+        decision = resolver(*conflicts[0])
+        if decision == CONFLICT_CANCEL:
+            return Outcome(cancelled=True)
+        if decision == CONFLICT_SKIP:
+            return Outcome(skipped=True)
+        if decision == CONFLICT_REPLACE:
+            return pairs, CONFLICT_REPLACE, exists
+        stem, suffix = naming.split_name(name)
+        base_stem = naming.strip_sequence(stem)
+        for number in range(2, naming.MAX_SEQUENCE):
+            candidate = f"{base_stem} ({number}){suffix}"
+            proposed = self._group_pairs(group, folder, candidate)
+            destinations = [target for _, target in proposed]
+            if len({str(path).casefold() for path in destinations}) != len(destinations):
+                raise NameError_("error.group_name_collision", path=str(folder / candidate))
+            proposed_exists = [path.exists() for path in destinations]
+            if all(not target_exists and not any(self._same_path(source, path, False)
+                                                  for source in sources)
+                   for path, target_exists in zip(destinations, proposed_exists, strict=True)):
+                return proposed, CONFLICT_SEQUENCE, proposed_exists
+        raise NameError_("error.no_unique_name")
+
+    def _build_steps(self, pairs: list[tuple[Path, Path]], action: str,
+                     exists: list[bool]) -> tuple[list[dict], list[str]]:
+        forward: list[dict] = []
+        snapshots: list[str] = []
+        try:
+            for (source, destination), target_exists in zip(pairs, exists, strict=True):
+                source_id = identity(source, VERIFY_FAST)
+                if source_id is None:
+                    continue
+                naming.check_path_length(destination)
+                if target_exists:
+                    existing = identity(destination, VERIFY_FAST)
+                    snapshot = self.store.snapshot(destination)
+                    if snapshot:
+                        snapshots.append(snapshot["file"])
+                    unlink = step_unlink(destination, existing)
+                    unlink["snapshot"] = snapshot
+                    forward.append(unlink)
+                forward.append(step_move(source, destination, source_id) if action in ("move", "rename")
+                               else step_copy(source, destination, source_id))
+        except Exception:
+            self.sequence.rollback()
+            self.store.discard_snapshots(snapshots)
+            raise
+        return forward, snapshots
+
     def context_for(self, path: Path, binding: Binding, source_root: Path | None,
                     sequence: int) -> template.TemplateContext:
         info = metadata.read(path)
@@ -135,7 +226,7 @@ class Planner:
         so the question can be asked on the interface thread rather than from
         inside a background transaction.
         """
-        if not binding.folder:
+        if not binding.folder or not self._absolute_folder(binding.folder):
             return None
         base = Path(binding.folder).expanduser()
         ctx = self.context_for(group.master, binding, source_root,
@@ -153,14 +244,12 @@ class Planner:
                            source_root: Path | None = None,
                            resolver: Resolver = always_sequence) -> Outcome:
         """Move, copy or favourite one shot (master plus every companion)."""
-        if not binding.folder:
+        if not binding.folder or not self._absolute_folder(binding.folder):
             return Outcome(cancelled=True, message_key="bind.target_folder")
         base = Path(binding.folder).expanduser().resolve()
         master = group.master
-        if base == master.parent.resolve() and action == "move":
-            raise TransactionError("error.target_is_source")
-
-        seq = self.sequence.take(binding)
+        uses_sequence = "{seq" in binding.path_template or "{seq" in binding.name_template
+        seq = self.sequence.take(binding) if uses_sequence else self.sequence.peek(binding)
         ctx = self.context_for(master, binding, source_root, seq)
         try:
             folder = base
@@ -171,60 +260,18 @@ class Planner:
             self.sequence.rollback()
             raise
 
-        conflict = ""
-        target = folder / master_name
-        reserved: set[str] = set()
-        replaced: list[tuple[Path, dict]] = []
+        try:
+            resolved = self._resolve_pairs(group, folder, master_name, resolver)
+        except Exception:
+            self.sequence.rollback()
+            raise
+        if isinstance(resolved, Outcome):
+            self.sequence.rollback()
+            return resolved
+        pairs, conflict, exists = resolved
+        target = pairs[0][1]
 
-        if target.exists():
-            decision = resolver(master, target)
-            if decision == CONFLICT_CANCEL:
-                self.sequence.rollback()
-                return Outcome(cancelled=True)
-            if decision == CONFLICT_SKIP:
-                self.sequence.rollback()
-                return Outcome(skipped=True)
-            if decision == CONFLICT_SEQUENCE:
-                conflict = CONFLICT_SEQUENCE
-                target = naming.unique_destination(folder, master_name, reserved)
-                master_name = target.name
-            else:
-                conflict = CONFLICT_REPLACE
-        reserved.add(str(target))
-
-        base_stem = sidecar_mod.base_stem(master)
-        pairs: list[tuple[Path, Path]] = [(master, target)]
-        for member in group.sidecars:
-            name = sidecar_target_name(master_name, base_stem, member.path.name)
-            companion = folder / name
-            if companion.exists() and conflict != CONFLICT_REPLACE:
-                companion = naming.unique_destination(folder, name, reserved)
-            reserved.add(str(companion))
-            pairs.append((member.path, companion))
-
-        forward: list[dict] = []
-        snapshots: list[str] = []
-        for source, destination in pairs:
-            # Size and modification time say whether a file changed since this
-            # plan was made. Content is hashed only where bytes are copied.
-            source_id = identity(source, VERIFY_FAST)
-            if source_id is None:
-                continue
-            naming.check_path_length(destination)
-            if destination.exists():
-                # Replacing: keep the old content so undo can put it back.
-                existing = identity(destination, VERIFY_FAST)
-                snapshot = self.store.snapshot(destination)
-                if snapshot:
-                    snapshots.append(snapshot["file"])
-                    replaced.append((destination, snapshot))
-                unlink = step_unlink(destination, existing)
-                unlink["snapshot"] = snapshot
-                forward.append(unlink)
-            if action == "move":
-                forward.append(step_move(source, destination, source_id))
-            else:
-                forward.append(step_copy(source, destination, source_id))
+        forward, snapshots = self._build_steps(pairs, action, exists)
 
         if not forward:
             self.sequence.rollback()
@@ -257,49 +304,13 @@ class Planner:
             return Outcome(skipped=True)
 
         folder = master.parent
-        target = folder / new_name
-        conflict = ""
-        reserved: set[str] = set()
-        if target.exists():
-            decision = resolver(master, target)
-            if decision == CONFLICT_CANCEL:
-                return Outcome(cancelled=True)
-            if decision == CONFLICT_SKIP:
-                return Outcome(skipped=True)
-            if decision == CONFLICT_SEQUENCE:
-                conflict = CONFLICT_SEQUENCE
-                target = naming.unique_destination(folder, new_name, reserved)
-                new_name = target.name
-            else:
-                conflict = CONFLICT_REPLACE
-        reserved.add(str(target))
+        resolved = self._resolve_pairs(group, folder, new_name, resolver)
+        if isinstance(resolved, Outcome):
+            return resolved
+        pairs, conflict, exists = resolved
+        target = pairs[0][1]
 
-        base_stem = sidecar_mod.base_stem(master)
-        pairs = [(master, target)]
-        for member in group.sidecars:
-            name = sidecar_target_name(new_name, base_stem, member.path.name)
-            companion = folder / name
-            if companion.exists() and conflict != CONFLICT_REPLACE:
-                companion = naming.unique_destination(folder, name, reserved)
-            reserved.add(str(companion))
-            pairs.append((member.path, companion))
-
-        forward: list[dict] = []
-        snapshots: list[str] = []
-        for source, destination in pairs:
-            source_id = identity(source, VERIFY_FAST)
-            if source_id is None:
-                continue
-            naming.check_path_length(destination)
-            if destination.exists():
-                existing = identity(destination, VERIFY_FAST)
-                snapshot = self.store.snapshot(destination)
-                if snapshot:
-                    snapshots.append(snapshot["file"])
-                unlink = step_unlink(destination, existing)
-                unlink["snapshot"] = snapshot
-                forward.append(unlink)
-            forward.append(step_move(source, destination, source_id))
+        forward, snapshots = self._build_steps(pairs, "rename", exists)
 
         plan = Plan(forward=forward, verify=self.verify, label="rename", snapshots=snapshots)
         plan.inverse = SafeStore.invert(forward)

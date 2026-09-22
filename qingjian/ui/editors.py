@@ -95,8 +95,8 @@ class TemplateEditor(QDialog):
         numbers.setSpacing(14)
         numbers.addWidget(caption(tr("tpl.seq_start")))
         self.seq_start = QSpinBox()
-        self.seq_start.setRange(0, 10 ** 8)
-        self.seq_start.setValue(max(0, binding.sequence_start))
+        self.seq_start.setRange(1, 10 ** 8)
+        self.seq_start.setValue(max(1, binding.sequence_start))
         numbers.addWidget(self.seq_start)
         numbers.addStretch(1)
         inner.addLayout(numbers)
@@ -136,6 +136,7 @@ class TemplateEditor(QDialog):
 
         self.path_edit.textChanged.connect(self._refresh)
         self.name_edit.textChanged.connect(self._refresh)
+        self.seq_start.valueChanged.connect(self._refresh)
         self._refresh()
 
     @staticmethod
@@ -178,7 +179,12 @@ class TemplateEditor(QDialog):
 
         self.preview.clear()
         base = Path(self.binding.folder or "…")
-        for index, context in enumerate(self.samples[:6], start=self.seq_start.value()):
+        start = self.seq_start.value()
+        if self.engine is not None:
+            preview_binding = config.Binding(**self.binding.to_dict())
+            preview_binding.sequence_start = start
+            start = self.engine.planner.sequence.peek(preview_binding)
+        for index, context in enumerate(self.samples[:6], start=start):
             context.sequence = index
             try:
                 target = template.render_destination(base, path_template, name_template,
@@ -207,11 +213,12 @@ class BindingsDialog(QDialog):
     """The ten keys, what each does and where it sends things."""
 
     def __init__(self, bindings: list[config.Binding], samples=None, parent=None,
-                 reserved=()) -> None:
+                 reserved=(), engine=None) -> None:
         super().__init__(parent)
         self.setWindowTitle(tr("bind.title"))
         self.setMinimumSize(940, 640)
         self.samples = samples or []
+        self.engine = engine
         #: Keys the window already answers to; a binding on one would be dead.
         self.reserved = list(reserved)
         self._working = [config.Binding(**b.to_dict()) for b in bindings]
@@ -306,7 +313,7 @@ class BindingsDialog(QDialog):
     def _edit_template(self, index: int) -> None:
         self._harvest()
         binding = self._working[index]
-        dialog = TemplateEditor(binding, self.samples, parent=self)
+        dialog = TemplateEditor(binding, self.samples, engine=self.engine, parent=self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.rows[index]["template"].setToolTip(
                 f"{binding.path_template}  /  {binding.name_template}")
@@ -338,6 +345,10 @@ class BindingsDialog(QDialog):
             QMessageBox.warning(self, tr("error.title"),
                                 tr("bind.reserved_key", key=", ".join(taken)))
             return
+        for binding in self._working:
+            if binding.needs_folder() and binding.folder and not Path(binding.folder).expanduser().is_absolute():
+                QMessageBox.warning(self, tr("error.title"), tr("bind.target_folder"))
+                return
         self.accept()
 
     def result_bindings(self) -> list[config.Binding]:

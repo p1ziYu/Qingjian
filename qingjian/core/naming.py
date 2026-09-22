@@ -6,6 +6,7 @@ import unicodedata
 from pathlib import Path
 
 from .platform_ import ILLEGAL_NAME_CHARS, MAX_PATH_LENGTH, is_reserved_name
+from .mediatypes import MEDIA_EXTENSIONS
 
 _ILLEGAL = re.compile("[" + re.escape(ILLEGAL_NAME_CHARS) + "]")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
@@ -27,12 +28,15 @@ class NameError_(ValueError):
         self.fields = fields
 
 
-def sanitize_component(name: str, replacement: str = "_") -> str:
+def sanitize_component(name: str, replacement: str = "_",
+                       collapse_spaces: bool = True, strip_outer: bool = True) -> str:
     """Make *name* usable as one path component on every supported platform."""
     text = unicodedata.normalize("NFC", str(name))
     text = _CONTROL.sub("", text)
     text = _ILLEGAL.sub(replacement, text)
-    text = _COLLAPSE.sub(" ", text).strip()
+    text = _COLLAPSE.sub(" ", text) if collapse_spaces else text
+    if strip_outer:
+        text = text.strip()
     # Windows silently drops trailing dots and spaces, which turns "a." into
     # "a" and makes a later existence check disagree with what was written.
     text = text.rstrip(". ")
@@ -106,4 +110,4 @@ def unique_destination(folder: Path, filename: str, taken: set | None = None,
 
 def ensure_suffix(name: str, fallback_suffix: str) -> str:
     """Give *name* an extension if the user typed one without."""
-    return name if Path(name).suffix else name + fallback_suffix
+    return name if Path(name).suffix.casefold() in MEDIA_EXTENSIONS | {".xmp"} else name + fallback_suffix

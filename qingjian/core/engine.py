@@ -408,7 +408,14 @@ class Engine:
         if outcome.cancelled or outcome.skipped:
             return outcome
         if outcome.plan is not None:
-            self.store.run(outcome.plan, progress, cancel, save_state=self.state.apply)
+            had_pending = self.store.has_pending()
+            try:
+                self.store.run(outcome.plan, progress, cancel, save_state=self.state.apply)
+            except Exception:
+                if had_pending or not self.store.has_pending():
+                    self.planner.sequence.rollback()
+                    self.store.discard_snapshots(outcome.plan.snapshots)
+                raise
             self.planner.sequence.commit()
         elif outcome.delta:
             self.state.apply(outcome.delta)

@@ -20,6 +20,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Callable
 
 from .naming import NameError_, sanitize_component, validate_filename
+from .mediatypes import MEDIA_EXTENSIONS
 from .platform_ import is_reserved_name
 
 _TOKEN = re.compile(r"\{([^{}]*)\}")
@@ -176,16 +177,31 @@ def _resolve_one(body: str, ctx: TemplateContext, strict: bool) -> str:
     return value
 
 
-def _substitute(template: str, ctx: TemplateContext, strict: bool) -> str:
+def _substitute(template: str, ctx: TemplateContext, strict: bool,
+                protected: bool = False) -> str:
     if template.count("{") != template.count("}"):
         raise NameError_("tpl.unbalanced")
-    return _TOKEN.sub(lambda m: _resolve_one(m.group(1), ctx, strict), template)
+    def replace(match):
+        value = _resolve_one(match.group(1), ctx, strict)
+        return f"\uf000{value}\uf001" if protected and value else value
+    return _TOKEN.sub(replace, template)
 
 
 def _tidy(component: str) -> str:
     """Clean up what an empty token leaves behind: ``a__b`` -> ``a_b``."""
-    text = re.sub(r"[_\-\s]{2,}", lambda m: m.group(0)[0], component)
-    return text.strip("_- ")
+    if "\uf000" not in component:
+        text = re.sub(r"(?:_{2,}|-{2,}|\s{2,})", lambda m: m.group(0)[0], component)
+        return text.strip("_- ")
+    parts = re.split(r"(\uf000.*?\uf001)", component)
+    for index, part in enumerate(parts):
+        if part.startswith("\uf000"):
+            parts[index] = part[1:-1]
+        else:
+            parts[index] = re.sub(r"(?:_{2,}|-{2,}|\s{2,})", lambda m: m.group(0)[0], part)
+    if parts:
+        parts[0] = parts[0].lstrip("_- ")
+        parts[-1] = parts[-1].rstrip("_- ")
+    return "".join(parts)
 
 
 #: The one token whose value is allowed to introduce further folder levels,
@@ -226,15 +242,15 @@ def render_path(template: str, ctx: TemplateContext, strict: bool = True) -> tup
         if not raw_part.strip():
             continue
         multilevel = _is_bare_multilevel(raw_part)
-        rendered = _substitute(raw_part, ctx, strict)
+        rendered = _substitute(raw_part, ctx, strict, protected=not multilevel)
         pieces = _SEPARATORS.split(rendered) if multilevel else [rendered]
         for piece in pieces:
-            piece = _tidy(piece)
+            piece = piece if multilevel else _tidy(piece)
             if not piece or piece == ".":
                 continue
             if piece == "..":
                 raise NameError_("tpl.escapes_root")
-            parts.append(sanitize_component(piece))
+            parts.append(sanitize_component(piece, collapse_spaces=False, strip_outer=False))
     return tuple(parts)
 
 
@@ -245,9 +261,15 @@ def render_name(template: str, ctx: TemplateContext, strict: bool = True) -> str
         return ctx.source.name
     if _SEPARATORS.search(text):
         raise NameError_("error.name_invalid")
-    rendered = _tidy(_substitute(text, ctx, strict))
-    rendered = sanitize_component(rendered) if rendered else ctx.stem
-    if not Path(rendered).suffix and ctx.suffix:
+    rendered = _tidy(_substitute(text, ctx, strict, protected=True))
+    rendered = sanitize_component(rendered, collapse_spaces=False,
+                                  strip_outer=False) if rendered else ctx.stem
+    tail = text.rsplit("}", 1)[-1] if "}" in text else text
+    last_token = list(_TOKEN.finditer(text))[-1] if _TOKEN.search(text) else None
+    ends_with_ext = bool(last_token and last_token.end() == len(text) and
+                         ALIASES.get(last_token.group(1), last_token.group(1)) == "ext")
+    literal_ext = any(tail.casefold().endswith(ext) for ext in MEDIA_EXTENSIONS | {".xmp"})
+    if not (ends_with_ext or literal_ext) and ctx.suffix:
         rendered += ctx.suffix
     validate_filename(rendered)
     return rendered

@@ -87,7 +87,10 @@ class MainWindow(QMainWindow):
         self.engine = engine
         self.settings = engine.settings
         self.view_mode = self.settings.default_view
-        self._conflict_default = ""
+        self._conflict_defaults: dict[str, str] = {}
+        self._remembered_replace_paths: set[Path] = set()
+        self._clash_notice = ""
+        self._handled_count = 0
         self._busy = False
         self._pending_open: Path | None = None
         self._pending_open_retry_queued = False
@@ -141,6 +144,10 @@ class MainWindow(QMainWindow):
         self._settle_timer.setInterval(SETTLE_MS)
         self._settle_timer.timeout.connect(self._settle)
         self._settle_pending = False
+        self._ledger_fit_timer = QTimer(self)
+        self._ledger_fit_timer.setSingleShot(True)
+        self._ledger_fit_timer.timeout.connect(self._fit_ledger)
+        self._ledger_fit_sizes: tuple[int, int, int, bool] | None = None
         self._flipped: deque[str] = deque(maxlen=4)
         self.thumbs.ready.connect(self._flip_arrived)
 
@@ -609,8 +616,9 @@ class MainWindow(QMainWindow):
                 continue
             self._binding_shortcuts.append(
                 self._shortcut(binding.key, lambda i=index: self.classify_index(i)))
-        if clashes:
-            self.status(tr("status.reserved_key", keys=", ".join(clashes)), "warning")
+        self._clash_notice = tr("status.reserved_key", keys=", ".join(clashes)) if clashes else ""
+        if self._clash_notice:
+            self.status(self._clash_notice, "warning")
 
     def _escape(self) -> None:
         if self.isFullScreen():
@@ -637,6 +645,8 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(200, self.recover_pending)
             return
         self._open_initial_folder()
+        if self._clash_notice:
+            self.status(self._clash_notice, "warning")
 
     def _open_initial_folder(self) -> None:
         if self.startup_folder is not None and self.startup_folder.is_dir():
@@ -794,9 +804,36 @@ class MainWindow(QMainWindow):
         metrics = self.status_label.fontMetrics()
         report = tr("status.done_action", action=tr("action.move"), name="IMG_0000.JPG")
         self.status_label.setMinimumWidth(metrics.horizontalAdvance(report))
+        self._ledger_buttons(True)
         self._ledger_extras(True)
         if self._overflows(self._ledger_row):
             self._ledger_extras(False)
+        if self._overflows(self._ledger_row):
+            self._ledger_buttons(False)
+        self._ledger_fit_sizes = self._ledger_sizes()
+
+    def _ledger_sizes(self) -> tuple[int, int, int, bool]:
+        return (self.progress_label.sizeHint().width(), self.queue_label.sizeHint().width(),
+                len(str(self._handled_count)), self.handled_button.isVisibleTo(self))
+
+    def _ledger_buttons(self, words: bool) -> None:
+        count = self._handled_count
+        full = tr("status.hidden_handled", count=count)
+        self.handled_button.setText(full if words else str(count))
+        self.handled_button.setToolTip("" if words else full)
+        self.handled_button.setIcon(QIcon() if words else icons.icon("history", 15, theme.PAPER_DIM))
+        for button, key, shortcut in ((self.undo_button, "side.undo", "Ctrl+Z"),
+                                      (self.redo_button, "side.redo", "Ctrl+Y")):
+            button.setText(tr(key) if words else "")
+            button.setToolTip(shortcut if words else f"{tr(key)} · {shortcut}")
+
+    def _schedule_ledger_fit(self) -> None:
+        if not self._started or self._ledger_fit_timer.isActive():
+            return
+        sizes = self._ledger_sizes()
+        previous = self._ledger_fit_sizes
+        if sizes != previous:
+            self._ledger_fit_timer.start(0)
 
     def _ledger_extras(self, shown: bool) -> None:
         self.preset_label.setVisible(shown)
@@ -849,6 +886,7 @@ class MainWindow(QMainWindow):
             self._after_queue_change("")
             return
         self.preloader.clear()
+        self._conflict_defaults.clear()
         self._update_slip()
         self.engine.save_settings()
         if restore and self.settings.last_path:
@@ -868,6 +906,7 @@ class MainWindow(QMainWindow):
             return
         except Cancelled:
             return
+        self._conflict_defaults.clear()
         self._after_queue_change(tr("scan.complete", count=len(self.engine.all_files)))
 
     def _rebuild_queue(self) -> None:
@@ -900,11 +939,10 @@ class MainWindow(QMainWindow):
 
     def _update_handled(self) -> None:
         count = self.engine.hidden_handled()
-        self.handled_button.setText(tr("status.hidden_handled", count=count))
+        self._handled_count = count
         if self.handled_button.isVisibleTo(self) != (count > 0):
             self.handled_button.setVisible(count > 0)
-            if self._started:
-                self._fit_ledger()
+        self._schedule_ledger_fit()
 
     def reveal_handled(self) -> None:
         if self._blocked() or not self.engine.source_root:
@@ -1033,6 +1071,13 @@ class MainWindow(QMainWindow):
         if self.view_mode == config.VIEW_SINGLE:
             self._refresh_view()
         self._settle_pending = False
+
+    def _guard_unseen_key_action(self) -> bool:
+        """Show the selected photo before accepting an action on it."""
+        if self._settle_pending and self.preview.current_path != self.engine.current_path():
+            self._settle()
+            return True
+        return False
 
     def _filmstrip_selected(self, path: str) -> None:
         if self.engine.go_to(path):
@@ -1188,6 +1233,7 @@ class MainWindow(QMainWindow):
         handled = self.engine.stats.total()
         total = handled + len(self.engine.queue_paths)
         self.progress_label.setText(tr("status.session_progress", done=handled, total=total))
+        self._schedule_ledger_fit()
         self.progress_bar.setRange(0, max(1, total))
         self.progress_bar.setValue(handled)
 
@@ -1302,6 +1348,7 @@ class MainWindow(QMainWindow):
 
     def _switch_preset(self, name: str) -> None:
         if name and name in self.settings.profiles:
+            self._conflict_defaults.clear()
             self.settings.current_profile = name
             self.engine.save_settings()
             self._install_binding_shortcuts()
@@ -1385,6 +1432,9 @@ class MainWindow(QMainWindow):
             card.setVisible(needle in haystack)
 
     def _activate_first_binding(self) -> None:
+        if not self.search_edit.text().strip():
+            self.setFocus()
+            return
         for index, card in enumerate(self._binding_cards):
             if card.isVisible():
                 self.search_edit.clear()
@@ -1405,6 +1455,7 @@ class MainWindow(QMainWindow):
             self, tr("bind.choose_for", key=binding.key),
             binding.folder or str(self.engine.source_root or Path.home()))
         if folder:
+            self._conflict_defaults.clear()
             binding.folder = folder
             self.engine.save_settings()
             self._refresh_bindings()
@@ -1431,6 +1482,7 @@ class MainWindow(QMainWindow):
         dialog = BindingsDialog(self.settings.bindings, self._template_samples(), self,
                                 reserved=self.reserved_keys(), engine=self.engine)
         if self._run_dialog(dialog) == QDialog.DialogCode.Accepted:
+            self._conflict_defaults.clear()
             self.settings.set_bindings(dialog.result_bindings())
             self.engine.save_settings()
             self._install_binding_shortcuts()
@@ -1447,6 +1499,8 @@ class MainWindow(QMainWindow):
     # ========================================================= classifying
     def classify_index(self, index: int) -> None:
         if self._blocked():
+            return
+        if self._guard_unseen_key_action():
             return
         if not (0 <= index < len(self.settings.bindings)):
             return
@@ -1612,14 +1666,20 @@ class MainWindow(QMainWindow):
                 conflicts = []
             if conflicts:
                 conflict_source, conflict_target = conflicts[0]
-                if self._conflict_default:
-                    decision = self._conflict_default
+                folder_key = str(Path(binding.folder).resolve())
+                remembered = self._conflict_defaults.get(folder_key, "")
+                if remembered:
+                    decision = remembered
+                    if decision == ops.CONFLICT_REPLACE:
+                        self._remembered_replace_paths.add(path)
+                        self.status(tr("status.remembered_replace", name=conflict_target.name),
+                                    "warning")
                 else:
                     decision, remember = ConflictDialog.ask(self, conflict_source, conflict_target)
                     if decision == ops.CONFLICT_CANCEL:
                         return False
                     if remember:
-                        self._conflict_default = decision
+                        self._conflict_defaults[folder_key] = decision
                 if decision == ops.CONFLICT_SKIP:
                     self.status(tr("skip"), "normal")
                     return False
@@ -1650,6 +1710,7 @@ class MainWindow(QMainWindow):
     def _run_operation(self, path: Path, work, label: str) -> None:
         """Advance the view now; let the transaction finish behind it."""
         if self._blocked():
+            self._remembered_replace_paths.discard(path)
             return
         if not self.settings.background_queue:
             released = self.preview.current_path == path
@@ -1658,6 +1719,7 @@ class MainWindow(QMainWindow):
             try:
                 outcome = work(lambda message, percent: None, lambda: False)
             except (TransactionError, NameError_, OSError) as error:
+                self._remembered_replace_paths.discard(path)
                 if released:
                     self._refresh_view()
                 self._report(error)
@@ -1688,14 +1750,18 @@ class MainWindow(QMainWindow):
         return position
 
     def _finish_operation(self, path: Path, index: int, outcome) -> None:
+        remembered_replace = path in self._remembered_replace_paths
+        self._remembered_replace_paths.discard(path)
         if outcome is None or outcome.cancelled:
             return
         if outcome.skipped and outcome.message_key:
             self.status(tr(outcome.message_key), "normal")
         if outcome.record is not None:
             action_label = tr(config.ACTIONS.get(outcome.record.action, ("action.move",))[0])
-            self.status(tr("status.done_action", action=action_label, name=path.name),
-                        "success")
+            message = tr("status.done_action", action=action_label, name=path.name)
+            if remembered_replace:
+                message += " · " + tr("status.remembered_replace", name=path.name)
+            self.status(message, "success")
         if outcome.message_key and not outcome.skipped:
             self.status(tr(outcome.message_key), "warning")
         if outcome.record:
@@ -1734,6 +1800,7 @@ class MainWindow(QMainWindow):
             return
         pending = self.engine.queue.pending
         self.queue_label.setText(tr("status.queue_pending", count=pending) if pending else "")
+        self._schedule_ledger_fit()
         if event not in ("finished", "failed"):
             return
         # _inflight is the record this thread owns; job.context is written by
@@ -1751,6 +1818,7 @@ class MainWindow(QMainWindow):
             self._finish_operation(path, position, job.result)
             self._schedule_open_pending(50)
             return
+        self._remembered_replace_paths.discard(path)
         if path.exists() and path not in self.engine.queue_paths:
             # Put the item back exactly where it was so nothing is lost.
             where = (len(self.engine.queue_paths) if position < 0
@@ -1799,6 +1867,8 @@ class MainWindow(QMainWindow):
     def skip_current(self) -> None:
         if self._blocked():
             return
+        if self._guard_unseen_key_action():
+            return
         if not self._drain_queue():
             return
         targets = self._targets()
@@ -1811,6 +1881,8 @@ class MainWindow(QMainWindow):
 
     def rename_current(self) -> None:
         if self._blocked():
+            return
+        if self._guard_unseen_key_action():
             return
         if not self._drain_queue():
             return
@@ -1855,6 +1927,8 @@ class MainWindow(QMainWindow):
 
     def trash_current(self) -> None:
         if self._blocked():
+            return
+        if self._guard_unseen_key_action():
             return
         targets = self._targets()
         if not targets:
@@ -2064,6 +2138,8 @@ class MainWindow(QMainWindow):
     def _rate_current(self, value: int) -> None:
         if self._blocked():
             return
+        if self._guard_unseen_key_action():
+            return
         targets = self._targets()
         if not targets:
             return
@@ -2076,6 +2152,8 @@ class MainWindow(QMainWindow):
 
     def _label_current(self, name: str) -> None:
         if self._blocked():
+            return
+        if self._guard_unseen_key_action():
             return
         targets = self._targets()
         if not targets:
@@ -2273,11 +2351,13 @@ class MainWindow(QMainWindow):
 
     # -- drag and drop --------------------------------------------------
     def dragEnterEvent(self, event) -> None:      # noqa: N802 - Qt naming
-        if event.mimeData().hasUrls():
+        if any(url.isLocalFile() and url.toLocalFile() for url in event.mimeData().urls()):
             event.acceptProposedAction()
 
     def dropEvent(self, event) -> None:           # noqa: N802 - Qt naming
         for url in event.mimeData().urls():
+            if not url.isLocalFile() or not url.toLocalFile():
+                continue
             path = Path(url.toLocalFile())
             if path.is_dir():
                 self.open_folder(path)

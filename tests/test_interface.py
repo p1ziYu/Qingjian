@@ -724,6 +724,10 @@ class GridProbeTests(QtCase):
         start, end = view.visible_rows()
         self.assertGreaterEqual(end, on_screen - 1, f"visible_rows() = {(start, end)}")
         last = view.paths()[on_screen - 1]
+        # Qt fills a batched list over several event turns. Under full-suite
+        # load the viewport can grow after the first 60 ms thumbnail request.
+        self.until(lambda: (last, view.edge) in cache._wanted,
+                   "the final viewport never requested its last visible tile", timeout=5)
         self.assertIn((last, view.edge), cache._wanted)
         self.assertGreaterEqual(view._tile_room, on_screen)
 
@@ -895,8 +899,13 @@ class BackgroundQueueTests(WindowCase):
         self.reported: list = []
         self.patch(self.window, "_report", self.reported.append)
         # A queue failure pops a modal box; offscreen it would never close.
-        self.patch(QMessageBox, "warning", lambda *a, **k: QMessageBox.StandardButton.Ok)
-        self.patch(QMessageBox, "critical", lambda *a, **k: QMessageBox.StandardButton.Ok)
+        # close_window processes Qt events; a queued failure notice can run
+        # there. Keep these stubs until after that cleanup has finished.
+        for name in ("warning", "critical"):
+            patcher = mock.patch.object(
+                QMessageBox, name, lambda *a, **k: QMessageBox.StandardButton.Ok)
+            patcher.start()
+            self._cleanups.insert(0, (patcher.stop, (), {}))
         self.activate()
 
     def test_twenty_real_failed_jobs_restore_every_row_once(self):
@@ -1057,6 +1066,12 @@ class BackgroundQueueTests(WindowCase):
         self.until(lambda: path in self.engine.queue_paths, "the item vanished from the list")
         self.assertEqual(row, self.engine.queue_paths.index(path), "put back on the wrong row")
         self.assertTrue(path.exists())
+
+    def test_pending_failure_notice_stays_nonmodal_during_window_cleanup(self):
+        """A queued failure notice can run inside closeEvent.processEvents()."""
+        from PySide6.QtCore import QTimer
+        self.window._failed_seen = 1
+        QTimer.singleShot(0, self.window._report_queue_failures)
 
     def test_undo_waits_for_the_move_still_in_the_queue(self):
         """A plan is only valid for the filesystem it was built against.

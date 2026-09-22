@@ -222,6 +222,10 @@ CATALOG: dict[str, tuple[str, str]] = {
         "目标是当前文件所在文件夹，请选择其他位置",
         "The target is the file's own folder — choose somewhere else",
     ),
+    "status.remembered_replace": (
+        "已按记住的选择替换 {name}",
+        "Replaced {name} using the remembered choice",
+    ),
     "error.group_name_collision": (
         "同组文件的目标名称冲突：{path}",
         "Files in this group would share a destination: {path}",

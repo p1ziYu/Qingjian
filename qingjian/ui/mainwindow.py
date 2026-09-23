@@ -1529,6 +1529,9 @@ class MainWindow(QMainWindow):
             return
         if binding.action == "tag":
             return
+        if binding.action == "skip":
+            self.skip_current()
+            return
         flight = self._take_off() if len(targets) == 1 else None
         filed = False
         for path in targets:
@@ -1695,12 +1698,13 @@ class MainWindow(QMainWindow):
         resolver = (lambda a, b, value=decision: value) if decision else ops.always_sequence
         root = self.engine.source_root
         recycle_mode = self.settings.recycle_mode
+        from_review = self.engine.review_mode
         self._run_operation(
             path,
             lambda progress, cancel: self.engine.classify(
                 binding, path, resolver, progress, cancel, group=group,
                 allow_system=self.settings.background_queue, root=root,
-                recycle_mode=recycle_mode),
+                recycle_mode=recycle_mode, from_review=from_review),
             f"{tr(config.ACTIONS[binding.action][0])} · {path.name}")
         return True
 
@@ -1943,6 +1947,7 @@ class MainWindow(QMainWindow):
             return
         recycle_mode = self.settings.recycle_mode
         allow_system = self.settings.background_queue
+        from_review = self.engine.review_mode
         for path in targets:
             # `target=path` binds the loop variable now; a bare closure would
             # recycle the last item once per selected file.
@@ -1950,7 +1955,7 @@ class MainWindow(QMainWindow):
                 path,
                 lambda progress, cancel, target=path: self.engine.trash(
                     target, progress, cancel, allow_system=allow_system,
-                    recycle_mode=recycle_mode),
+                    recycle_mode=recycle_mode, from_review=from_review),
                 f"{tr('action.trash')} · {path.name}")
 
     def undo(self) -> None:
@@ -2008,6 +2013,9 @@ class MainWindow(QMainWindow):
             outcome = self._with_progress(
                 message, lambda progress, cancel: action(progress, cancel))
         except (TransactionError, OSError) as error:
+            if getattr(error, "key", "") == "status.undo_stuck":
+                self.status(tr("status.undo_stuck"), "warning")
+                return
             self._report(error)
             return
         except Cancelled:

@@ -40,6 +40,21 @@ class StateTests(TempCase):
         self.assertEqual({"/a/3.jpg"}, self.state.done_paths())
         self.assertEqual((4, "green"), self.state.tag("/a/1.jpg"))
 
+    def test_failed_apply_does_not_queue_snapshots_as_orphans(self):
+        redo = self.record(id="redo", stack=STACK_REDO)
+        redo_data = redo.to_dict()
+        redo_data["stack"] = STACK_REDO
+        self.state.apply({**empty_delta(), "records_add": [redo_data]})
+        delta = empty_delta()
+        delta["records_clear_stack"].append(STACK_REDO)
+        delta["records_add"].append(self.record(id="new").to_dict())
+        with mock.patch.object(self.state, "_next_seq",
+                               side_effect=__import__("sqlite3").OperationalError("full")):
+            with self.assertRaises(__import__("sqlite3").OperationalError):
+                self.state.apply(delta)
+        self.assertIsNotNone(self.state.record("redo"))
+        self.assertEqual([], self.state.take_orphans())
+
     def test_applying_the_same_delta_twice_is_harmless(self):
         """Crash recovery replays the journal, so this must not double up."""
         delta = empty_delta()

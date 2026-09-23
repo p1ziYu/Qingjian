@@ -475,6 +475,42 @@ class EngineTests(TempCase):
         self.engine.rename("renamed.JPG", target)
         self.assertEqual((5, ""), self.engine.state.tag(str(target.with_name("renamed.JPG"))))
 
+    def test_rename_tags_follow_undo_redo_and_restore_replaced_target(self):
+        source = self.root / "Day4" / "solo_01.JPG"
+        target = source.with_name("solo_02.JPG")
+        self.engine.tag([source], rating=5, label="red")
+        self.engine.tag([target], rating=4, label="green")
+        self.engine.rename(target.name, source, resolver=lambda _a, _b: "replace")
+        self.assertEqual((5, "red"), self.engine.state.tag(str(target)))
+        undo = self.engine.undo()
+        self.engine.state.apply(undo.delta)
+        self.assertEqual((5, "red"), self.engine.state.tag(str(source)))
+        self.assertEqual((4, "green"), self.engine.state.tag(str(target)))
+        redo = self.engine.redo()
+        self.engine.state.apply(redo.delta)
+        self.assertEqual((0, ""), self.engine.state.tag(str(source)))
+        self.assertEqual((5, "red"), self.engine.state.tag(str(target)))
+
+    def test_undoing_review_classification_puts_item_back_in_queue(self):
+        source = self.root / "Day4" / "solo_01.JPG"
+        root = str(self.engine.source_root)
+        self.engine.skip(source)
+        self.engine.set_review_mode(True)
+        self.engine.classify(self.engine.settings.bindings[0], source)
+        self.engine.undo()
+        self.assertIn(str(source), self.engine.state.review_queue(root))
+
+    def test_skip_binding_is_inert_in_review_mode(self):
+        source = self.root / "Day4" / "solo_01.JPG"
+        root = str(self.engine.source_root)
+        self.engine.skip(source)
+        before = self.engine.state.counts()["history"]
+        self.engine.set_review_mode(True)
+        outcome = self.engine.classify(config.Binding(key="S", action="skip"), source)
+        self.assertTrue(outcome.skipped)
+        self.assertEqual(before, self.engine.state.counts()["history"])
+        self.assertIn(str(source), self.engine.state.review_queue(root))
+
     def test_duplicate_modes(self):
         for mode in (dedupe.MODE_EXACT, dedupe.MODE_SIMILAR, dedupe.MODE_BURST):
             groups = self.engine.find_duplicates(mode)

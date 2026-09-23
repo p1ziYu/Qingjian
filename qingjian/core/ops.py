@@ -242,7 +242,8 @@ class Planner:
     # -- move / copy / favorite ---------------------------------------
     def plan_folder_action(self, action: str, group: sidecar_mod.SidecarGroup, binding: Binding,
                            source_root: Path | None = None,
-                           resolver: Resolver = always_sequence) -> Outcome:
+                           resolver: Resolver = always_sequence,
+                           from_review: bool | None = None) -> Outcome:
         """Move, copy or favourite one shot (master plus every companion)."""
         if not binding.folder or not self._absolute_folder(binding.folder):
             return Outcome(cancelled=True, message_key="bind.target_folder")
@@ -289,7 +290,7 @@ class Planner:
                      "targets": [str(t) for _, t in pairs],
                      "snapshot_bytes": sum((step.get("snapshot") or {}).get("size", 0)
                                            for step in forward)})
-        plan.state = self._delta_for(record, group, action)
+        plan.state = self._delta_for(record, group, action, from_review)
         return Outcome(plan=plan, record=record, delta=plan.state)
 
     # -- rename --------------------------------------------------------
@@ -314,6 +315,11 @@ class Planner:
 
         forward, snapshots = self._build_steps(pairs, "rename", exists)
 
+        tag_paths = [str(path) for pair in pairs for path in pair]
+        tags = self.state.tags_for(tag_paths)
+        tag_pairs = [[str(old), str(new), *tags.get(str(old), (0, "")),
+                      *tags.get(str(new), (0, ""))] for old, new in pairs]
+
         plan = Plan(forward=forward, verify=self.verify, label="rename", snapshots=snapshots)
         plan.inverse = SafeStore.invert(forward)
         record = Record(id=uuid.uuid4().hex, action="rename", original=str(master),
@@ -323,14 +329,20 @@ class Planner:
                                  "verify": self.verify, "snapshots": snapshots,
                                  "paths": [str(p) for p, _ in pairs],
                                  "targets": [str(t) for _, t in pairs],
+                                 "tag_pairs": tag_pairs,
                                  "snapshot_bytes": sum((step.get("snapshot") or {}).get("size", 0)
                                                        for step in forward)})
         plan.state = self._delta_for(record, group, "rename")
+        for old, new, old_rating, old_label, _new_rating, _new_label in tag_pairs:
+            plan.state["tags_set"].extend([
+                [old, 0, ""], [new, old_rating, old_label],
+            ])
         return Outcome(plan=plan, record=record, delta=plan.state)
 
     # -- recycle -------------------------------------------------------
     def plan_trash(self, group: sidecar_mod.SidecarGroup,
-                   source_root: Path | None = None) -> Outcome:
+                   source_root: Path | None = None,
+                   from_review: bool | None = None) -> Outcome:
         forward: list[dict] = []
         snapshots: list[str] = []
         for member in group.members:
@@ -362,7 +374,7 @@ class Planner:
                                  "verify": self.verify, "snapshots": snapshots,
                                  "paths": [str(m.path) for m in group.members],
                                  "snapshot_bytes": sum(m.size for m in group.members)})
-        plan.state = self._delta_for(record, group, "trash")
+        plan.state = self._delta_for(record, group, "trash", from_review)
         return Outcome(plan=plan, record=record, delta=plan.state)
 
     # -- state-only actions --------------------------------------------
@@ -429,15 +441,18 @@ class Planner:
         return Outcome(plan=plan, record=record, delta=delta)
 
     # -- deltas ---------------------------------------------------------
-    def _delta_for(self, record: Record, group: sidecar_mod.SidecarGroup, action: str) -> dict:
+    def _delta_for(self, record: Record, group: sidecar_mod.SidecarGroup, action: str,
+                   from_review: bool | None = None) -> dict:
         delta = empty_delta()
         # A new operation ends the redo branch, the way every editor's undo
         # stack does. Only the paths that push a real record come through here,
         # so tagging or ignoring a duplicate leaves redo untouched.
-        delta["records_clear_stack"].append(STACK_REDO)
-        delta["records_add"].append(record.to_dict())
         root = record.root
         master = str(group.master)
+        record.from_review = (self.state.is_queued(root, master)
+                              if from_review is None else from_review)
+        delta["records_clear_stack"].append(STACK_REDO)
+        delta["records_add"].append(record.to_dict())
         # Any decision about a file takes it out of the review queue.
         delta["reviews_remove"].append([root, master])
         if action in ("copy", "favorite"):
@@ -458,6 +473,17 @@ class Planner:
                 delta["reviews_add"].append([root, master])
             else:
                 delta["reviews_remove"].append([root, master])
+        if record.action == "rename":
+            for old, new, old_rating, old_label, new_rating, new_label in \
+                    record.payload.get("tag_pairs") or []:
+                if undo:
+                    delta["tags_set"].extend([
+                        [old, old_rating, old_label], [new, new_rating, new_label],
+                    ])
+                else:
+                    delta["tags_set"].extend([
+                        [old, 0, ""], [new, old_rating, old_label],
+                    ])
         if record.action in ("copy", "favorite"):
             if undo:
                 delta["done_remove"].append(master)

@@ -26,7 +26,7 @@ from .logsetup import get_logger
 from .opqueue import Job, OperationQueue
 from .safestore import (SafeStore, TransactionError, _retry_sharing,
                         reclaim_candidates)
-from .state import STACK_HISTORY, STACK_REDO, Record, StateStore
+from .state import STACK_HISTORY, STACK_REDO, STACK_STUCK, Record, StateStore
 
 log = get_logger("engine")
 
@@ -504,7 +504,8 @@ class Engine:
                  progress=_noop, cancel=_never,
                  group: sidecar_mod.SidecarGroup | None = None,
                   allow_system: bool = True, root: Path | None = None,
-                  recycle_mode: str | None = None) -> ops.Outcome:
+                  recycle_mode: str | None = None,
+                  from_review: bool | None = None) -> ops.Outcome:
         target = Path(path) if path else self.current_path()
         if target is None:
             return ops.Outcome(skipped=True)
@@ -517,12 +518,14 @@ class Engine:
             action = binding.action
             if action in ("move", "copy", "favorite"):
                 outcome = self.planner.plan_folder_action(action, group, binding,
-                                                           source_root, resolver)
+                                                           source_root, resolver, from_review)
             elif action == "skip":
+                if self.review_mode:
+                    return ops.Outcome(skipped=True)
                 outcome = self.planner.plan_skip(group, source_root or target.parent)
             elif action == "trash":
                 return self._commit_trash(group, progress, cancel, allow_system,
-                                          recycle_mode, source_root)
+                                          recycle_mode, source_root, from_review)
             else:
                 return ops.Outcome(skipped=True)
             return self._commit(outcome, progress, cancel)
@@ -552,24 +555,24 @@ class Engine:
         with self.exclusive():
             outcome = self.planner.plan_rename(self.group_for(target), new_name,
                                                self.source_root, resolver)
-            result = self._commit(outcome, progress, cancel)
-            if result.record and result.record.destination:
-                self.state.rename_tag(str(target), result.record.destination)
-            return result
+            return self._commit(outcome, progress, cancel)
 
     def trash(self, path: str | Path | None = None, progress=_noop, cancel=_never,
-               allow_system: bool = True, recycle_mode: str | None = None) -> ops.Outcome:
+               allow_system: bool = True, recycle_mode: str | None = None,
+               from_review: bool | None = None) -> ops.Outcome:
         target = Path(path) if path else self.current_path()
         if target is None:
             return ops.Outcome(skipped=True)
         with self.exclusive():
             group = self._operation_group(self.group_for(target))
-            return self._commit_trash(group, progress, cancel, allow_system, recycle_mode)
+            return self._commit_trash(group, progress, cancel, allow_system, recycle_mode,
+                                      from_review=from_review)
 
     def _commit_trash(self, group: sidecar_mod.SidecarGroup,
                        progress, cancel, allow_system: bool = True,
                        recycle_mode: str | None = None,
-                       root: Path | None = None) -> ops.Outcome:
+                       root: Path | None = None,
+                       from_review: bool | None = None) -> ops.Outcome:
         """Recycle, honouring the single-copy setting.
 
         The previous version always kept an application snapshot *and* pushed a
@@ -598,7 +601,7 @@ class Engine:
                                 payload={"forward": [], "inverse": [],
                                          "paths": [str(p) for p in sent],
                                          "system_recycle": True})
-                delta = self.planner._delta_for(record, sent_group, "trash")
+                delta = self.planner._delta_for(record, sent_group, "trash", from_review)
                 if group.master not in sent:
                     delta["reviews_remove"] = []
                 self.state.apply(delta)
@@ -622,7 +625,7 @@ class Engine:
                 raise OSError(tr("status.partial_recycle", paths=remaining,
                                  error=str(error))) from error
             return commit_sent()
-        outcome = self.planner.plan_trash(group, root or self.source_root)
+        outcome = self.planner.plan_trash(group, root or self.source_root, from_review)
         result = self._commit(outcome, progress, cancel)
         if system_requested and result.record:
             result.message_key = "status.soft_recycle_fallback"
@@ -648,7 +651,16 @@ class Engine:
             if record is None:
                 return ops.Outcome(skipped=True)
             outcome = self.planner.plan_undo(record)
-            result = self._commit_transition(outcome, progress, cancel)
+            try:
+                result = self._commit_transition(outcome, progress, cancel)
+            except TransactionError as error:
+                if error.key not in ("error.external_change", "error.snapshot_missing"):
+                    raise
+                from .state import empty_delta
+                delta = empty_delta()
+                delta["records_move"].append({"id": record.id, "to": STACK_STUCK})
+                self.state.apply(delta)
+                raise TransactionError("status.undo_stuck") from error
             self.stats.undos += 1
             self.stats.handled[record.action] = max(
                 0, self.stats.handled.get(record.action, 0) - 1)
@@ -1043,7 +1055,7 @@ class Engine:
         policy = self.settings.quota
         if not force and not policy.automatic:
             return (0, 0)
-        records = self.state.oldest_undoable(limit=5000)
+        records = self.state.oldest_reclaimable(limit=5000)
         rows = [{"time_epoch": r.time_epoch, "snapshots": r.snapshots,
                  "snapshot_bytes": r.payload.get("snapshot_bytes", None)} for r in records]
         for row in rows:

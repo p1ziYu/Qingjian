@@ -41,6 +41,51 @@ class QueueCursorTests(TempCase):
         self.assertEqual(engine.current_path(), before)
 
 
+class G11UndoStateTests(TempCase):
+    def test_a_refused_undo_does_not_block_older_records(self):
+        src = self.tmp / "src"
+        out = self.tmp / "out"
+        one = self.write(src / "one.jpg", b"one")
+        two = self.write(src / "two.jpg", b"two")
+        engine = Engine(self.data, config.Settings())
+        self.addCleanup(engine.close)
+        binding = config.Binding(key="1", action="move", folder=str(out))
+        engine.classify(binding, one)
+        engine.classify(binding, two)
+        (out / "two.jpg").write_bytes(b"external")
+        with self.assertRaises(TransactionError):
+            engine.undo()
+        stuck = engine.state.records("stuck")
+        self.assertEqual(1, len(stuck))
+        outcome = engine.undo()
+        self.assertFalse(outcome.skipped)
+        self.assertTrue(one.exists())
+        self.assertEqual(b"external", (out / "two.jpg").read_bytes())
+
+    def test_stuck_snapshots_are_reclaimed_and_cleared(self):
+        from qingjian.core.state import Record, empty_delta
+        from qingjian.core.safestore import QuotaPolicy
+        snapshot = self.write(self.data / "snapshots" / "held", b"held")
+        engine = Engine(self.data, config.Settings())
+        self.addCleanup(engine.close)
+        record = Record(id="stuck", action="move", original="a", stack="stuck",
+                        payload={"snapshots": [str(snapshot)], "snapshot_bytes": 4})
+        delta = empty_delta()
+        delta["records_add"].append(record.to_dict())
+        engine.state.apply(delta)
+        engine.settings.quota = QuotaPolicy(max_operations=0, max_bytes=1,
+                                             max_days=0, automatic=False)
+        self.assertEqual((4, 1), engine.reclaim(force=True))
+        self.assertFalse(snapshot.exists())
+
+    def test_classify_index_routes_skip_binding_through_skip_current(self):
+        source = (PACKAGE / "ui" / "mainwindow.py").read_text(encoding="utf-8")
+        method = source[source.index("    def classify_index("):
+                        source.index("    def _take_off(")]
+        self.assertIn('if binding.action == "skip":', method)
+        self.assertIn("self.skip_current()", method)
+
+
 class TagWithoutQueueLockTests(TempCase):
     def test_tag_does_not_take_exclusive_lock(self):
         photo = self.write(self.tmp / "p.jpg", b"photo")

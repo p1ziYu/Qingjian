@@ -27,6 +27,7 @@ log = get_logger("state")
 
 STACK_HISTORY = "history"
 STACK_REDO = "redo"
+STACK_STUCK = "stuck"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS records (
@@ -182,6 +183,7 @@ class StateStore:
         if not delta:
             return
         now = time.time()
+        orphan_refs: list[str] = []
         with self._lock, self._db:
             cursor = self._db.cursor()
             # Before anything is added: a fresh operation invalidates whatever
@@ -199,7 +201,7 @@ class StateStore:
                         continue
                     # The files go only after the database says nothing points
                     # at them, so a crash in between leaks disk, never history.
-                    self._orphans.extend(str(ref) for ref in refs)
+                    orphan_refs.extend(str(ref) for ref in refs)
             for data in delta.get("records_add") or []:
                 record = Record.from_dict(data)
                 record.seq = self._next_seq(cursor)
@@ -243,6 +245,9 @@ class StateStore:
                     "label=excluded.label, updated=excluded.updated",
                     [(p, int(r), str(lbl or ""), now) for p, r, lbl in tags])
             cursor.execute("DELETE FROM tags WHERE rating=0 AND label=''")
+        if orphan_refs:
+            with self._lock:
+                self._orphans.extend(orphan_refs)
 
     @staticmethod
     def _next_seq(cursor) -> int:
@@ -286,6 +291,16 @@ class StateStore:
                 "SELECT id,seq,stack,action,original,destination,root,conflict,time_epoch,"
                 "from_review,undoable,bytes,payload FROM records WHERE undoable=1 AND stack=? "
                 "ORDER BY seq ASC LIMIT ?", (STACK_HISTORY, limit)).fetchall()
+        return [Record.from_row(row) for row in rows]
+
+    def oldest_reclaimable(self, limit: int = 1000) -> list[Record]:
+        """Undoable history and stuck records that may still own snapshots."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT id,seq,stack,action,original,destination,root,conflict,time_epoch,"
+                "from_review,undoable,bytes,payload FROM records "
+                "WHERE undoable=1 AND stack IN (?,?) ORDER BY seq ASC LIMIT ?",
+                (STACK_HISTORY, STACK_STUCK, limit)).fetchall()
         return [Record.from_row(row) for row in rows]
 
     def retention_gate(self) -> tuple[int, float | None]:
@@ -345,6 +360,14 @@ class StateStore:
 
     def in_review(self, root: str) -> set[str]:
         return set(self.review_queue(root))
+
+    def is_queued(self, root: str, path: str) -> bool:
+        """Check one review row without materialising the full queue."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT 1 FROM reviews WHERE root=? AND path=? LIMIT 1",
+                (str(root), str(path))).fetchone()
+        return row is not None
 
     def review_count(self, root: str) -> int:
         """How many items are queued, without materialising the list.

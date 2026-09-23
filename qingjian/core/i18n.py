@@ -180,6 +180,8 @@ CATALOG: dict[str, tuple[str, str]] = {
     "status.ready": ("就绪", "Ready"),
     "status.done_action": ("已{action}：{name}", "{action}: {name}"),
     "status.undo_done": ("撤销完成", "Undone"),
+    "status.undo_stuck": ("这条记录已无法撤销；再按 Ctrl+Z 撤销更早的操作",
+                          "This operation can no longer be undone; press Ctrl+Z again to undo an earlier operation"),
     "status.redo_done": ("已恢复上一步", "Redone"),
     "status.recover_done": ("恢复检查完成", "Recovery check complete"),
     "status.recover_none": ("没有待恢复操作", "No pending operation to recover"),

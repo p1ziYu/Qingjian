@@ -15,6 +15,7 @@ from __future__ import annotations
 from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+from math import floor
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
@@ -269,7 +270,8 @@ def find_similar(paths: Sequence[Path], threshold: float = 0.92, cache=None,
             usable.append(path)
             hashes.append(int(value))
 
-    distance = max(0, min(MAX_INDEXED_DISTANCE, round((1.0 - threshold) * imaging.HASH_BITS)))
+    distance = max(0, min(MAX_INDEXED_DISTANCE,
+                          floor((1.0 - threshold) * imaging.HASH_BITS)))
     pairs = banded_pairs(hashes, distance)
     if not pairs:
         progress("", 100)
@@ -289,8 +291,9 @@ def find_similar(paths: Sequence[Path], threshold: float = 0.92, cache=None,
                 continue
             if cancel():
                 raise Cancelled("cancelled")
-            candidates = _build_candidates([usable[i] for i in members],
-                                           [hashes[i] for i in members], cache, score_quality)
+            candidates = _build_candidates(
+                [usable[i] for i in members], [hashes[i] for i in members], cache,
+                score_quality, ignored, progress, cancel)
             candidates = [c for c in candidates
                           if identity_key(c.path, c.digest or "") not in ignored]
             if len(candidates) < 2:
@@ -301,30 +304,61 @@ def find_similar(paths: Sequence[Path], threshold: float = 0.92, cache=None,
     return groups
 
 
-def _build_candidates(paths: list[Path], hashes: list[int], cache, score_quality: bool) -> list[Candidate]:
-    out: list[Candidate] = []
-    for path, value in zip(paths, hashes):
+def _digest_for_ignore(path: Path, cache, ignored: set[str], cancel: Cancel) -> str:
+    digest = str(cache.get(path, "sha256") or "") if cache is not None else ""
+    prefix = f"{path.resolve()}\n"
+    if prefix in ignored:
+        return ""
+    if not digest and any(key.startswith(prefix) for key in ignored):
+        if cancel():
+            raise Cancelled("cancelled")
+        try:
+            digest = fingerprint(path, cancel=cancel)
+        except OSError:
+            return ""
+        if cache is not None:
+            cache.put(path, sha256=digest)
+    return digest
+
+
+def _build_candidates(paths: list[Path], hashes: list[int], cache, score_quality: bool,
+                      ignored: set[str] | None = None, progress: Progress = _noop,
+                      cancel: Cancel = _never) -> list[Candidate]:
+    ignored = ignored or set()
+
+    def build(item: tuple[int, Path, int]):
+        _index, path, value = item
+        if cancel():
+            raise Cancelled("cancelled")
         info = metadata.read(path)
-        # The ignore list is keyed by path plus content. `ignore_duplicates`
-        # falls back to the cached digest, so this has to read the same place
-        # or the key stored and the key looked up never match.
-        digest = str(cache.get(path, "sha256") or "") if cache is not None else ""
+        digest = _digest_for_ignore(path, cache, ignored, cancel)
         sharp = 0.0
         defect = ""
         if score_quality:
-            cached = cache.get(path, "sharpness") if cache is not None else None
-            if cached is None:
+            cached = ({field: cache.get(path, field)
+                       for field in ("sharpness", "blown", "crushed")}
+                      if cache is not None else {})
+            if not cached or any(value is None for value in cached.values()):
+                if cancel():
+                    raise Cancelled("cancelled")
                 score = imaging.quality_score(path)
                 sharp = score["sharpness"]
-                defect = imaging.looks_unusable(score)
                 if cache is not None:
-                    cache.put(path, sharpness=sharp)
+                    cache.put(path, sharpness=sharp, blown=score.get("blown", 0.0),
+                              crushed=score.get("crushed", 0.0))
             else:
-                sharp = float(cached)
-        out.append(Candidate(path=path, size=info.size, width=info.width, height=info.height,
-                             sharpness=sharp, captured=info.timestamp(),
-                             digest=digest, phash=value, defect=defect))
-    return out
+                score = cached
+                sharp = float(cached["sharpness"])
+            defect = imaging.looks_unusable(score)
+        return Candidate(path=path, size=info.size, width=info.width, height=info.height,
+                         sharpness=sharp, captured=info.timestamp(),
+                         digest=digest, phash=value, defect=defect)
+
+    items = [(index, path, value) for index, (path, value) in
+             enumerate(zip(paths, hashes, strict=True))]
+    found = _mapped(build, items, progress, cancel, workers=2, first=85, span=15)
+    return [candidate for _item, candidate in sorted(found, key=lambda pair: pair[0][0])
+            if candidate is not None]
 
 
 def _best_index(candidates: list[Candidate]) -> int:
@@ -393,8 +427,11 @@ def find_bursts(paths: Sequence[Path], gap_seconds: float = 2.0, minimum: int = 
     run: list[tuple[float, Path, int]] = []
 
     def flush() -> None:
+        if cancel():
+            raise Cancelled("cancelled")
         if len(run) >= minimum:
-            candidates = _build_candidates([r[1] for r in run], [r[2] for r in run], cache, True)
+            candidates = _build_candidates([r[1] for r in run], [r[2] for r in run],
+                                           cache, True, ignored, progress, cancel)
             # Ignoring a burst has to stick, or the group the user dismissed
             # comes straight back on the next scan.
             candidates = [c for c in candidates
@@ -405,6 +442,8 @@ def find_bursts(paths: Sequence[Path], gap_seconds: float = 2.0, minimum: int = 
 
     with (cache.batch() if cache is not None else nullcontext()):
         for entry in entries:
+            if cancel():
+                raise Cancelled("cancelled")
             if not run:
                 run.append(entry)
                 continue

@@ -1000,6 +1000,9 @@ class Engine:
         keys = []
         for candidate in candidates:
             digest = candidate.digest or self.cache.get(candidate.path, "sha256") or ""
+            if not digest:
+                digest = dedupe.fingerprint(candidate.path)
+                self.cache.put(candidate.path, sha256=digest)
             keys.append(dedupe.identity_key(candidate.path, str(digest)))
         with self.exclusive():
             return self._commit(self.planner.plan_ignore_duplicates(root, keys))

@@ -10,8 +10,11 @@ import ast
 import hashlib
 import os
 import threading
+import time
 from collections import defaultdict
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from base import ROOT, TempCase, unittest
 from qingjian.core import dedupe, safestore
@@ -400,3 +403,143 @@ class G09DedupeTests(TempCase):
         os.utime(old, (-34560000, -34560000))
         self.assertIsNotNone(metadata.read(old, use_cache=False).captured)
         scanner.apply_filter([old], scanner.FilterSpec(mode='portrait'))
+
+
+class G10CancellationTests(TempCase):
+    def test_scoring_stops_similar_and_bursts_promptly(self):
+        folder = self.tmp / "cancel"
+        folder.mkdir()
+        paths = [self.write(folder / f"frame-{index}.jpg", b"x" * 9000)
+                 for index in range(5)]
+        info = SimpleNamespace(size=9000, width=100, height=100,
+                               captured_is_fallback=False, timestamp=lambda: 100.0)
+        for finder in (
+                lambda cancel: dedupe.find_similar(paths, cancel=cancel),
+                lambda cancel: dedupe.find_bursts(paths, minimum=3, cancel=cancel)):
+            calls = [0]
+
+            def score(_path, counter=calls):
+                counter[0] += 1
+                return {"sharpness": 20.0, "blown": 0.0, "crushed": 0.0}
+
+            with patch.object(dedupe.metadata, "read", return_value=info), \
+                    patch.object(dedupe.imaging, "phash", return_value=7), \
+                    patch.object(dedupe.imaging, "quality_score", side_effect=score):
+                with self.assertRaises(Cancelled):
+                    finder(lambda counter=calls: counter[0] > 0)
+            self.assertLessEqual(calls[0], 2)
+
+
+class G10CacheAndIgnoreTests(TempCase):
+    def test_defect_survives_same_and_new_cache_instances(self):
+        folder = self.tmp / "defects"
+        folder.mkdir()
+        paths = [self.write(folder / name, os.urandom(9000))
+                 for name in ("a.jpg", "b.jpg")]
+        db = self.tmp / "hashes.db"
+        info = SimpleNamespace(size=9000, width=100, height=100,
+                               captured_is_fallback=True, timestamp=lambda: 0.0)
+        score = {"sharpness": 1.0, "blown": 0.0, "crushed": 0.0}
+        scans = []
+        with patch.object(dedupe.metadata, "read", return_value=info), \
+                patch.object(dedupe.imaging, "phash", return_value=7), \
+                patch.object(dedupe.imaging, "quality_score", return_value=score):
+            cache = HashCache(db)
+            scans.append(dedupe.find_similar(paths, cache=cache))
+            scans.append(dedupe.find_similar(paths, cache=cache))
+            cache.close()
+            fresh = HashCache(db)
+            scans.append(dedupe.find_similar(paths, cache=fresh))
+            fresh.close()
+        for groups in scans:
+            self.assertEqual({member.defect for group in groups for member in group.members},
+                             {"blurry"})
+
+    def test_ignoring_before_exact_hash_stays_ignored_after_exact_scan(self):
+        import shutil
+
+        import numpy as np
+        from PIL import Image
+        from qingjian.core import config
+        from qingjian.core.engine import Engine
+
+        root = self.tmp / "ignore"
+        root.mkdir()
+        pixels = np.random.default_rng(33).integers(0, 256, (360, 480, 3), dtype=np.uint8)
+        Image.fromarray(pixels).save(root / "a.jpg", quality=92)
+        shutil.copyfile(root / "a.jpg", root / "b.jpg")
+        settings = config.Settings()
+        settings.background_queue = False
+        engine = Engine(self.tmp / "engine", settings)
+        engine.open_folder(root)
+        with self.assertRaises(Cancelled):
+            engine.find_duplicates(dedupe.MODE_EXACT, cancel=lambda: True)
+        group = engine.find_duplicates(dedupe.MODE_SIMILAR)[0]
+        engine.ignore_duplicates(group.members, root)
+        engine.find_duplicates(dedupe.MODE_EXACT)
+        self.assertEqual(engine.find_duplicates(dedupe.MODE_SIMILAR), [])
+        engine.close()
+
+
+class G10DialogLifetimeTests(unittest.TestCase):
+    def test_timed_out_pool_is_not_destroyed_with_dialog(self):
+        from PySide6.QtCore import QCoreApplication, QEvent
+        from PySide6.QtWidgets import QApplication
+        from qingjian.ui.duplicates import DuplicatesDialog
+
+        entered = threading.Event()
+
+        class State:
+            @staticmethod
+            def ignored_keys(_root):
+                return set()
+
+        class Engine:
+            source_root = None
+            state = State()
+
+            @staticmethod
+            def find_duplicates(_mode, _progress, _cancel):
+                entered.set()
+                time.sleep(3.0)
+                return []
+
+        app = QApplication.instance() or QApplication([])
+        dialog = DuplicatesDialog(Engine())
+        self.assertTrue(entered.wait(1.0))
+        started = time.monotonic()
+        with patch("qingjian.ui.duplicates.log.warning"):
+            dialog.done(0)
+        dialog.setParent(None)
+        dialog.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete.value)
+        elapsed = time.monotonic() - started
+        self.assertTrue(dialog._pool.waitForDone(3000))
+        app.processEvents()
+        self.assertLess(elapsed, 2.0)
+
+
+class G10RestoreButtonTests(unittest.TestCase):
+    def test_restore_enabled_with_ignored_items_and_no_rows(self):
+        from PySide6.QtWidgets import QApplication
+        from qingjian.ui.duplicates import DuplicatesDialog
+
+        class State:
+            @staticmethod
+            def ignored_keys(_root):
+                return {"ignored"}
+
+        class Engine:
+            source_root = None
+            state = State()
+
+            @staticmethod
+            def find_duplicates(_mode, _progress, _cancel):
+                return []
+
+        app = QApplication.instance() or QApplication([])
+        dialog = DuplicatesDialog(Engine())
+        self.assertTrue(dialog._pool.waitForDone(1000))
+        app.processEvents()
+        self.assertTrue(dialog.restore.isEnabled())
+        dialog.done(0)

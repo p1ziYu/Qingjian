@@ -195,7 +195,7 @@ class Settings:
         settings.workers = number("workers", 4, 1, 32)
         settings.thumb_cache_mb = number("thumb_cache_mb", 512, 64, 65536)
         settings.hash_cache = flag("hash_cache", True)
-        settings.similar_threshold = number("similar_threshold", 0.92, 0.80, 1.0)
+        settings.similar_threshold = number("similar_threshold", 0.92, 0.89, 1.0)
         settings.burst_gap_seconds = number("burst_gap_seconds", 2.0, 0.1, 60.0)
         settings.burst_minimum = number("burst_minimum", 3, 2, 100)
         settings.sidecar = SidecarRules.from_dict(data.get("sidecar"))

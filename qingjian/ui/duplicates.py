@@ -42,6 +42,28 @@ _MARK_STYLE = {
 
 _COLUMN_WIDTHS = (260, 380, 120, 100, 80, 120)
 
+_DETACHED_POOLS: dict[QThreadPool, QObject] = {}
+_DETACHED_TIMERS: set[QTimer] = set()
+
+
+def _retain_running_pool(pool: QThreadPool, signals: QObject) -> None:
+    """Keep a timed-out pool alive without tying it to the closed dialog."""
+    _DETACHED_POOLS[pool] = signals
+    timer = QTimer()
+    timer.setInterval(100)
+
+    def release_when_idle() -> None:
+        if pool.activeThreadCount():
+            return
+        timer.stop()
+        _DETACHED_POOLS.pop(pool, None)
+        _DETACHED_TIMERS.discard(timer)
+        timer.deleteLater()
+
+    timer.timeout.connect(release_when_idle)
+    _DETACHED_TIMERS.add(timer)
+    timer.start()
+
 
 class _ScanSignals(QObject):
     progress = Signal(str, int)
@@ -107,7 +129,7 @@ class DuplicatesDialog(QDialog):
         self._fill_timer = QTimer(self)
         self._fill_timer.setInterval(0)
         self._fill_timer.timeout.connect(self._fill_chunk)
-        self._pool = QThreadPool(self)
+        self._pool = QThreadPool()
         self._pool.setMaxThreadCount(1)
         self._signals = _ScanSignals()
         self._signals.progress.connect(self._on_progress)
@@ -271,8 +293,15 @@ class DuplicatesDialog(QDialog):
         self.rescan.setText(tr("dup.stop") if busy else tr("dup.rescan"))
         self.tabs.setEnabled(not busy)
         for widget in (self.auto_keep, self.to_review, self.ignore_one,
-                       self.ignore_group, self.restore):
+                       self.ignore_group):
             widget.setEnabled(not busy and bool(self.rows))
+        self._update_restore_button()
+
+    def _update_restore_button(self, ignored: int | None = None) -> None:
+        if ignored is None:
+            ignored = len(self.engine.state.ignored_keys(str(self.engine.source_root or "")))
+        self.restore.setEnabled(bool(ignored) and not self._scanning
+                                and not self._fill_timer.isActive())
 
     def _on_progress(self, message: str, percent: int) -> None:
         if not self._scanning:
@@ -411,8 +440,7 @@ class DuplicatesDialog(QDialog):
             f"{tr('dup.reclaimable', size=human_size(stats['reclaimable']))}   ·   "
             f"{tr('dup.ignored_count', count=ignored)}")
         self.restore.setText(tr("dup.restore_ignored", count=ignored))
-        self.restore.setEnabled(bool(ignored) and not self._scanning
-                                and not self._fill_timer.isActive())
+        self._update_restore_button(ignored)
 
     @staticmethod
     def _mark_text(mark: str, mode: str) -> str:
@@ -437,7 +465,7 @@ class DuplicatesDialog(QDialog):
         if member.sharpness:
             bits.append(f"{tr('dup.col.sharpness')} {member.sharpness:.0f}")
         if member.defect:
-            bits.append(member.defect)
+            bits.append(tr(f"dup.defect.{member.defect}"))
         self.detail.setText("   ·   ".join(part for part in bits if part))
 
     def _enlarge(self, row: int) -> None:
@@ -531,10 +559,11 @@ class DuplicatesDialog(QDialog):
             self._signals.disconnect()
         except (RuntimeError, TypeError):
             pass
-        # The pool is a child of this dialog, so its destructor waits with no
-        # timeout on the interface thread. Wait here instead, where the stop
-        # flag is already set and the worker checks it between files.
-        if not self._pool.waitForDone(15000):
+        # A worker stuck in a decoder must not make closing the dialog block.
+        # The unparented pool is retained until it becomes idle, rather than
+        # being synchronously destroyed along with this dialog.
+        if not self._pool.waitForDone(1000):
             log.warning("duplicate scan did not stop in time")
+            _retain_running_pool(self._pool, self._signals)
         self.preview.release()
         super().done(result)

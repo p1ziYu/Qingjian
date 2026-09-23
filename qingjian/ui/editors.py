@@ -571,7 +571,7 @@ class SettingsDialog(QDialog):
             tr("settings.hash_cache"), tr("settings.hash_cache.desc"),
             self._switch("hash_cache", self.settings.hash_cache)))
         threshold = QDoubleSpinBox()
-        threshold.setRange(0.80, 1.0)
+        threshold.setRange(0.89, 1.0)
         threshold.setSingleStep(0.01)
         threshold.setDecimals(2)
         threshold.setValue(self.settings.similar_threshold)

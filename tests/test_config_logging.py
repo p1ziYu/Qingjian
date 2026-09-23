@@ -42,6 +42,10 @@ class ConfigTests(TempCase):
         self.assertEqual(4, settings.workers)
         self.assertLessEqual(settings.similar_threshold, 1.0)
 
+    def test_similarity_threshold_is_clamped_to_index_capability(self):
+        settings = config.Settings.from_dict({"similar_threshold": 0.80})
+        self.assertEqual(0.89, settings.similar_threshold)
+
     def test_a_short_profile_is_padded_to_ten_keys(self):
         settings = config.Settings.from_dict(
             {"profiles": {"P": [{"key": "1", "action": "move"}]}, "current_profile": "P"})

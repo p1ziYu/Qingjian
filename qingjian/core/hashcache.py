@@ -25,6 +25,8 @@ CREATE TABLE IF NOT EXISTS entries (
     phash     TEXT,
     dhash     TEXT,
     sharpness REAL,
+    blown     REAL,
+    crushed   REAL,
     captured  REAL,
     updated   REAL NOT NULL
 );
@@ -32,7 +34,7 @@ CREATE INDEX IF NOT EXISTS entries_size ON entries(size);
 CREATE TABLE IF NOT EXISTS cache_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
 
-FIELDS = ("sha256", "phash", "dhash", "sharpness", "captured")
+FIELDS = ("sha256", "phash", "dhash", "sharpness", "blown", "crushed", "captured")
 
 
 class HashCache:
@@ -68,6 +70,10 @@ class HashCache:
             columns = {row[1] for row in self._db.execute("PRAGMA table_info(entries)")}
             if "captured" not in columns:
                 self._db.execute("ALTER TABLE entries ADD COLUMN captured REAL")
+            if "blown" not in columns:
+                self._db.execute("ALTER TABLE entries ADD COLUMN blown REAL")
+            if "crushed" not in columns:
+                self._db.execute("ALTER TABLE entries ADD COLUMN crushed REAL")
             row = self._db.execute(
                 "SELECT value FROM cache_meta WHERE key='algorithm'").fetchone()
             from .imaging import ALGORITHM_VERSION
@@ -136,13 +142,15 @@ class HashCache:
                 try:
                     rows = self._db.execute(
                         "SELECT path, size, mtime_ns, sha256, phash, dhash, sharpness, "
-                        f"captured FROM entries WHERE path IN ({marks})", batch).fetchall()
+                        f"blown, crushed, captured FROM entries WHERE path IN ({marks})",
+                        batch).fetchall()
                 except sqlite3.Error:
                     return found
-                for path, size, mtime_ns, sha, ph, dh, sharp, captured in rows:
+                for path, size, mtime_ns, sha, ph, dh, sharp, blown, crushed, captured in rows:
                     self._memory[(path, size, mtime_ns)] = {
                         "sha256": sha, "phash": _from_text(ph), "dhash": _from_text(dh),
-                        "sharpness": sharp, "captured": captured}
+                        "sharpness": sharp, "blown": blown, "crushed": crushed,
+                        "captured": captured}
                     found += 1
         return found
 
@@ -185,7 +193,7 @@ class HashCache:
             try:
                 self._db.execute(
                     "INSERT INTO entries(path,size,mtime_ns,sha256,phash,dhash,sharpness,"
-                    "captured,updated) VALUES(?,?,?,?,?,?,?,?,?) "
+                    "blown,crushed,captured,updated) VALUES(?,?,?,?,?,?,?,?,?,?,?) "
                     "ON CONFLICT(path) DO UPDATE SET"
                     " sha256=CASE WHEN entries.size=excluded.size AND entries.mtime_ns=excluded.mtime_ns"
                     " THEN COALESCE(excluded.sha256,entries.sha256) ELSE excluded.sha256 END,"
@@ -195,12 +203,17 @@ class HashCache:
                     " THEN COALESCE(excluded.dhash,entries.dhash) ELSE excluded.dhash END,"
                     " sharpness=CASE WHEN entries.size=excluded.size AND entries.mtime_ns=excluded.mtime_ns"
                     " THEN COALESCE(excluded.sharpness,entries.sharpness) ELSE excluded.sharpness END,"
+                    " blown=CASE WHEN entries.size=excluded.size AND entries.mtime_ns=excluded.mtime_ns"
+                    " THEN COALESCE(excluded.blown,entries.blown) ELSE excluded.blown END,"
+                    " crushed=CASE WHEN entries.size=excluded.size AND entries.mtime_ns=excluded.mtime_ns"
+                    " THEN COALESCE(excluded.crushed,entries.crushed) ELSE excluded.crushed END,"
                     " captured=CASE WHEN entries.size=excluded.size AND entries.mtime_ns=excluded.mtime_ns"
                     " THEN COALESCE(excluded.captured,entries.captured) ELSE excluded.captured END,"
                     " size=excluded.size, mtime_ns=excluded.mtime_ns, updated=excluded.updated",
                     (key[0], key[1], key[2], row.get("sha256"),
                      _to_text(row.get("phash")), _to_text(row.get("dhash")),
-                     row.get("sharpness"), row.get("captured"), time.time()),
+                     row.get("sharpness"), row.get("blown"), row.get("crushed"),
+                     row.get("captured"), time.time()),
                 )
                 self._dirty = True
                 if not self._batching:
@@ -213,7 +226,7 @@ class HashCache:
             return None
         try:
             cursor = self._db.execute(
-                "SELECT size, mtime_ns, sha256, phash, dhash, sharpness, captured "
+                "SELECT size, mtime_ns, sha256, phash, dhash, sharpness, blown, crushed, captured "
                 "FROM entries WHERE path=?", (key[0],),
             )
             row = cursor.fetchone()
@@ -221,11 +234,12 @@ class HashCache:
             return None
         if not row:
             return None
-        size, mtime_ns, sha, ph, dh, sharp, captured = row
+        size, mtime_ns, sha, ph, dh, sharp, blown, crushed, captured = row
         if size != key[1] or mtime_ns != key[2]:
             return None                     # the file changed; recompute
         value = {"sha256": sha, "phash": _from_text(ph), "dhash": _from_text(dh),
-                 "sharpness": sharp, "captured": captured}
+                 "sharpness": sharp, "blown": blown, "crushed": crushed,
+                 "captured": captured}
         self._memory[key] = value
         return value
 

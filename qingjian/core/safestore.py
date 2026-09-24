@@ -252,7 +252,7 @@ def identity(path: str | Path, verify: str = VERIFY_FULL,
     if path.is_symlink() or not path.is_file():
         raise TransactionError("error.symlink" if path.is_symlink() else "error.not_regular_file",
                                str(path), path=str(path))
-    record = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+    record: dict[str, int | str | None] = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
     if verify == VERIFY_FULL:
         record["hash"] = fingerprint(path, progress, cancel)
     return record
@@ -308,7 +308,7 @@ def identity_matches(path: str | Path, expected: dict | None, verify: str = VERI
     path = Path(path)
     info = _stat_or_none(path)
     want_hash = (expected or {}).get("hash")
-    if info is not None and want_hash and verify == VERIFY_FULL:
+    if info is not None and expected is not None and want_hash and verify == VERIFY_FULL:
         if expected.get("size") is not None and info.st_size != expected["size"]:
             return False
         return fingerprint(path, progress, cancel) == want_hash

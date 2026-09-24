@@ -14,7 +14,7 @@ _BUTTON_TEXT = {
 
 
 def _message(parent, title: str, text: str, icon: QMessageBox.Icon,
-             buttons: QMessageBox.StandardButtons,
+             buttons: QMessageBox.StandardButton,
              default: QMessageBox.StandardButton = QMessageBox.StandardButton.NoButton
              ) -> QMessageBox.StandardButton:
     box = QMessageBox(icon, title, text, buttons, parent)
@@ -31,7 +31,7 @@ def _message(parent, title: str, text: str, icon: QMessageBox.Icon,
 
 
 def ask(parent, title: str, text: str,
-        buttons: QMessageBox.StandardButtons = (QMessageBox.StandardButton.Yes
+        buttons: QMessageBox.StandardButton = (QMessageBox.StandardButton.Yes
                                                  | QMessageBox.StandardButton.No),
         default: QMessageBox.StandardButton = QMessageBox.StandardButton.No
         ) -> QMessageBox.StandardButton:
@@ -39,7 +39,7 @@ def ask(parent, title: str, text: str,
 
 
 def warning(parent, title: str, text: str,
-            buttons: QMessageBox.StandardButtons = QMessageBox.StandardButton.Ok,
+            buttons: QMessageBox.StandardButton = QMessageBox.StandardButton.Ok,
             default: QMessageBox.StandardButton = QMessageBox.StandardButton.NoButton
             ) -> QMessageBox.StandardButton:
     return _message(parent, title, text, QMessageBox.Icon.Warning, buttons, default)

@@ -4,6 +4,7 @@ from __future__ import annotations
 import sys
 import zipfile
 from pathlib import Path
+from typing import Any, TypeVar, cast
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QKeySequence
@@ -27,11 +28,13 @@ from .widgets import (SectionCard, SettingRow, Segmented, Switch, caption, separ
 
 log = get_logger("editors")
 
+_WidgetT = TypeVar("_WidgetT", bound=QWidget)
+
 
 def shortcut_identity(text: str) -> int | None:
     """Return the Qt key identity used by QShortcut, independent of case."""
     sequence = QKeySequence(text.strip())
-    return sequence[0].toCombined() if not sequence.isEmpty() else None
+    return cast(Any, sequence)[0].toCombined() if not sequence.isEmpty() else None
 
 
 class ShortcutEdit(QLineEdit):
@@ -390,7 +393,7 @@ class SettingsDialog(QDialog):
         self.resize(1060, 780)
         self.settings = config.Settings.from_dict(settings.to_dict())
         self.engine = engine
-        self._controls: dict[str, object] = {}
+        self._controls: dict[str, QWidget] = {}
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 18)
@@ -475,6 +478,12 @@ class SettingsDialog(QDialog):
             widget.setSuffix(suffix)
         self._controls[key] = widget
         return widget
+
+    def _control(self, key: str, kind: type[_WidgetT]) -> _WidgetT:
+        control = self._controls[key]
+        if not isinstance(control, kind):
+            raise TypeError(f"{key} is not a {kind.__name__}")
+        return control
 
     def _page_general(self) -> QWidget:
         page, layout = self._page()
@@ -577,8 +586,8 @@ class SettingsDialog(QDialog):
         row.addWidget(quota_gb)
         row.addWidget(caption(tr("backup.keep_days")))
         row.addWidget(self._spin("quota_days", quota.max_days, 0, 2_147_483_647))
-        self._quota_initial = (self._controls["quota_ops"].value(), quota_gb.value(),
-                               self._controls["quota_days"].value())
+        self._quota_initial = (self._control("quota_ops", QSpinBox).value(), quota_gb.value(),
+                               self._control("quota_days", QSpinBox).value())
         card.add_row(SettingRow(tr("settings.quota"), tr("backup.policy_text"), None))
         card.body.addWidget(numbers)
         card.add_row(SettingRow(
@@ -652,33 +661,33 @@ class SettingsDialog(QDialog):
 
     # -- saving --------------------------------------------------------
     def _save(self) -> None:
-        get = self._controls.get
         settings = self.settings
         rules = settings.sidecar
         emptied = [key for key, old in (("sidecar_raw", rules.raw_extensions),
                                         ("sidecar_meta", rules.metadata_extensions),
                                         ("sidecar_live", rules.live_extensions))
-                   if old and get(key) is not None and not get(key).text().strip()]
+                   if old and not self._control(key, QLineEdit).text().strip()]
         if emptied and ask(self, tr("settings.sidecar.clear_title"),
                            tr("settings.sidecar.clear_confirm"),
                            default=QMessageBox.StandardButton.No) \
                 != QMessageBox.StandardButton.Yes:
             return
-        settings.language = get("language").value()
-        settings.density = get("density").value()
-        settings.restore_position = get("restore_position").isChecked()
-        settings.default_view = get("default_view").value()
-        settings.verification = get("verification").value()
-        settings.fast_path = get("fast_path").isChecked()
-        settings.recycle_mode = get("recycle").value()
-        settings.logging_enabled = get("logging").isChecked()
-        settings.background_queue = get("background_queue").isChecked()
-        settings.workers = get("workers").value()
-        settings.thumb_cache_mb = get("thumb_cache").value()
-        settings.hash_cache = get("hash_cache").isChecked()
-        settings.similar_threshold = float(get("similar_threshold").value())
-        quota_values = (get("quota_ops").value(), get("quota_gb").value(),
-                        get("quota_days").value())
+        settings.language = self._control("language", Segmented).value()
+        settings.density = self._control("density", Segmented).value()
+        settings.restore_position = self._control("restore_position", Switch).isChecked()
+        settings.default_view = self._control("default_view", Segmented).value()
+        settings.verification = self._control("verification", Segmented).value()
+        settings.fast_path = self._control("fast_path", Switch).isChecked()
+        settings.recycle_mode = self._control("recycle", Segmented).value()
+        settings.logging_enabled = self._control("logging", Switch).isChecked()
+        settings.background_queue = self._control("background_queue", Switch).isChecked()
+        settings.workers = self._control("workers", QSpinBox).value()
+        settings.thumb_cache_mb = self._control("thumb_cache", QSpinBox).value()
+        settings.hash_cache = self._control("hash_cache", Switch).isChecked()
+        settings.similar_threshold = self._control("similar_threshold", QDoubleSpinBox).value()
+        quota_values = (self._control("quota_ops", QSpinBox).value(),
+                        self._control("quota_gb", QDoubleSpinBox).value(),
+                        self._control("quota_days", QSpinBox).value())
         if quota_values != self._quota_initial:
             settings.quota = QuotaPolicy(
                 max_operations=quota_values[0],
@@ -689,26 +698,24 @@ class SettingsDialog(QDialog):
             settings.quota = self._quota_original
 
         def parse(key: str, fallback):
-            control = get(key)
-            if control is None:
-                return fallback
+            control = self._control(key, QLineEdit)
             text = control.text()
             values = {("." + part.strip().lstrip(".")).lower()
                       for part in text.replace(",", " ").split() if part.strip(". ")}
             return frozenset(values)
 
         settings.sidecar = SidecarRules(
-            enabled=get("sidecar_enabled").isChecked(),
-            prompt=get("sidecar_prompt").value(),
+            enabled=self._control("sidecar_enabled", Switch).isChecked(),
+            prompt=self._control("sidecar_prompt", Segmented).value(),
             raw_extensions=parse("sidecar_raw", rules.raw_extensions),
             metadata_extensions=parse("sidecar_meta", rules.metadata_extensions),
             live_extensions=parse("sidecar_live", rules.live_extensions),
             extra_extensions=rules.extra_extensions,
             link_same_stem_media=rules.link_same_stem_media,
-            hide_from_queue=get("sidecar_hide").isChecked())
+            hide_from_queue=self._control("sidecar_hide", Switch).isChecked())
 
-        menu = get("folder_menu")
-        if menu is not None and menu.isChecked() != self._folder_menu_was:
+        menu = self._controls.get("folder_menu")
+        if isinstance(menu, Switch) and menu.isChecked() != self._folder_menu_was:
             script = Path(__file__).resolve().parents[2] / "main.py"
             command = platform_.launch_command(getattr(sys, "frozen", False), sys.executable,
                                                str(script))

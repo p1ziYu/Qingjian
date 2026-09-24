@@ -20,6 +20,7 @@ import tempfile
 import time
 import traceback
 from pathlib import Path
+from typing import Any
 
 RESULTS: list[tuple[str, bool, str]] = []
 
@@ -48,9 +49,9 @@ class _CallbackExceptionMonitor:
 
     def __init__(self) -> None:
         self.errors: list[str] = []
-        self._old_hook = None
-        self._old_unraisable = None
-        self._old_trace = None
+        self._old_hook: Any = None
+        self._old_unraisable: Any = None
+        self._old_trace: Any = None
         self._tool_id = None
         self._wrapped: list[tuple[type, str, object]] = []
 
@@ -619,6 +620,7 @@ def _check_ui(library: Path, data: Path) -> str:
             from qingjian.ui.duplicates import DuplicatesDialog
             from qingjian.ui.editors import BindingsDialog, SettingsDialog, TemplateEditor
             current = engine.current_path()
+            assert current is not None
             group = engine.group_for(current)
             built = []
             for name, factory in (
@@ -641,6 +643,7 @@ def _check_ui(library: Path, data: Path) -> str:
             notes.append("dialogs: " + ",".join(built))
 
             original = engine.current_path()
+            assert original is not None
             window.classify_index(0)
             app.processEvents()
             keepers = library.parent / "Keepers2"

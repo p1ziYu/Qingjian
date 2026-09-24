@@ -44,7 +44,7 @@ def _never() -> bool:
 
 def _sized(paths: Sequence[Path], minimum: int = MIN_SIZE) -> list[tuple[Path, int, tuple]]:
     """Files worth comparing, keeping one name for each physical file."""
-    out: list[tuple[Path, int]] = []
+    out: list[tuple[Path, int, tuple[str, int, int]]] = []
     seen: set[tuple[int, int]] = set()
     for path in paths:
         try:
@@ -233,8 +233,8 @@ def banded_pairs(hashes: Sequence[int], max_distance: int) -> set[tuple[int, int
         for band in range(_BANDS):
             buckets[band][(value >> (band * _BAND_BITS)) & _BAND_MASK].append(index)
     pairs: set[tuple[int, int]] = set()
-    for band in buckets:
-        for members in band.values():
+    for bucket in buckets:
+        for members in bucket.values():
             if len(members) < 2 or len(members) > 4096:
                 continue
             for i, left in enumerate(members):
@@ -321,7 +321,7 @@ def _digest_for_ignore(path: Path, cache, ignored: set[str], cancel: Cancel,
         if cancel():
             raise Cancelled("cancelled")
         try:
-            digest = fingerprint(path, cancel=cancel)
+            digest = fingerprint(path, cancel=cancel) or ""
         except OSError:
             return ""
         if cache is not None:

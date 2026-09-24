@@ -11,6 +11,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any, cast
 
 from . import exifread, isobmff, mediatypes
 from .logsetup import get_logger
@@ -232,7 +233,7 @@ def _read_image(info: MediaInfo) -> None:
                 exif = image.getexif() if image.format != "PNG" or "exif" in image.info else {}
                 tags = {ExifTags.TAGS.get(t, str(t)): v for t, v in dict(exif).items()}
                 try:
-                    inner = exif.get_ifd(0x8769)
+                    inner = cast(Any, exif).get_ifd(0x8769)
                     tags.update({ExifTags.TAGS.get(t, str(t)): v for t, v in inner.items()})
                 except (KeyError, ValueError, TypeError, AttributeError):
                     pass

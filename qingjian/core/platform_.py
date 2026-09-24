@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import cast
 
 IS_WINDOWS = sys.platform == "win32"
 IS_MACOS = sys.platform == "darwin"
@@ -101,12 +102,13 @@ def _recycle_policy() -> tuple[int | None, bool] | None:
         if entry is not None and (entry[1] != winreg.REG_DWORD
                                   or type(entry[0]) is not int):
             return None
-    if size is not None and not 1 <= size[0] <= 100:
+    size_value = cast(int, size[0]) if size is not None else None
+    no_recycle_value = cast(int, no_recycle[0]) if no_recycle is not None else None
+    if size_value is not None and not 1 <= size_value <= 100:
         return None
-    if no_recycle is not None and no_recycle[0] not in (0, 1):
+    if no_recycle_value is not None and no_recycle_value not in (0, 1):
         return None
-    return (size[0] if size is not None else None,
-            no_recycle is None or no_recycle[0] == 0)
+    return (size_value, no_recycle_value is None or no_recycle_value == 0)
 
 
 def can_recycle(path: str | Path, bytes_needed: int = 0) -> bool:

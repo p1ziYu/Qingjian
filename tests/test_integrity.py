@@ -44,6 +44,37 @@ class QueueCursorTests(TempCase):
 
 
 class G11UndoStateTests(TempCase):
+    def test_abandoned_snapshot_is_force_reclaimed_and_reference_cleared(self):
+        from qingjian.core.state import Record, empty_delta
+        from qingjian.core.safestore import Plan, QuotaPolicy
+
+        source = self.write(self.tmp / "source.bin", b"held")
+        engine = Engine(self.data, config.Settings())
+        self.addCleanup(engine.close)
+        snapshot = engine.store.snapshot(source)
+        record = Record(id="abandoned", action="move", original=str(source),
+                        payload={"snapshots": [snapshot["file"]],
+                                 "snapshot_bytes": 4})
+        delta = empty_delta()
+        delta["records_add"].append(record.to_dict())
+        plan = Plan(snapshots=[snapshot["file"]], state=delta)
+        payload = plan.to_dict()
+        payload["stage_id"] = "abandoned-stage"
+        engine.store.journal_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        self.assertTrue(engine.abandon_pending(False))
+        kept = engine.state.record("abandoned")
+        self.assertIsNotNone(kept)
+        assert kept is not None
+        self.assertFalse(kept.undoable)
+        self.assertEqual([snapshot["file"]], kept.snapshots)
+        engine.settings.quota = QuotaPolicy(max_operations=0, max_bytes=1,
+                                             max_days=0, automatic=False)
+
+        self.assertEqual((4, 1), engine.reclaim(force=True))
+        self.assertFalse(Path(snapshot["file"]).exists())
+        self.assertEqual([], engine.state.record("abandoned").snapshots)
+
     def test_a_refused_undo_does_not_block_older_records(self):
         src = self.tmp / "src"
         out = self.tmp / "out"

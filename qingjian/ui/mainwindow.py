@@ -1920,6 +1920,7 @@ class MainWindow(QMainWindow):
             return
         if not self._drain_queue():
             return
+        path: Path | None
         if self.view_mode == config.VIEW_GRID:
             targets = self._targets()
             if len(targets) != 1:

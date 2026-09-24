@@ -732,12 +732,14 @@ class ThumbnailGrid(_Browser):
         for row in rows:
             if start is None:
                 start = previous = row
-            elif row == previous + 1:
+            elif previous is not None and row == previous + 1:
                 previous = row
             else:
+                assert previous is not None
                 selection.select(model.index(start, 0), model.index(previous, 0))
                 start = previous = row
         if start is not None:
+            assert previous is not None
             selection.select(model.index(start, 0), model.index(previous, 0))
         self.selectionModel().select(selection,
                                      QItemSelectionModel.SelectionFlag.ClearAndSelect)

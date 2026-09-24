@@ -297,13 +297,16 @@ class StateStore:
         return [Record.from_row(row) for row in rows]
 
     def oldest_reclaimable(self, limit: int = 1000) -> list[Record]:
-        """Undoable history and stuck records that may still own snapshots."""
+        """Records that may still own snapshots, including abandoned plans."""
         with self._lock:
             rows = self._db.execute(
                 "SELECT id,seq,stack,action,original,destination,root,conflict,time_epoch,"
                 "from_review,undoable,bytes,payload FROM records "
-                "WHERE undoable=1 AND stack IN (?,?) ORDER BY seq ASC LIMIT ?",
-                (STACK_HISTORY, STACK_STUCK, limit)).fetchall()
+                "WHERE (undoable=1 AND stack IN (?,?)) OR "
+                "(stack=? AND json_type(payload,'$.abandoned') IS NOT NULL "
+                "AND json_array_length(payload,'$.snapshots') > 0) "
+                "ORDER BY seq ASC LIMIT ?",
+                (STACK_HISTORY, STACK_STUCK, STACK_HISTORY, limit)).fetchall()
         return [Record.from_row(row) for row in rows]
 
     def retention_gate(self) -> tuple[int, float | None]:

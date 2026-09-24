@@ -215,6 +215,7 @@ class Segmented(QFrame):
         self._buttons.clear()
         for value, label in options:
             button = QPushButton(label)
+            button.setAutoDefault(False)
             button.setObjectName("segment")
             button.setCheckable(True)
             button.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -248,6 +249,13 @@ class Segmented(QFrame):
         self._quiet = quiet
         button.setChecked(True)
         self._quiet = False
+
+
+def set_primary_button(dialog: QWidget, primary: QPushButton) -> None:
+    """Make Enter predictable throughout a dialog's button tree."""
+    primary.setDefault(True)
+    for button in dialog.findChildren(QPushButton):
+        button.setAutoDefault(button is primary)
 
 
 class Switch(QAbstractButton):

@@ -9,7 +9,7 @@ from pathlib import Path
 from PySide6.QtCore import QLockFile, QObject, Signal
 from PySide6.QtGui import QFontDatabase
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication
 
 from .. import __app_name__, __display_name__, __organization__, __version__
 from ..core import appdirs, config
@@ -17,6 +17,7 @@ from ..core.engine import Engine
 from ..core.i18n import set_language, tr
 from ..core.logsetup import get_logger
 from . import icons, theme
+from .prompts import critical, warning
 
 log = get_logger("app")
 
@@ -178,7 +179,7 @@ def main(argv: list[str] | None = None) -> int:
         # to the first one and bow out quietly.
         if hand_over(doorbell, str(options["folder"] or "")):
             return 0
-        QMessageBox.warning(None, __display_name__, tr("error.single_instance"))
+        warning(None, __display_name__, tr("error.single_instance"))
         return 1
 
     settings = config.load()
@@ -191,7 +192,7 @@ def main(argv: list[str] | None = None) -> int:
         engine = Engine(appdirs.data_dir(), settings)
     except Exception as error:                      # pragma: no cover - startup failure
         log.exception("engine failed to start")
-        QMessageBox.critical(None, __display_name__, str(error))
+        critical(None, __display_name__, str(error))
         lock.unlock()
         return 1
 

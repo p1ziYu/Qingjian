@@ -48,6 +48,7 @@ CATALOG: dict[str, tuple[str, str]] = {
     "skip": ("跳过", "Skip"),
     "unknown": ("未知", "Unknown"),
     "none": ("无", "None"),
+    "unlimited": ("不限", "Unlimited"),
 
     # ---- header --------------------------------------------------------
     "header.choose_folder": ("选择文件夹", "Choose folder"),
@@ -604,6 +605,15 @@ CATALOG: dict[str, tuple[str, str]] = {
         "Export a diagnostic bundle with logs, transaction records and environment — never your media",
     ),
     "settings.export_bundle": ("导出诊断包", "Export bundle"),
+    "settings.export_failed": ("诊断包导出失败：{error}",
+                               "Could not export the diagnostic bundle: {error}"),
+    "settings.export_saved": ("诊断包已保存到：{path}",
+                              "Diagnostic bundle saved to: {path}"),
+    "settings.sidecar.clear_title": ("清空伴随文件扩展名", "Clear sidecar extensions"),
+    "settings.sidecar.clear_confirm": (
+        "清空后，这类伴随文件将不再随照片移动。仍要保存吗？",
+        "After clearing this field, these sidecars will no longer move with the photo. Save anyway?",
+    ),
     "settings.background_queue": ("后台执行分类操作", "Run sorting in the background"),
     "settings.background_queue.desc": (
         "按下数字键立刻翻到下一张，文件操作排队在后台完成；失败会回插到队列并红字提示",

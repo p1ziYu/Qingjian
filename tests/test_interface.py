@@ -20,7 +20,7 @@ from base import ROOT, TempCase, unittest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 try:
-    from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
+    from PySide6.QtCore import QEvent, QPoint, QPointF, Qt, QTimer
     from PySide6.QtGui import QContextMenuEvent, QKeyEvent, QMouseEvent
     from PySide6.QtTest import QTest
     from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
@@ -104,7 +104,7 @@ class WindowCase(QtCase):
 class QueueFailureTests(WindowCase):
     def test_twenty_failures_are_counted_and_returned(self):
         self.settings.background_queue = True
-        warning_patch = mock.patch.object(QMessageBox, "warning")
+        warning_patch = mock.patch("qingjian.ui.mainwindow.warning")
         warning = warning_patch.start()
         self._cleanups.insert(0, (warning_patch.stop, (), {}))
         paths = list(self.engine.queue_paths)
@@ -138,7 +138,7 @@ class QueueFailureTests(WindowCase):
             depth -= 1
             return QMessageBox.StandardButton.Ok
 
-        with mock.patch.object(QMessageBox, "warning", warning):
+        with mock.patch("qingjian.ui.mainwindow.warning", warning):
             self.window._on_queue_event("failed", SimpleNamespace(
                 id=1, context={}, error=OSError("first")))
         self.assertLessEqual(peak, 1)
@@ -259,7 +259,7 @@ class ProgressHandoverTests(WindowCase):
                 self.window.open_requested(str(incoming))
             self.assertEqual(self.engine.source_root, self.source)
             return QMessageBox.StandardButton.Ok
-        with mock.patch.object(QMessageBox, "warning", warning):
+        with mock.patch("qingjian.ui.mainwindow.warning", warning):
             self.window._report_queue_failures()
             self.assertTrue(self.wait_until(lambda: self.engine.source_root == incoming))
 
@@ -363,8 +363,8 @@ class RecycleTests(WindowCase):
              patch.object(platform_, "_recycle_policy", side_effect=policy), \
              patch.object(platform_, "move_to_trash",
                           side_effect=AssertionError("real system recycle attempted")), \
-             patch.object(QMessageBox, "warning",
-                          side_effect=lambda _parent, _title, message: errors.append(message)):
+             patch("qingjian.ui.mainwindow.warning",
+                   side_effect=lambda _parent, _title, message: errors.append(message)):
             self.window.trash_current()
             self.engine.queue.wait_idle(10)
             self.app.processEvents()
@@ -467,13 +467,14 @@ class RecycleTests(WindowCase):
         self.assertTrue(self.recycled())
 
     def refuse_questions(self) -> list:
+        from qingjian.ui import mainwindow
         asked = []
 
         def question(*args, **kwargs):
             asked.append(args)
             return QMessageBox.StandardButton.No
 
-        self.patch(QMessageBox, "question", question)
+        self.patch(mainwindow, "ask", question)
         return asked
 
     def test_delete_recycles_at_once_and_undo_brings_it_back(self):
@@ -571,7 +572,7 @@ class GridTargetTests(WindowCase):
         self.assertEqual(contents, sorted(path.read_bytes() for path in self.recycled()))
 
     def test_rename_in_the_grid_offers_the_selected_name(self):
-        from PySide6.QtWidgets import QInputDialog
+        from qingjian.ui import mainwindow
         queue = list(self.engine.queue_paths)
         self.to_grid([queue[5]])
         seen = []
@@ -580,12 +581,12 @@ class GridTargetTests(WindowCase):
             seen.append(text)
             return "", False
 
-        self.patch(QInputDialog, "getText", get_text)
+        self.patch(mainwindow, "get_text", get_text)
         self.window.rename_current()
         self.assertEqual([queue[5].name], seen)
 
     def test_renaming_many_at_once_says_so_and_touches_nothing(self):
-        from PySide6.QtWidgets import QInputDialog
+        from qingjian.ui import mainwindow
         from qingjian.core.i18n import tr
         queue = list(self.engine.queue_paths)
         self.to_grid([queue[2], queue[5]])
@@ -595,7 +596,7 @@ class GridTargetTests(WindowCase):
             seen.append(text)
             return "", False
 
-        self.patch(QInputDialog, "getText", get_text)
+        self.patch(mainwindow, "get_text", get_text)
         self.window.rename_current()
         self.assertEqual([], seen)
         self.assertEqual(tr("status.rename_one_only"), self.window.status_label.text())
@@ -796,7 +797,8 @@ class RecoverExitTests(WindowCase):
     """Recovery that cannot finish offers a way out; a clean start says nothing."""
 
     def silence_warnings(self) -> None:
-        self.patch(QMessageBox, "warning",
+        from qingjian.ui import mainwindow
+        self.patch(mainwindow, "warning",
                    staticmethod(lambda *a, **k: QMessageBox.StandardButton.Ok))
 
     def answers(self, answer: str) -> list:
@@ -894,6 +896,7 @@ class BackgroundQueueTests(WindowCase):
 
     def setUp(self):
         super().setUp()
+        from qingjian.ui import mainwindow
         self.settings.background_queue = True            # the shipped default
         self.settings.bindings[1].folder = str(self.tmp / "other")
         self.reported: list = []
@@ -901,11 +904,10 @@ class BackgroundQueueTests(WindowCase):
         # A queue failure pops a modal box; offscreen it would never close.
         # close_window processes Qt events; a queued failure notice can run
         # there. Keep these stubs until after that cleanup has finished.
-        for name in ("warning", "critical"):
-            patcher = mock.patch.object(
-                QMessageBox, name, lambda *a, **k: QMessageBox.StandardButton.Ok)
-            patcher.start()
-            self._cleanups.insert(0, (patcher.stop, (), {}))
+        warning_patcher = mock.patch.object(
+            mainwindow, "warning", lambda *a, **k: QMessageBox.StandardButton.Ok)
+        warning_patcher.start()
+        self._cleanups.insert(0, (warning_patcher.stop, (), {}))
         self.activate()
 
     def test_twenty_real_failed_jobs_restore_every_row_once(self):
@@ -915,7 +917,8 @@ class BackgroundQueueTests(WindowCase):
         self.window.rescan()
         before = list(self.engine.queue_paths)
         messages = []
-        self.patch(QMessageBox, "warning",
+        from qingjian.ui import mainwindow
+        self.patch(mainwindow, "warning",
                    lambda _parent, _title, message: messages.append(message))
 
         def fail(_progress, _cancel):
@@ -1051,7 +1054,8 @@ class BackgroundQueueTests(WindowCase):
 
     def test_a_failed_move_goes_back_to_its_row(self):
         from qingjian.core.safestore import TransactionError
-        self.patch(QMessageBox, "warning", lambda *_args, **_kwargs:
+        from qingjian.ui import mainwindow
+        self.patch(mainwindow, "warning", lambda *_args, **_kwargs:
                    QMessageBox.StandardButton.Ok)
         self.engine.go_to(self.engine.queue_paths[3])
         path = self.engine.current_path()
@@ -1111,11 +1115,10 @@ class BackgroundQueueTests(WindowCase):
 
     def test_f2_renames_and_ctrl_z_puts_the_old_name_back(self):
         from unittest import mock
-        from PySide6.QtWidgets import QInputDialog
         current = self.engine.current_path()
         content = current.read_bytes()
         target = current.with_name("renamed.JPG")
-        with mock.patch.object(QInputDialog, "getText", return_value=("renamed.JPG", True)):
+        with mock.patch("qingjian.ui.mainwindow.get_text", return_value=("renamed.JPG", True)):
             self.press(Qt.Key.Key_F2)
             self.until(lambda: target.exists(), "the file was not renamed")
         self.assertEqual(content, target.read_bytes())
@@ -1173,8 +1176,8 @@ class BackgroundQueueTests(WindowCase):
         self.patch(self.engine, "close", closing)
         self.slow_classify()            # opens only once closing waits for the queue
         self.window.classify_index(0)
-        with mock.patch.object(QMessageBox, "question",
-                               return_value=QMessageBox.StandardButton.Yes):
+        with mock.patch("qingjian.ui.mainwindow.ask",
+                        return_value=QMessageBox.StandardButton.Yes):
             self.window.close()
         self.assertEqual([0], pending, "the window closed over a queued move")
         self.assertTrue((self.keep / current.name).exists())
@@ -1278,9 +1281,10 @@ class BindingCardTests(QtCase):
 class ReservedKeyTests(WindowCase):
     def test_the_key_editor_refuses_a_key_the_window_already_uses(self):
         from qingjian.core import config
+        from qingjian.ui import editors
         from qingjian.ui.editors import BindingsDialog
         warned = []
-        self.patch(QMessageBox, "warning", lambda *args, **kwargs: warned.append(args[2]))
+        self.patch(editors, "warning", lambda *args, **kwargs: warned.append(args[2]))
         bindings = [config.Binding(key=key) for key in config.DEFAULT_KEYS]
         bindings[1].key = "G"
         dialog = BindingsDialog(bindings, [], self.window, reserved=self.window.reserved_keys())
@@ -1688,6 +1692,248 @@ class FolderMenuSettingTests(WindowCase):
         self.assertEqual([], calls)
 
 
+class G12DialogTests(WindowCase):
+    def test_primary_buttons_are_explicit_and_other_buttons_are_not_auto_default(self):
+        from PySide6.QtWidgets import QPushButton
+        from qingjian.core import config
+        from qingjian.ui.dialogs import TableDialog
+        from qingjian.ui.editors import BindingsDialog, SettingsDialog, TemplateEditor
+
+        dialogs = [
+            TableDialog("History", ["A"], [], [("Undo", lambda: None)]),
+            TemplateEditor(config.Binding(key="1", folder=str(self.keep)), []),
+            BindingsDialog(config.default_bindings()),
+            SettingsDialog(config.Settings()),
+        ]
+        for dialog in dialogs:
+            with self.subTest(dialog=type(dialog).__name__):
+                self.addCleanup(dialog.deleteLater)
+                buttons = dialog.findChildren(QPushButton)
+                defaults = [button for button in buttons if button.isDefault()]
+                self.assertEqual(1, len(defaults), type(dialog).__name__)
+                self.assertTrue(all(not button.autoDefault() for button in buttons
+                                    if button is not defaults[0]), type(dialog).__name__)
+
+    def test_sidecar_and_duplicates_have_one_safe_default(self):
+        from PySide6.QtWidgets import QPushButton
+        from qingjian.ui.dialogs import SidecarDialog
+        from qingjian.ui.duplicates import DuplicatesDialog
+
+        current = self.engine.current_path()
+        self.write(current.with_suffix(".CR2"), b"raw")
+        group = self.engine._operation_group(self.engine.group_for(current))
+        sidecar = SidecarDialog(group, current.name, str(self.keep), self.window)
+        duplicates = DuplicatesDialog(self.engine, self.window)
+        self.addCleanup(sidecar.deleteLater)
+        self.addCleanup(duplicates.close)
+        self.addCleanup(duplicates.deleteLater)
+        for dialog in (sidecar, duplicates):
+            with self.subTest(dialog=type(dialog).__name__):
+                buttons = dialog.findChildren(QPushButton)
+                defaults = [button for button in buttons if button.isDefault()]
+                self.assertEqual(1, len(defaults), type(dialog).__name__)
+                self.assertTrue(all(not button.autoDefault() for button in buttons
+                                    if button is not defaults[0]), type(dialog).__name__)
+
+    def test_sidecar_dialog_ignores_arrow_focus_navigation(self):
+        from PySide6.QtWidgets import QPushButton
+        from qingjian.ui.dialogs import SidecarDialog
+
+        current = self.engine.current_path()
+        self.write(current.with_suffix(".CR2"), b"raw")
+        group = self.engine._operation_group(self.engine.group_for(current))
+        dialog = SidecarDialog(group, current.name, str(self.keep), self.window)
+        self.addCleanup(dialog.deleteLater)
+        dialog.show()
+        primary = next(button for button in dialog.findChildren(QPushButton)
+                       if button.isDefault())
+        primary.setFocus()
+        for key in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down):
+            QTest.keyClick(primary, key)
+            self.assertIs(primary, dialog.focusWidget())
+
+    def test_conflict_dialog_ignores_arrow_focus_navigation(self):
+        from PySide6.QtWidgets import QCheckBox
+        from qingjian.core import ops
+        from qingjian.ui.dialogs import ConflictDialog
+
+        source = self.write(self.tmp / "incoming.jpg", b"new")
+        target = self.write(self.tmp / "existing.jpg", b"old")
+        for key in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down):
+            for activate in (Qt.Key.Key_Return, Qt.Key.Key_Space):
+                with self.subTest(direction=key, activate=activate):
+                    dialog = ConflictDialog(source, target, self.window)
+                    dialog.show()
+                    self.app.processEvents()
+                    initial = dialog.focusWidget()
+                    self.assertIsInstance(initial, QCheckBox)
+                    QTest.keyClick(initial, key)
+                    QTest.keyClick(dialog.focusWidget() or dialog, activate)
+                    self.assertNotEqual(ops.CONFLICT_REPLACE, dialog.choice)
+                    dialog.close()
+                    dialog.deleteLater()
+
+    def test_master_only_is_never_remembered_as_always(self):
+        from qingjian.core.sidecar import PROMPT_ONCE
+        from qingjian.ui import mainwindow
+        from qingjian.ui.dialogs import SidecarDialog
+
+        class MasterOnly(SidecarDialog):
+            def exec(self):
+                self._master_only()
+                return QDialog.DialogCode.Accepted
+
+        self.patch(mainwindow, "SidecarDialog", MasterOnly)
+        current = self.engine.current_path()
+        self.write(current.with_suffix(".CR2"), b"raw")
+        self.settings.sidecar = self.settings.sidecar.with_prompt(PROMPT_ONCE)
+        self.window.classify_index(0)
+        self.assertEqual(PROMPT_ONCE, self.settings.sidecar.prompt)
+
+    def test_shortcuts_compare_qt_key_identity_and_reject_modifiers(self):
+        from qingjian.core import config
+        from qingjian.ui import editors
+        from qingjian.ui.editors import BindingsDialog, ShortcutEdit
+
+        dialog = BindingsDialog(config.default_bindings(), reserved=self.window.reserved_keys())
+        self.addCleanup(dialog.deleteLater)
+        dialog.rows[1]["key"].setText("a")
+        dialog.rows[2]["key"].setText("A")
+        with mock.patch.object(editors, "warning") as warning:
+            dialog._accept()
+        self.assertNotEqual(QDialog.DialogCode.Accepted, dialog.result())
+        warning.assert_called_once()
+
+        edit = ShortcutEdit()
+        event = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Exclam,
+                          Qt.KeyboardModifier.ShiftModifier, "!")
+        QApplication.sendEvent(edit, event)
+        self.assertEqual("", edit.sequence())
+
+        self.settings.bindings[1] = config.Binding(key="a", action="move",
+                                                   folder=str(self.tmp / "one"))
+        self.settings.bindings[2] = config.Binding(key="A", action="move",
+                                                   folder=str(self.tmp / "two"))
+        self.window._install_binding_shortcuts()
+        self.assertIn("A", self.window.status_label.text().upper())
+
+    def test_legacy_letter_binding_and_number_binding_still_trigger(self):
+        from qingjian.core import config
+
+        letter = self.tmp / "letter"
+        self.settings.bindings[1] = config.Binding(key="a", action="move", folder=str(letter))
+        self.window._install_binding_shortcuts()
+        self.activate()
+        first = self.engine.current_path()
+        QTest.keyClick(self.window, Qt.Key.Key_A)
+        self.app.processEvents()
+        self.assertTrue((letter / first.name).exists())
+        second = self.engine.current_path()
+        QTest.keyClick(self.window, Qt.Key.Key_1)
+        self.app.processEvents()
+        self.assertTrue((self.keep / second.name).exists())
+
+    def test_saving_untouched_quota_preserves_exact_value_and_zero_is_unlimited(self):
+        from qingjian.core import config
+        from qingjian.core.i18n import tr
+        from qingjian.ui.editors import SettingsDialog
+
+        for value in (0, 1610612736, 5000 * 1024 ** 3):
+            settings = config.Settings.from_dict({"quota": {"max_bytes": value}})
+            dialog = SettingsDialog(settings)
+            self.addCleanup(dialog.deleteLater)
+            dialog._save()
+            self.assertEqual(value, dialog.result_settings().quota.max_bytes)
+        dialog = SettingsDialog(config.Settings())
+        self.addCleanup(dialog.deleteLater)
+        dialog._controls["quota_gb"].setValue(1.5)
+        dialog._save()
+        self.assertEqual(1610612736, dialog.result_settings().quota.max_bytes)
+        self.settings.quota = self.settings.quota.__class__(max_bytes=0)
+        self.window._update_quota()
+        self.assertIn(tr("unlimited"), self.window.quota_label.text())
+
+    def test_clearing_sidecar_extensions_saves_empty_after_one_warning(self):
+        from qingjian.core import config
+        from qingjian.ui import editors
+
+        dialog = editors.SettingsDialog(config.Settings())
+        self.addCleanup(dialog.deleteLater)
+        dialog._controls["sidecar_meta"].setText("")
+        with mock.patch.object(
+                editors, "ask",
+                side_effect=(QMessageBox.StandardButton.No, QMessageBox.StandardButton.Yes),
+                create=True) as warning:
+            dialog._save()
+            self.assertNotEqual(QDialog.DialogCode.Accepted, dialog.result())
+            self.assertNotEqual(frozenset(),
+                                dialog.result_settings().sidecar.metadata_extensions)
+            dialog._save()
+        self.assertEqual(2, warning.call_count)
+        self.assertEqual(frozenset(), dialog.result_settings().sidecar.metadata_extensions)
+
+    def test_export_bundle_failure_is_reported_and_logged(self):
+        from qingjian.core import config
+        from qingjian.ui import editors
+
+        class BrokenEngine:
+            @staticmethod
+            def backup_usage():
+                return 0
+
+            @staticmethod
+            def diagnostic_bundle(_destination):
+                raise PermissionError("blocked")
+
+        engine = BrokenEngine()
+        engine.data_dir = self.data
+        dialog = editors.SettingsDialog(config.Settings(), engine)
+        self.addCleanup(dialog.deleteLater)
+        with mock.patch.object(editors.QFileDialog, "getSaveFileName",
+                               return_value=(str(self.tmp / "bundle.zip"), "Zip (*.zip)")), \
+             mock.patch.object(editors, "warning", create=True) as warning, \
+             self.assertLogs("qingjian", level="WARNING"):
+            dialog._export_bundle()
+        warning.assert_called_once()
+
+        destination = self.tmp / "saved.zip"
+        with mock.patch.object(editors.QFileDialog, "getSaveFileName",
+                               return_value=(str(destination), "Zip (*.zip)")), \
+             mock.patch.object(engine, "diagnostic_bundle") as export, \
+             mock.patch.object(editors, "information", create=True) as information:
+            dialog._export_bundle()
+        export.assert_called_once_with(str(destination))
+        information.assert_called_once()
+
+    def test_prompt_helpers_localize_standard_buttons(self):
+        from PySide6.QtWidgets import QPushButton
+        from qingjian.core.i18n import set_language
+        from qingjian.ui.prompts import ask, get_text
+
+        set_language("zh")
+        seen = []
+
+        def close_message():
+            modal = QApplication.activeModalWidget()
+            seen.append(sorted(button.text().replace("&", "")
+                               for button in modal.findChildren(QPushButton)))
+            modal.reject()
+
+        QTimer.singleShot(0, close_message)
+        ask(self.window, "title", "text")
+        self.assertEqual(["否", "是"], seen[-1])
+
+        def close_input():
+            modal = QApplication.activeModalWidget()
+            seen.append(sorted(button.text().replace("&", "")
+                               for button in modal.findChildren(QPushButton)))
+            modal.reject()
+
+        QTimer.singleShot(0, close_input)
+        get_text(self.window, "title", "label", text="x")
+        self.assertEqual(["取消", "确定"], seen[-1])
+
+
 class BaggingTests(WindowCase):
     """The copy that drops into an envelope must never cover the next print."""
 
@@ -1841,19 +2087,17 @@ class G03WindowTests(WindowCase):
         run.assert_not_called()
 
     def test_rename_precheck_uses_completed_suffix(self):
-        from PySide6.QtWidgets import QInputDialog
         from qingjian.core import ops
         from qingjian.ui.mainwindow import ConflictDialog
         self.engine.go_to(self.source / "IMG_0000.JPG")
-        with mock.patch.object(QInputDialog, "getText", return_value=("IMG_0001", True)), \
+        with mock.patch("qingjian.ui.mainwindow.get_text", return_value=("IMG_0001", True)), \
              mock.patch.object(ConflictDialog, "ask", return_value=(ops.CONFLICT_CANCEL, False)) as ask:
             self.window.rename_current()
         ask.assert_called_once()
 
     def test_invalid_rename_reports_error(self):
-        from PySide6.QtWidgets import QInputDialog
         self.engine.go_to(self.source / "IMG_0000.JPG")
-        with mock.patch.object(QInputDialog, "getText", return_value=("a/b", True)), \
+        with mock.patch("qingjian.ui.mainwindow.get_text", return_value=("a/b", True)), \
              mock.patch.object(self.window, "_report") as report:
             self.window.rename_current()
         report.assert_called_once()
@@ -1865,7 +2109,7 @@ class G03EditorTests(QtCase):
         from qingjian.ui.editors import BindingsDialog
         dialog = BindingsDialog([config.Binding("1", "move", "Keep")])
         self.addCleanup(dialog.close)
-        with mock.patch.object(QMessageBox, "warning"):
+        with mock.patch("qingjian.ui.editors.warning"):
             dialog._accept()
         self.assertNotEqual(QDialog.DialogCode.Accepted, dialog.result())
 
@@ -1876,7 +2120,7 @@ class G03EditorTests(QtCase):
         for folder in ("Keep", "D:Keep", "\\Keep"):
             with self.subTest(folder=folder):
                 dialog = BindingsDialog([config.Binding("1", "move", folder)])
-                with mock.patch.object(QMessageBox, "warning"):
+                with mock.patch("qingjian.ui.editors.warning"):
                     dialog._accept()
                 self.assertNotEqual(QDialog.DialogCode.Accepted, dialog.result())
                 dialog.close()
@@ -1909,8 +2153,9 @@ class G03EditorTests(QtCase):
 
 class OpenFolderFailureTests(WindowCase):
     def test_an_unexpected_scan_failure_is_reported(self):
+        from qingjian.ui import mainwindow
         shown = []
-        self.patch(QMessageBox, "warning", staticmethod(lambda *a, **k: shown.append(a)))
+        self.patch(mainwindow, "warning", staticmethod(lambda *a, **k: shown.append(a)))
 
         def explode(folder, progress=None, cancel=None):
             raise ValueError("invalid literal for int() with base 10: '\u2460'")
@@ -2096,9 +2341,8 @@ class G06PreviewOperationTests(WindowCase):
         self.assertTrue(device.isOpen())
 
     def test_failed_rename_releases_preview_then_restores_it(self):
-        from PySide6.QtWidgets import QInputDialog
         path, device = self.moving_gif()
-        with mock.patch.object(QInputDialog, "getText", return_value=("new.gif", True)), \
+        with mock.patch("qingjian.ui.mainwindow.get_text", return_value=("new.gif", True)), \
              mock.patch.object(self.engine, "current_path", return_value=path), \
              mock.patch.object(self.engine, "rename", side_effect=OSError("busy")) as rename, \
              mock.patch.object(self.window, "_refresh_view") as refresh, \

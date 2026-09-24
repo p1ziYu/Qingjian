@@ -14,7 +14,7 @@ from PySide6.QtCore import (QAbstractAnimation, QEasingCurve, QEvent, QObject,
                             QPropertyAnimation, QRect, QSize, Qt, QTimer, Signal)
 from PySide6.QtGui import QFont, QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileDialog,
-                               QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
+                               QFrame, QHBoxLayout, QLabel, QLineEdit,
                                QMainWindow, QMenu, QMessageBox, QProgressBar, QProgressDialog,
                                QPushButton, QSizePolicy, QStackedWidget, QToolButton,
                                QVBoxLayout, QWidget)
@@ -32,8 +32,9 @@ from . import icons, theme
 from .browsers import Filmstrip, ThumbnailGrid
 from .dialogs import BackupDialog, ConflictDialog, SidecarDialog, TableDialog
 from .duplicates import DuplicatesDialog
-from .editors import BindingsDialog, SettingsDialog
+from .editors import BindingsDialog, SettingsDialog, shortcut_identity
 from .preview import MediaPreview, PreviewPrefetcher
+from .prompts import ask, get_text, information, warning
 from .thumbs import ThumbnailCache
 from .widgets import (BindingCard, CountLabel, ElidedLabel, FlyingPrint, FolderSlip,
                       LabelSwatches, Segmented, StarRating, elide, icon_button, separator,
@@ -610,9 +611,18 @@ class MainWindow(QMainWindow):
         self._binding_shortcuts.clear()
         # Two shortcuts on one key fire neither. A clash saved before the key
         # editor refused them keeps the built-in key and says so.
-        clashes = config.reserved_conflicts(self.settings.bindings, self.reserved_keys())
+        reserved = {shortcut_identity(key) for key in self.reserved_keys()}
+        by_identity: dict[int, list[str]] = {}
+        for binding in self.settings.bindings:
+            identity = shortcut_identity(binding.key)
+            if identity is not None:
+                by_identity.setdefault(identity, []).append(binding.key)
+        clash_ids = {identity for identity, keys in by_identity.items()
+                     if len(keys) > 1 or identity in reserved}
+        clashes = sorted({key.upper() for identity in clash_ids
+                          for key in by_identity[identity]})
         for index, binding in enumerate(self.settings.bindings):
-            if not binding.key or binding.key in clashes:
+            if not binding.key or shortcut_identity(binding.key) in clash_ids:
                 continue
             self._binding_shortcuts.append(
                 self._shortcut(binding.key, lambda i=index: self.classify_index(i)))
@@ -673,7 +683,7 @@ class MainWindow(QMainWindow):
         message = tr(key, **fields) if key else str(error)
         log.warning("operation failed: %s", error)
         self.status(message, "error")
-        QMessageBox.warning(self, tr("error.title"), message)
+        warning(self, tr("error.title"), message)
 
     # ============================================================ language
     def _change_language(self, code: str) -> None:
@@ -1246,11 +1256,13 @@ class MainWindow(QMainWindow):
 
     def _update_quota(self) -> None:
         used = self.engine.backup_usage()
-        cap = max(1, self.settings.quota.max_bytes)
-        usage = tr("status.snapshot_usage", used=human_size(used), cap=human_size(cap))
+        quota = self.settings.quota.max_bytes
+        cap = max(1, quota)
+        usage = (tr("unlimited") if quota == 0 else
+                 tr("status.snapshot_usage", used=human_size(used), cap=human_size(cap)))
         self.quota_label.setText(usage)
         self.quota_bar.setToolTip(usage)
-        percent = min(100, int(used * 100 / cap))
+        percent = 0 if quota == 0 else min(100, int(used * 100 / cap))
         self.quota_bar.setRange(0, 100)
         self.quota_bar.setValue(percent)
         self.quota_bar.setProperty("full", "true" if percent > 85 else "false")
@@ -1372,12 +1384,12 @@ class MainWindow(QMainWindow):
         finally:
             menu.deleteLater()
         if chosen is duplicate:
-            name, ok = QInputDialog.getText(self, tr("side.preset_new"), tr("side.preset_name"),
-                                            text=f"{self.settings.current_profile} 2")
+            name, ok = get_text(self, tr("side.preset_new"), tr("side.preset_name"),
+                                text=f"{self.settings.current_profile} 2")
             name = (name or "").strip()
             if ok and name:
                 if name in self.settings.profiles:
-                    QMessageBox.warning(self, tr("error.title"), tr("side.preset_exists"))
+                    warning(self, tr("error.title"), tr("side.preset_exists"))
                     return
                 self.settings.profiles[name] = [
                     config.Binding(**b.to_dict()) for b in self.settings.bindings]
@@ -1386,13 +1398,12 @@ class MainWindow(QMainWindow):
                 self._refresh_presets()
                 self._refresh_bindings()
         elif chosen is rename:
-            name, ok = QInputDialog.getText(self, tr("side.preset_rename"),
-                                            tr("side.preset_name"),
-                                            text=self.settings.current_profile)
+            name, ok = get_text(self, tr("side.preset_rename"), tr("side.preset_name"),
+                                text=self.settings.current_profile)
             name = (name or "").strip()
             if ok and name and name != self.settings.current_profile:
                 if name in self.settings.profiles:
-                    QMessageBox.warning(self, tr("error.title"), tr("side.preset_exists"))
+                    warning(self, tr("error.title"), tr("side.preset_exists"))
                     return
                 self.settings.profiles[name] = self.settings.profiles.pop(
                     self.settings.current_profile)
@@ -1401,10 +1412,9 @@ class MainWindow(QMainWindow):
                 self._refresh_presets()
         elif chosen is delete:
             if len(self.settings.profiles) == 1:
-                QMessageBox.information(self, tr("error.title"), tr("side.preset_last"))
+                information(self, tr("error.title"), tr("side.preset_last"))
                 return
-            if QMessageBox.question(self, tr("side.preset_delete"),
-                                    self.settings.current_profile) \
+            if ask(self, tr("side.preset_delete"), self.settings.current_profile) \
                     == QMessageBox.StandardButton.Yes:
                 self.settings.profiles.pop(self.settings.current_profile, None)
                 self.settings.current_profile = next(iter(self.settings.profiles))
@@ -1864,8 +1874,7 @@ class MainWindow(QMainWindow):
         self._reporting = True
         self.engine.queue.clear_failures()
         try:
-            QMessageBox.warning(self, tr("error.title"),
-                                tr("status.queue_failed", count=count))
+            warning(self, tr("error.title"), tr("status.queue_failed", count=count))
         finally:
             self._reporting = False
             self._failed_seen = max(0, self._failed_seen - count)
@@ -1908,7 +1917,7 @@ class MainWindow(QMainWindow):
             path = self.engine.current_path()
         if path is None:
             return
-        name, ok = QInputDialog.getText(self, tr("rename"), tr("info.filename"), text=path.name)
+        name, ok = get_text(self, tr("rename"), tr("info.filename"), text=path.name)
         if not ok or not name.strip():
             return
         try:
@@ -2266,10 +2275,9 @@ class MainWindow(QMainWindow):
             self.status(tr("backup.reclaimed", size=human_size(freed), count=retired),
                         "success")
         elif dialog.result_action == "clear":
-            if QMessageBox.warning(self, tr("backup.clear_all"), tr("backup.clear_confirm"),
-                                   QMessageBox.StandardButton.Yes
-                                   | QMessageBox.StandardButton.Cancel,
-                                   QMessageBox.StandardButton.Cancel) \
+            if warning(self, tr("backup.clear_all"), tr("backup.clear_confirm"),
+                       QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                       QMessageBox.StandardButton.Cancel) \
                     != QMessageBox.StandardButton.Yes:
                 return
             freed = self.engine.clear_backups()
@@ -2398,9 +2406,8 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         if self.engine.queue.pending:
-            answer = QMessageBox.question(self, tr("queue.drain"),
-                                          tr("status.queue_pending",
-                                             count=self.engine.queue.pending))
+            answer = ask(self, tr("queue.drain"),
+                         tr("status.queue_pending", count=self.engine.queue.pending))
             if answer != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
@@ -2411,9 +2418,8 @@ class MainWindow(QMainWindow):
                 # Still working after the wait: closing here would abandon a
                 # transaction part-way, so let the user decide rather than
                 # deciding for them.
-                answer = QMessageBox.question(
-                    self, tr("queue.drain"),
-                    tr("status.queue_pending", count=self.engine.queue.pending))
+                answer = ask(self, tr("queue.drain"),
+                             tr("status.queue_pending", count=self.engine.queue.pending))
                 if answer != QMessageBox.StandardButton.Yes:
                     event.ignore()
                     return

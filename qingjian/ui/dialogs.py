@@ -3,8 +3,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QDialog, QHBoxLayout, QHeaderView, QLabel, QProgressBar, QPushButton,
+from PySide6.QtCore import QEvent, Qt, QTimer
+from PySide6.QtWidgets import (QAbstractButton, QAbstractItemView, QCheckBox, QDialog, QHBoxLayout, QHeaderView, QLabel, QProgressBar, QPushButton,
                                QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from ..core import ops
@@ -12,7 +12,7 @@ from ..core.engine import human_size
 from ..core.i18n import tr
 from ..core.sidecar import KIND_LIVE, KIND_MASTER, KIND_METADATA, KIND_RAW, SidecarGroup
 from . import icons, theme
-from .widgets import caption, separator
+from .widgets import caption, separator, set_primary_button
 
 
 def _title_row(title: str, subtitle: str = "", icon_name: str = "") -> QWidget:
@@ -48,7 +48,23 @@ _CHUNK_ROWS = 250
 _MEASURE_ROWS = 60
 
 
-class ConflictDialog(QDialog):
+class _NoArrowButtonDialog(QDialog):
+    """Keep arrow keys from moving focus onto a destructive button."""
+
+    def _block_button_arrows(self) -> None:
+        for control in self.findChildren(QAbstractButton):
+            control.installEventFilter(self)
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt naming
+        if (isinstance(watched, QAbstractButton)
+                and event.type() == QEvent.Type.KeyPress
+                and event.key() in (Qt.Key.Key_Left, Qt.Key.Key_Right,
+                                    Qt.Key.Key_Up, Qt.Key.Key_Down)):
+            return True
+        return super().eventFilter(watched, event)
+
+
+class ConflictDialog(_NoArrowButtonDialog):
     """What to do when the destination already holds a file of that name."""
 
     def __init__(self, source: Path, target: Path, parent=None) -> None:
@@ -95,6 +111,8 @@ class ConflictDialog(QDialog):
         buttons.addWidget(cancel)
         buttons.addWidget(sequence)
         layout.addLayout(buttons)
+        set_primary_button(self, sequence)
+        self._block_button_arrows()
 
     def _choose(self, value: str) -> None:
         self.choice = value
@@ -124,7 +142,7 @@ _KIND_TEXT = {
 }
 
 
-class SidecarDialog(QDialog):
+class SidecarDialog(_NoArrowButtonDialog):
     """Confirm that the raw and the metadata travel with the photograph."""
 
     def __init__(self, group: SidecarGroup, target_name: str, target_folder: str,
@@ -203,13 +221,22 @@ class SidecarDialog(QDialog):
         accept = QPushButton(tr("sidecar.move_all", count=group.count))
         accept.setObjectName("primaryButton")
         accept.setDefault(True)
-        accept.clicked.connect(self.accept)
+        accept.clicked.connect(self._move_all)
         buttons.addWidget(cancel)
         buttons.addWidget(master_only)
         buttons.addWidget(accept)
         layout.addLayout(buttons)
+        self._remember_decision: bool | None = None
+        set_primary_button(self, accept)
+        self._block_button_arrows()
+
+    def _move_all(self) -> None:
+        self._remember_decision = self.remember.isChecked() and all(
+            check.isChecked() for check, _path in self._checks if check.isEnabled())
+        self.accept()
 
     def _master_only(self) -> None:
+        self._remember_decision = False
         for check, _path in self._checks:
             check.setChecked(check.isEnabled() is False)
         self.accept()
@@ -218,7 +245,9 @@ class SidecarDialog(QDialog):
         return [path for check, path in self._checks if check.isChecked()]
 
     def remembered(self) -> bool:
-        return self.remember.isChecked()
+        if self._remember_decision is None:
+            return self.remember.isChecked()
+        return self._remember_decision
 
 
 class TableDialog(QDialog):
@@ -278,6 +307,7 @@ class TableDialog(QDialog):
         close.clicked.connect(self.accept)
         buttons.addWidget(close)
         layout.addLayout(buttons)
+        set_primary_button(self, close)
 
     def _write_chunk(self) -> None:
         batch = self._rows[self._written:self._written + _CHUNK_ROWS]
@@ -319,18 +349,20 @@ class BackupDialog(QDialog):
         bar.setObjectName("quotaBar")
         cap = max(1, policy.max_bytes)
         bar.setRange(0, 100)
-        percent = min(100, int(used * 100 / cap))
+        percent = 0 if policy.max_bytes == 0 else min(100, int(used * 100 / cap))
         bar.setValue(percent)
         bar.setProperty("full", "true" if percent > 85 else "false")
         row = QHBoxLayout()
         row.setSpacing(10)
         row.addWidget(bar, 1)
-        row.addWidget(QLabel(f"{human_size(used)} / {human_size(policy.max_bytes)}"))
+        row.addWidget(QLabel(tr("unlimited") if policy.max_bytes == 0
+                             else f"{human_size(used)} / {human_size(policy.max_bytes)}"))
         layout.addLayout(row)
 
         for label, value in (
             (tr("backup.keep_last"), tr("backup.operations", count=policy.max_operations)),
-            (tr("backup.disk_cap"), human_size(policy.max_bytes)),
+            (tr("backup.disk_cap"), tr("unlimited") if policy.max_bytes == 0
+             else human_size(policy.max_bytes)),
             (tr("backup.keep_days"), tr("backup.days", count=policy.max_days)),
         ):
             line = QHBoxLayout()
@@ -358,6 +390,7 @@ class BackupDialog(QDialog):
         buttons.addWidget(reclaim)
         buttons.addWidget(close)
         layout.addLayout(buttons)
+        set_primary_button(self, close)
 
     def _finish(self, action: str) -> None:
         self.result_action = action

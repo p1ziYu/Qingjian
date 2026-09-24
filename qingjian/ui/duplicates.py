@@ -24,7 +24,7 @@ from ..core.logsetup import get_logger
 from ..core.safestore import Cancelled, TransactionError
 from . import theme
 from .preview import MediaPreview
-from .widgets import Segmented, caption, separator
+from .widgets import Segmented, caption, separator, set_primary_button
 
 log = get_logger("duplicates")
 
@@ -235,6 +235,7 @@ class DuplicatesDialog(QDialog):
         actions.addStretch(1)
         actions.addWidget(close)
         layout.addLayout(actions)
+        set_primary_button(self, close)
 
         self.reload()
 

@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import sys
+import zipfile
 from pathlib import Path
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import (QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFrame,
                                QHBoxLayout, QLabel, QLineEdit, QListWidget,
                                QListWidgetItem, QMessageBox, QPushButton, QScrollArea,
@@ -13,12 +15,23 @@ from PySide6.QtWidgets import (QComboBox, QDialog, QDoubleSpinBox, QFileDialog, 
 from ..core import config, platform_, template
 from ..core.engine import human_size
 from ..core.i18n import LANGUAGES, tr
+from ..core.logsetup import get_logger
 from ..core.naming import NameError_
 from ..core.safestore import QuotaPolicy, VERIFY_FAST, VERIFY_FULL
 from ..core.sidecar import (PROMPT_ALWAYS, PROMPT_EACH, PROMPT_NEVER, PROMPT_ONCE,
                             SidecarRules)
 from . import icons, theme
-from .widgets import SectionCard, SettingRow, Segmented, Switch, caption, separator
+from .prompts import ask, information, warning
+from .widgets import (SectionCard, SettingRow, Segmented, Switch, caption, separator,
+                      set_primary_button)
+
+log = get_logger("editors")
+
+
+def shortcut_identity(text: str) -> int | None:
+    """Return the Qt key identity used by QShortcut, independent of case."""
+    sequence = QKeySequence(text.strip())
+    return sequence[0].toCombined() if not sequence.isEmpty() else None
 
 
 class ShortcutEdit(QLineEdit):
@@ -37,6 +50,11 @@ class ShortcutEdit(QLineEdit):
             return
         if key in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete):
             self.setText("")
+            return
+        if event.modifiers() & (Qt.KeyboardModifier.ShiftModifier
+                                | Qt.KeyboardModifier.ControlModifier
+                                | Qt.KeyboardModifier.AltModifier
+                                | Qt.KeyboardModifier.MetaModifier):
             return
         text = event.text()
         if text and text.isprintable() and not text.isspace():
@@ -133,6 +151,7 @@ class TemplateEditor(QDialog):
         buttons.addWidget(cancel)
         buttons.addWidget(apply_button)
         layout.addLayout(buttons)
+        set_primary_button(self, apply_button)
 
         self.path_edit.textChanged.connect(self._refresh)
         self.name_edit.textChanged.connect(self._refresh)
@@ -152,6 +171,7 @@ class TemplateEditor(QDialog):
         flow.setSpacing(6)
         for token in tokens:
             chip = QPushButton("{" + token + "}")
+            chip.setAutoDefault(False)
             chip.setObjectName("compactButton")
             chip.setCursor(Qt.CursorShape.PointingHandCursor)
             chip.clicked.connect(lambda _=False, value=token, edit=target: edit.insert(
@@ -201,7 +221,7 @@ class TemplateEditor(QDialog):
         try:
             template.validate(self.path_edit.text(), self.name_edit.text())
         except NameError_ as error:
-            QMessageBox.warning(self, tr("error.title"), tr(error.key, **error.fields))
+            warning(self, tr("error.title"), tr(error.key, **error.fields))
             return
         self.binding.path_template = self.path_edit.text().strip()
         self.binding.name_template = self.name_edit.text().strip()
@@ -258,6 +278,7 @@ class BindingsDialog(QDialog):
         buttons.addWidget(cancel)
         buttons.addWidget(accept)
         layout.addLayout(buttons)
+        set_primary_button(self, accept)
 
     def _build_row(self, index: int, binding: config.Binding) -> QWidget:
         row = QFrame()
@@ -331,23 +352,28 @@ class BindingsDialog(QDialog):
 
     def _accept(self) -> None:
         self._harvest()
-        seen: dict[str, int] = {}
+        seen: dict[int, list[str]] = {}
         for binding in self._working:
             if binding.key:
-                seen[binding.key] = seen.get(binding.key, 0) + 1
-        clashes = [key for key, count in seen.items() if count > 1]
+                identity = shortcut_identity(binding.key)
+                if identity is not None:
+                    seen.setdefault(identity, []).append(binding.key)
+        clashes = sorted({key.upper() for keys in seen.values() if len(keys) > 1
+                          for key in keys})
         if clashes:
-            QMessageBox.warning(self, tr("error.title"),
-                                tr("bind.duplicate_key", key=", ".join(clashes)))
+            warning(self, tr("error.title"),
+                    tr("bind.duplicate_key", key=", ".join(clashes)))
             return
-        taken = config.reserved_conflicts(self._working, self.reserved)
+        reserved = {shortcut_identity(key) for key in self.reserved}
+        taken = sorted({binding.key for binding in self._working
+                        if binding.key and shortcut_identity(binding.key) in reserved})
         if taken:
-            QMessageBox.warning(self, tr("error.title"),
-                                tr("bind.reserved_key", key=", ".join(taken)))
+            warning(self, tr("error.title"),
+                    tr("bind.reserved_key", key=", ".join(taken)))
             return
         for binding in self._working:
             if binding.needs_folder() and binding.folder and not Path(binding.folder).expanduser().is_absolute():
-                QMessageBox.warning(self, tr("error.title"), tr("bind.target_folder"))
+                warning(self, tr("error.title"), tr("bind.target_folder"))
                 return
         self.accept()
 
@@ -418,6 +444,7 @@ class SettingsDialog(QDialog):
         buttons.addWidget(cancel)
         buttons.addWidget(save)
         layout.addLayout(buttons)
+        set_primary_button(self, save)
 
     # -- pages ---------------------------------------------------------
     @staticmethod
@@ -531,16 +558,27 @@ class SettingsDialog(QDialog):
             tr("settings.fastpath"), tr("settings.fastpath.desc"),
             self._switch("fast_path", self.settings.fast_path)))
         quota = self.settings.quota
+        self._quota_original = quota
         numbers = QWidget()
         row = QHBoxLayout(numbers)
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(10)
         row.addWidget(caption(tr("backup.keep_last")))
-        row.addWidget(self._spin("quota_ops", quota.max_operations, 0, 100000))
+        row.addWidget(self._spin("quota_ops", quota.max_operations, 0, 2_147_483_647))
         row.addWidget(caption(tr("backup.disk_cap")))
-        row.addWidget(self._spin("quota_gb", max(1, quota.max_bytes // 1024 ** 3), 1, 4096, " GB"))
+        quota_gb = QDoubleSpinBox()
+        quota_gb.setRange(0, 1_000_000_000)
+        quota_gb.setDecimals(3)
+        quota_gb.setSingleStep(0.25)
+        quota_gb.setSuffix(" GB")
+        quota_gb.setSpecialValueText(tr("unlimited"))
+        quota_gb.setValue(quota.max_bytes / 1024 ** 3)
+        self._controls["quota_gb"] = quota_gb
+        row.addWidget(quota_gb)
         row.addWidget(caption(tr("backup.keep_days")))
-        row.addWidget(self._spin("quota_days", quota.max_days, 0, 3650))
+        row.addWidget(self._spin("quota_days", quota.max_days, 0, 2_147_483_647))
+        self._quota_initial = (self._controls["quota_ops"].value(), quota_gb.value(),
+                               self._controls["quota_days"].value())
         card.add_row(SettingRow(tr("settings.quota"), tr("backup.policy_text"), None))
         card.body.addWidget(numbers)
         card.add_row(SettingRow(
@@ -603,12 +641,29 @@ class SettingsDialog(QDialog):
         filename, _ = QFileDialog.getSaveFileName(self, tr("settings.export_bundle"),
                                                   "qingjian-diagnostics.zip", "Zip (*.zip)")
         if filename:
-            self.engine.diagnostic_bundle(filename)
+            try:
+                self.engine.diagnostic_bundle(filename)
+            except (OSError, zipfile.LargeZipFile) as error:
+                log.warning("diagnostic bundle export failed: %s", error, exc_info=True)
+                warning(self, tr("error.title"), tr("settings.export_failed", error=error))
+            else:
+                information(self, tr("settings.export_bundle"),
+                            tr("settings.export_saved", path=filename))
 
     # -- saving --------------------------------------------------------
     def _save(self) -> None:
         get = self._controls.get
         settings = self.settings
+        rules = settings.sidecar
+        emptied = [key for key, old in (("sidecar_raw", rules.raw_extensions),
+                                        ("sidecar_meta", rules.metadata_extensions),
+                                        ("sidecar_live", rules.live_extensions))
+                   if old and get(key) is not None and not get(key).text().strip()]
+        if emptied and ask(self, tr("settings.sidecar.clear_title"),
+                           tr("settings.sidecar.clear_confirm"),
+                           default=QMessageBox.StandardButton.No) \
+                != QMessageBox.StandardButton.Yes:
+            return
         settings.language = get("language").value()
         settings.density = get("density").value()
         settings.restore_position = get("restore_position").isChecked()
@@ -622,19 +677,26 @@ class SettingsDialog(QDialog):
         settings.thumb_cache_mb = get("thumb_cache").value()
         settings.hash_cache = get("hash_cache").isChecked()
         settings.similar_threshold = float(get("similar_threshold").value())
-        settings.quota = QuotaPolicy(
-            max_operations=get("quota_ops").value(),
-            max_bytes=get("quota_gb").value() * 1024 ** 3,
-            max_days=get("quota_days").value(),
-            automatic=settings.quota.automatic)
+        quota_values = (get("quota_ops").value(), get("quota_gb").value(),
+                        get("quota_days").value())
+        if quota_values != self._quota_initial:
+            settings.quota = QuotaPolicy(
+                max_operations=quota_values[0],
+                max_bytes=round(quota_values[1] * 1024 ** 3),
+                max_days=quota_values[2],
+                automatic=settings.quota.automatic)
+        else:
+            settings.quota = self._quota_original
 
         def parse(key: str, fallback):
-            text = get(key).text() if get(key) is not None else ""
+            control = get(key)
+            if control is None:
+                return fallback
+            text = control.text()
             values = {("." + part.strip().lstrip(".")).lower()
                       for part in text.replace(",", " ").split() if part.strip(". ")}
-            return frozenset(values) if values else fallback
+            return frozenset(values)
 
-        rules = settings.sidecar
         settings.sidecar = SidecarRules(
             enabled=get("sidecar_enabled").isChecked(),
             prompt=get("sidecar_prompt").value(),
@@ -653,7 +715,7 @@ class SettingsDialog(QDialog):
             try:
                 platform_.set_folder_menu(menu.isChecked(), tr("app.open_with"), command)
             except OSError as error:
-                QMessageBox.warning(self, tr("error.title"), str(error))
+                warning(self, tr("error.title"), str(error))
         self.accept()
 
     def result_settings(self) -> config.Settings:

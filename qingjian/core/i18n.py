@@ -12,7 +12,6 @@ import locale
 import os
 import re
 import sys
-from typing import Callable, Iterable
 
 LANGUAGES: tuple[tuple[str, str], ...] = (("zh", "中文"), ("en", "English"))
 LANGUAGE_CODES = tuple(code for code, _ in LANGUAGES)
@@ -23,7 +22,6 @@ _PLACEHOLDER = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
 # key: (zh, en)
 CATALOG: dict[str, tuple[str, str]] = {
     # ---- app ----------------------------------------------------------
-    "app.name": ("轻拣", "Qingjian"),
     "app.tagline": ("图片与视频快速分类", "Fast photo and video sorting"),
     "app.subtitle": ("MEDIA SORTER", "MEDIA SORTER"),
     "app.open_with": ("用轻拣打开", "Open with Qingjian"),
@@ -32,20 +30,15 @@ CATALOG: dict[str, tuple[str, str]] = {
     "ok": ("确定", "OK"),
     "cancel": ("取消", "Cancel"),
     "close": ("关闭", "Close"),
-    "apply": ("应用", "Apply"),
     "save": ("保存", "Save"),
-    "delete": ("删除", "Delete"),
     "rename": ("重命名", "Rename"),
     "browse": ("浏览", "Browse"),
     "reset": ("恢复默认", "Reset to default"),
-    "add": ("添加", "Add"),
-    "remove": ("移除", "Remove"),
     "yes": ("是", "Yes"),
     "no": ("否", "No"),
     "select_all": ("全选", "Select all"),
     "invert_selection": ("反选", "Invert"),
     "clear_selection": ("取消选择", "Clear"),
-    "retry": ("重试", "Retry"),
     "skip": ("跳过", "Skip"),
     "unknown": ("未知", "Unknown"),
     "none": ("无", "None"),
@@ -53,19 +46,15 @@ CATALOG: dict[str, tuple[str, str]] = {
 
     # ---- header --------------------------------------------------------
     "header.choose_folder": ("选择文件夹", "Choose folder"),
-    "header.rescan": ("重新扫描", "Rescan"),
     "header.rescan_tip": ("重新扫描（F5）", "Rescan (F5)"),
-    "header.settings": ("设置", "Settings"),
     "header.no_folder": ("尚未选择待分类文件夹", "No folder chosen yet"),
     "header.item_count": ("{count} 项", "{count} items"),
 
     # ---- views ---------------------------------------------------------
     "view.single": ("单张", "Single"),
     "view.grid": ("网格", "Grid"),
-    "view.compare": ("对比", "Compare"),
 
     # ---- filters -------------------------------------------------------
-    "filter.label": ("筛选", "Filter"),
     "filter.all": ("全部媒体", "All media"),
     "filter.images": ("仅图片", "Images only"),
     "filter.videos": ("仅视频", "Videos only"),
@@ -90,12 +79,8 @@ CATALOG: dict[str, tuple[str, str]] = {
 
     "scan.recursive": ("包含子文件夹", "Include subfolders"),
     "scan.scanning": ("正在扫描媒体文件…", "Scanning media…"),
-    "scan.scanned_n": ("已扫描 {count} 项", "{count} scanned"),
     "scan.complete": ("扫描完成：{count} 项", "Scan complete: {count} items"),
-    "scan.cancelled": ("扫描已取消", "Scan cancelled"),
-    "scan.failed": ("扫描失败：{error}", "Scan failed: {error}"),
     "scan.filtering": ("正在筛选…", "Filtering…"),
-    "scan.filter_cancelled": ("筛选已取消", "Filter cancelled"),
     "scan.no_media": ("当前筛选下没有待分类媒体", "Nothing to sort under this filter"),
     "scan.review_empty": ("待复查队列为空", "The review queue is empty"),
     "scan.hint_adjust": (
@@ -146,7 +131,6 @@ CATALOG: dict[str, tuple[str, str]] = {
     "side.review_exit": ("退出待复查（{count}）", "Leave review queue ({count})"),
     "side.undo": ("撤销", "Undo"),
     "side.redo": ("恢复上一步", "Redo"),
-    "side.undo_batch": ("撤销这一批", "Undo this batch"),
     "side.rating": ("评分", "Rating"),
     "side.colour_label": ("色标", "Label"),
     "side.keyhint": (
@@ -194,10 +178,8 @@ CATALOG: dict[str, tuple[str, str]] = {
     ),
     "status.session_progress": ("本次已处理 {done} / {total}", "{done} / {total} handled"),
     "status.snapshot_usage": ("快照 {used} / {cap}", "Snapshots {used} / {cap}"),
-    "status.snapshot_manage": ("管理", "Manage"),
     "status.queue_pending": ("队列中 {count} 项", "{count} queued"),
     "status.queue_failed": ("{count} 项失败，已放回队列", "{count} failed and were put back"),
-    "status.thumbs_cached": ("缩略图已缓存 {count} 项", "{count} thumbnails cached"),
     "status.enter_review": ("正在处理待复查队列", "Working through the review queue"),
     "status.leave_review": ("已返回普通分类队列", "Back to the normal queue"),
     "status.revealed": ("已在文件管理器中定位", "Revealed in the file manager"),
@@ -237,10 +219,6 @@ CATALOG: dict[str, tuple[str, str]] = {
     ),
     "error.busy": ("请等待当前操作完成", "Wait for the current operation to finish"),
     "error.pending_first": ("请先恢复未完成操作", "Finish the pending operation first"),
-    "error.pending_blocked": (
-        "存在未完成操作，请先恢复后再继续",
-        "A pending operation must be finished before anything else runs",
-    ),
     "error.pending_block_write": (
         "存在待恢复操作，已阻止新的文件修改",
         "A pending operation is blocking new file changes",
@@ -248,10 +226,6 @@ CATALOG: dict[str, tuple[str, str]] = {
     "error.external_change": (
         "文件已被外部修改，操作已停止：{path}",
         "Stopped: this file was changed outside the app: {path}",
-    ),
-    "error.recover_blocked": (
-        "恢复被阻止：文件被外部修改，请保留当前文件：{path}",
-        "Recovery blocked: the file was changed outside the app — keep it as it is: {path}",
     ),
     "error.snapshot_missing": (
         "恢复副本缺失或损坏：{path}",
@@ -335,14 +309,9 @@ CATALOG: dict[str, tuple[str, str]] = {
         "以后不再询问，始终联动同名文件",
         "Don’t ask again — always move files that share a name",
     ),
-    "sidecar.edit_rules": ("在设置中调整规则", "Edit the rules in Settings"),
     "sidecar.move_all": ("一起移动 {count} 个文件", "Move all {count} files"),
     "sidecar.master_only": ("仅移动主文件", "Move master only"),
     "sidecar.badge": ("{count} 个伴随文件", "{count} sidecars"),
-    "sidecar.selection_note": (
-        "选中项含 {count} 个伴随文件，将一并移动",
-        "The selection carries {count} sidecars — they move too",
-    ),
 
     # ---- duplicates ----------------------------------------------------
     "dup.title": ("重复与相似", "Duplicates & near-matches"),
@@ -370,7 +339,6 @@ CATALOG: dict[str, tuple[str, str]] = {
     "dup.mark.keep_sharp": ("推荐保留 · 最清晰", "Keep · sharpest"),
     "dup.mark.extra": ("多余", "Extra"),
     "dup.mark.lower_res": ("低分辨率", "Lower res"),
-    "dup.mark.softer": ("略糊", "Softer"),
     "dup.defect.blurry": ("模糊", "Blurry"),
     "dup.defect.overexposed": ("过曝", "Overexposed"),
     "dup.defect.black": ("黑屏", "Black frame"),
@@ -382,7 +350,6 @@ CATALOG: dict[str, tuple[str, str]] = {
     "dup.searching": ("查找重复内容", "Looking for duplicates"),
     "dup.hashing": ("校验 {name}", "Hashing {name}"),
     "dup.cancelled": ("已取消查重", "Duplicate scan cancelled"),
-    "dup.scanning": ("正在扫描 {done}/{total}", "Scanning {done}/{total}"),
     "dup.stop": ("停止", "Stop"),
     "dup.rescan": ("重新扫描", "Rescan"),
     "dup.scan_failed": ("扫描失败：{error}", "Scan failed: {error}"),
@@ -398,25 +365,10 @@ CATALOG: dict[str, tuple[str, str]] = {
         "Ignoring only writes to this folder’s ignore list — it survives restarts and never moves "
         "or deletes a file. A file re-enters matching once its content changes.",
     ),
-    "dup.burst_found": (
-        "发现 {groups} 组连拍（共 {frames} 张），推荐按清晰度保留每组最佳",
-        "{groups} bursts found ({frames} frames) — keep the sharpest of each",
-    ),
-    "dup.burst_badge": ("连拍 {count} 张", "Burst · {count}"),
-    "dup.pick": ("推荐", "Pick"),
-    "dup.auto_pick": ("自动选出最佳", "Auto-pick best"),
-    "dup.rest_to_review": ("其余加入待复查", "Rest to review"),
 
     # ---- grid ----------------------------------------------------------
-    "grid.thumb_size": ("缩略图大小", "Thumbnail size"),
     "grid.show_filename": ("文件名", "Filename"),
-    "grid.show_rating": ("评分与色标", "Rating & label"),
-    "grid.group_bursts": ("连拍成组", "Group bursts"),
     "grid.selected": ("{count} 项已选中", "{count} selected"),
-    "grid.bulk_hint": ("按 1–0 批量分类", "Press 1–0 to sort in bulk"),
-    "grid.bulk_rate": ("评分", "Rate"),
-    "grid.bulk_label": ("色标", "Label"),
-    "grid.bulk_review": ("待复查", "Review later"),
 
     # ---- info ----------------------------------------------------------
     "info.title": ("媒体信息", "Media info"),
@@ -438,7 +390,6 @@ CATALOG: dict[str, tuple[str, str]] = {
     "info.aperture": ("光圈", "Aperture"),
     "info.shutter": ("快门", "Shutter"),
     "info.focal": ("焦距", "Focal length"),
-    "info.sharpness": ("清晰度", "Sharpness"),
     "info.sidecars": ("伴随文件", "Sidecars"),
     "info.rating": ("评分", "Rating"),
     "info.label": ("色标", "Label"),
@@ -454,12 +405,6 @@ CATALOG: dict[str, tuple[str, str]] = {
     "history.state.done": ("已执行", "Applied"),
     "history.state.undone": ("已撤销，可重做", "Undone — can be redone"),
     "history.undo_last": ("撤销最后操作", "Undo the last operation"),
-    "history.legacy": ("查看旧版记录", "Show legacy records"),
-    "history.legacy_title": (
-        "旧版记录（只读；旧备份保留，未自动转换为新事务）",
-        "Legacy records (read-only; old backups kept, not converted to new transactions)",
-    ),
-    "history.legacy_backup": ("旧备份位置", "Legacy backup location"),
 
     "stats.title": ("本次统计（已扣除撤销）", "This session (undos deducted)"),
     "stats.item": ("项目", "Item"),
@@ -478,8 +423,6 @@ CATALOG: dict[str, tuple[str, str]] = {
     # ---- backups -------------------------------------------------------
     "backup.title": ("备份管理", "Backup management"),
     "backup.usage": ("恢复副本占用", "Restore copies use"),
-    "backup.location": ("目录", "Location"),
-    "backup.policy": ("保留策略", "Retention"),
     "backup.policy_text": (
         "超出任一上限时，最旧的记录会被标为不可撤销并回收其恢复副本",
         "Past any limit, the oldest records become non-undoable and their restore copies are reclaimed",
@@ -512,13 +455,10 @@ CATALOG: dict[str, tuple[str, str]] = {
         "全部设置随方案保存，可导出为便携配置",
         "Every setting is saved with the preset and can be exported as a portable config",
     ),
-    "settings.import_export": ("导入 / 导出配置", "Import / export config"),
     "settings.nav.general": ("通用", "General"),
     "settings.nav.sidecar": ("伴随文件", "Sidecar files"),
-    "settings.nav.rules": ("分类规则", "Sorting rules"),
     "settings.nav.safety": ("安全与备份", "Safety & backups"),
     "settings.nav.performance": ("性能", "Performance"),
-    "settings.nav.shortcuts": ("快捷键", "Shortcuts"),
     "settings.nav.about": ("关于", "About"),
 
     "settings.language": ("界面语言", "Interface language"),
@@ -590,10 +530,6 @@ CATALOG: dict[str, tuple[str, str]] = {
         "Windows recycle bin: restore it from the bin; Ctrl+Z cannot undo it",
     ),
     "settings.recycle.system": ("Windows 回收站", "Windows recycle bin"),
-    "settings.recycle.system.desc": (
-        "从系统回收站手动还原，Ctrl+Z 不能撤销",
-        "Restore it from the recycle bin; Ctrl+Z cannot undo it",
-    ),
     "settings.folder_menu": ("资源管理器右键菜单", "Explorer folder menu"),
     "settings.folder_menu.desc": (
         "在文件夹上右键即可“用轻拣打开”；轻拣已经开着时会直接切到那个文件夹。只写当前用户的注册表，不需要管理员权限",
@@ -628,8 +564,6 @@ CATALOG: dict[str, tuple[str, str]] = {
         "按路径 + 大小 + 修改时间缓存 SHA-256，重复查重不再整盘重算",
         "Keys SHA-256 by path + size + mtime, so a re-scan does not re-read the disk",
     ),
-    "settings.version": ("版本", "Version"),
-    "settings.up_to_date": ("已是最新", "Up to date"),
 
     # ---- templates -----------------------------------------------------
     "tpl.title": ("目标路径与命名模板", "Target path & naming template"),
@@ -640,16 +574,10 @@ CATALOG: dict[str, tuple[str, str]] = {
     "tpl.path": ("目标路径模板", "Target path template"),
     "tpl.name": ("文件命名模板", "Filename template"),
     "tpl.seq_start": ("序号起始", "Start at"),
-    "tpl.seq_digits": ("位数", "Digits"),
-    "tpl.on_clash": ("同名冲突", "On name clash"),
-    "tpl.date_fallback": ("日期缺失时回退到修改时间", "Fall back to mtime when no date"),
     "tpl.preview": ("实时预览", "Live preview"),
-    "tpl.preview_note": ("取自当前队列的前 {count} 项", "First {count} items of the current queue"),
     "tpl.valid": ("模板有效 · 无非法字符", "Template valid · no illegal characters"),
     "tpl.invalid": ("模板无效：{error}", "Template invalid: {error}"),
-    "tpl.badge.sidecar": ("伴随联动", "Sidecar"),
     "tpl.badge.fallback": ("回退", "Fallback"),
-    "tpl.badge.sequenced": ("加序号", "Sequenced"),
     "tpl.apply_to_preset": ("应用到方案", "Apply to preset"),
     "tpl.unknown_token": ("未知占位符 {token}", "Unknown placeholder {token}"),
     "tpl.unbalanced": ("花括号不匹配", "Unbalanced braces"),
@@ -673,13 +601,7 @@ CATALOG: dict[str, tuple[str, str]] = {
     "bind.edit_template": ("编辑模板", "Edit template"),
 
     # ---- queue ----------------------------------------------------------
-    "queue.title": ("后台队列", "Background queue"),
-    "queue.pending": ("等待中", "Pending"),
-    "queue.running": ("执行中", "Running"),
-    "queue.failed": ("失败", "Failed"),
-    "queue.retry_all": ("全部重试", "Retry all"),
     "queue.drain": ("等待队列完成…", "Waiting for the queue to drain…"),
-    "queue.item_failed": ("{name} 未完成：{error}", "{name} did not complete: {error}"),
 }
 
 
@@ -693,7 +615,6 @@ class Translator:
     def __init__(self, language: str = DEFAULT_LANGUAGE, catalog: dict | None = None) -> None:
         self._catalog = catalog if catalog is not None else CATALOG
         self._index = 0
-        self._listeners: list[Callable[[str], None]] = []
         self.missing: set[str] = set()
         self.set_language(language)
 
@@ -705,8 +626,6 @@ class Translator:
     def set_language(self, language: str) -> str:
         code = self.resolve(language)
         self._index = LANGUAGE_CODES.index(code)
-        for listener in list(self._listeners):
-            listener(code)
         return code
 
     @staticmethod
@@ -742,10 +661,6 @@ class Translator:
         # A specific but unsupported tag: fall back to English rather than Chinese.
         return "en" if not value.startswith("zh") else "zh"
 
-    def on_change(self, listener: Callable[[str], None]) -> Callable[[], None]:
-        self._listeners.append(listener)
-        return lambda: self._listeners.remove(listener) if listener in self._listeners else None
-
     # -- lookup --------------------------------------------------------
     def tr(self, key: str, /, **fields: object) -> str:
         entry = self._catalog.get(key)
@@ -763,11 +678,6 @@ class Translator:
             self.missing.add(key + " (format)")
             return text
 
-    def has(self, key: str) -> bool:
-        return key in self._catalog
-
-    def keys(self) -> Iterable[str]:
-        return self._catalog.keys()
 
 
 _translator = Translator(DEFAULT_LANGUAGE)
@@ -783,10 +693,6 @@ def set_language(language: str) -> str:
 
 def get_language() -> str:
     return _translator.language
-
-
-def on_language_change(listener: Callable[[str], None]) -> Callable[[], None]:
-    return _translator.on_change(listener)
 
 
 def tr(key: str, /, **fields: object) -> str:

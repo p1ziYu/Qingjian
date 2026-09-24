@@ -6,6 +6,8 @@ read, and never do any of it on the thread that paints the window.
 """
 from __future__ import annotations
 
+import importlib.util
+
 import ast
 import hashlib
 import os
@@ -195,6 +197,34 @@ class CachePressureTests(TempCase):
         fresh._db.set_trace_callback(None)
         self.assertEqual(statements, [], "a preloaded row still hit the database")
 
+    def test_duplicate_scans_reuse_each_files_stat_key(self):
+        paths = [self.write(self.tmp / f"same{i}.jpg", b"x" * 100_000) for i in range(2)]
+        cache = HashCache(self.tmp / "keys.db")
+        self.addCleanup(cache.close)
+        real_stat = Path.stat
+        counts = defaultdict(int)
+
+        def counted(path, *args, **kwargs):
+            counts[str(path)] += 1
+            return real_stat(path, *args, **kwargs)
+
+        info = SimpleNamespace(size=100_000, width=100, height=100,
+                               timestamp=lambda: 0.0)
+        with patch.object(Path, "stat", counted), \
+             patch.object(dedupe.metadata, "read", return_value=info), \
+             patch.object(dedupe.imaging, "phash", return_value=123), \
+             patch.object(dedupe.imaging, "quality_score",
+                          return_value={"sharpness": 1.0, "blown": 0.0, "crushed": 0.0}):
+            self.assertEqual(1, len(dedupe.find_exact(paths, cache)))
+            exact_counts = dict(counts)
+            counts.clear()
+            self.assertEqual(1, len(dedupe.find_similar(paths, 0.92, cache=cache)))
+            similar_counts = dict(counts)
+        # Exact hashing still checks regular-file identity and reads the sample;
+        # the cache itself must add no seventh/eighth stat for get + put.
+        self.assertTrue(all(exact_counts[str(path)] == 6 for path in paths), exact_counts)
+        self.assertTrue(all(similar_counts[str(path)] == 1 for path in paths), similar_counts)
+
 
 class CancellationTests(TempCase):
     """A scan the user stopped must stop."""
@@ -215,59 +245,7 @@ class CancellationTests(TempCase):
             dedupe.find_exact(paths + paths, progress=progress, cancel=stop.is_set)
 
 
-class ScanThreadingTests(unittest.TestCase):
-    """The window must stay alive while the scan runs."""
 
-    @staticmethod
-    def _method(path: Path, klass: str, method: str):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ClassDef) and node.name == klass:
-                for item in node.body:
-                    if isinstance(item, ast.FunctionDef) and item.name == method:
-                        return item
-        raise AssertionError(f"{klass}.{method} not found in {path.name}")
-
-    def test_the_dialog_never_scans_on_the_interface_thread(self):
-        """`find_duplicates` may only be reached from the worker task."""
-        source = PACKAGE / "ui" / "duplicates.py"
-        tree = ast.parse(source.read_text(encoding="utf-8"))
-        callers = set()
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.ClassDef):
-                continue
-            for item in node.body:
-                if not isinstance(item, ast.FunctionDef):
-                    continue
-                for call in ast.walk(item):
-                    if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) \
-                            and call.func.attr == "find_duplicates":
-                        callers.add(f"{node.name}.{item.name}")
-        self.assertEqual(callers, {"_ScanTask.run"},
-                         f"the scan is also started from {sorted(callers)}")
-
-    def test_the_scan_is_given_a_way_to_stop(self):
-        body = ast.dump(self._method(PACKAGE / "ui" / "duplicates.py", "_ScanTask", "run"))
-        self.assertIn("is_set", body, "the worker ignores the stop flag")
-
-    def test_the_table_is_not_measured_cell_by_cell(self):
-        """resizeColumnsToContents walks every cell of every row."""
-        text = (PACKAGE / "ui" / "duplicates.py").read_text(encoding="utf-8")
-        self.assertNotIn("resizeColumnsToContents", text)
-
-    def test_the_table_is_filled_in_chunks(self):
-        body = ast.dump(self._method(PACKAGE / "ui" / "duplicates.py",
-                                     "DuplicatesDialog", "_fill"))
-        self.assertIn("_fill_timer", body, "the whole table is built in one go")
-
-    def test_switching_tabs_reuses_what_was_already_found(self):
-        body = ast.dump(self._method(PACKAGE / "ui" / "duplicates.py",
-                                     "DuplicatesDialog", "reload"))
-        self.assertIn("_results", body, "every tab switch rescans the library")
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class ScanLifetimeTests(unittest.TestCase):
@@ -350,7 +328,6 @@ class IgnoreListTests(TempCase):
         self.assertEqual(dedupe.find_similar(paths, cache=cache, ignored=stored), [])
 
     def test_bursts_honour_the_ignore_list(self):
-        import shutil
         from datetime import datetime, timedelta
 
         import numpy as np
@@ -372,7 +349,6 @@ class IgnoreListTests(TempCase):
             Image.fromarray(frame.astype("uint8")).resize(
                 (1000, 750), Image.BILINEAR).save(path, quality=85, exif=exif)
             paths.append(path)
-        self.assertTrue(shutil.which is not None)
 
         found = dedupe.find_bursts(paths, minimum=3)
         self.assertTrue(found, "no burst was detected to ignore")
@@ -543,3 +519,205 @@ class G10RestoreButtonTests(unittest.TestCase):
         app.processEvents()
         self.assertTrue(dialog.restore.isEnabled())
         dialog.done(0)
+
+
+@unittest.skipUnless(importlib.util.find_spec("PySide6") is not None,
+                     "PySide6 is not installed")
+class RuntimeScanContractTests(unittest.TestCase):
+    """Observable Qt coverage paired with the source-only fallback below."""
+
+    def test_scan_runs_off_thread_reuses_results_and_fills_in_chunks(self):
+        from PySide6.QtTest import QTest
+        from PySide6.QtWidgets import QApplication, QHeaderView
+        from qingjian.ui.duplicates import DuplicatesDialog, _CHUNK
+
+        app = QApplication.instance() or QApplication([])
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+        candidates = [dedupe.Candidate(Path(f"photo-{index}.jpg"), size=10000)
+                      for index in range(_CHUNK * 2 + 17)]
+        group = dedupe.Group(dedupe.MODE_EXACT, candidates)
+
+        class State:
+            @staticmethod
+            def ignored_keys(_root):
+                return set()
+
+        class Engine:
+            source_root = None
+            state = State()
+
+            @staticmethod
+            def find_duplicates(mode, _progress, cancel):
+                calls.append((mode, threading.get_ident(), cancel))
+                entered.set()
+                if not release.wait(5):
+                    raise TimeoutError("scan gate timed out")
+                return [group]
+
+        main_thread = threading.get_ident()
+        dialog = DuplicatesDialog(Engine())
+        try:
+            self.assertTrue(entered.wait(2), "worker scan never started")
+            self.assertEqual("exact", calls[0][0])
+            self.assertNotEqual(main_thread, calls[0][1])
+            self.assertTrue(callable(calls[0][2]))
+            self.assertFalse(calls[0][2]())
+            dialog.summary.setText("interface still responsive")
+            self.assertEqual("interface still responsive", dialog.summary.text())
+            release.set()
+            deadline = time.monotonic() + 5
+            while dedupe.MODE_EXACT not in dialog._results and time.monotonic() < deadline:
+                QTest.qWait(10)
+            self.assertIn(dedupe.MODE_EXACT, dialog._results)
+            self.assertEqual(1, len(calls))
+
+            # Cached reload performs no second scan. Stop the zero-delay timer
+            # so each explicit call below represents exactly one UI tick.
+            dialog.reload()
+            dialog._fill_timer.stop()
+            self.assertEqual(1, len(calls))
+            self.assertEqual(0, dialog.table.rowCount())
+            self.assertEqual(QHeaderView.ResizeMode.Interactive,
+                             dialog.table.horizontalHeader().sectionResizeMode(0))
+            dialog._fill_chunk()
+            self.assertEqual(_CHUNK, dialog.table.rowCount())
+            dialog._fill_chunk()
+            self.assertEqual(_CHUNK * 2, dialog.table.rowCount())
+            dialog._fill_chunk()
+            self.assertEqual(len(candidates), dialog.table.rowCount())
+        finally:
+            release.set()
+            dialog.done(0)
+            dialog._pool.waitForDone(5000)
+            dialog.deleteLater()
+            app.processEvents()
+
+    def test_cached_reload_does_not_start_a_second_worker(self):
+        from PySide6.QtTest import QTest
+        from PySide6.QtWidgets import QApplication
+        from qingjian.ui.duplicates import DuplicatesDialog
+        app = QApplication.instance() or QApplication([])
+        calls = []
+
+        class State:
+            ignored_keys = staticmethod(lambda _root: set())
+
+        class Engine:
+            source_root = None
+            state = State()
+
+            @staticmethod
+            def find_duplicates(mode, _progress, _cancel):
+                calls.append(mode)
+                return []
+
+        dialog = DuplicatesDialog(Engine())
+        try:
+            deadline = time.monotonic() + 3
+            while dedupe.MODE_EXACT not in dialog._results and time.monotonic() < deadline:
+                QTest.qWait(10)
+            self.assertEqual([dedupe.MODE_EXACT], calls)
+            dialog.reload()
+            app.processEvents()
+            self.assertEqual([dedupe.MODE_EXACT], calls)
+        finally:
+            dialog.done(0)
+            dialog._pool.waitForDone(3000)
+
+    def test_each_fill_tick_writes_at_most_one_chunk(self):
+        from PySide6.QtTest import QTest
+        from PySide6.QtWidgets import QApplication
+        from qingjian.ui.duplicates import DuplicatesDialog, _CHUNK
+        app = QApplication.instance() or QApplication([])
+
+        class State:
+            ignored_keys = staticmethod(lambda _root: set())
+
+        class Engine:
+            source_root = None
+            state = State()
+            find_duplicates = staticmethod(lambda *_args: [])
+
+        dialog = DuplicatesDialog(Engine())
+        try:
+            deadline = time.monotonic() + 3
+            while dedupe.MODE_EXACT not in dialog._results and time.monotonic() < deadline:
+                QTest.qWait(10)
+            members = [dedupe.Candidate(Path(f"p-{index}.jpg"), size=10000)
+                       for index in range(_CHUNK + 1)]
+            dialog._results[dedupe.MODE_EXACT] = [
+                dedupe.Group(dedupe.MODE_EXACT, members)]
+            dialog.reload()
+            dialog._fill_timer.stop()
+            self.assertEqual(0, dialog.table.rowCount())
+            dialog._fill_chunk()
+            self.assertEqual(_CHUNK, dialog.table.rowCount())
+            dialog._fill_chunk()
+            self.assertEqual(_CHUNK + 1, dialog.table.rowCount())
+        finally:
+            dialog.done(0)
+            dialog._pool.waitForDone(3000)
+            app.processEvents()
+
+
+@unittest.skipIf(importlib.util.find_spec("PySide6") is not None,
+                 "runtime Qt tests cover this contract")
+class ScanThreadingTests(unittest.TestCase):
+    """The window must stay alive while the scan runs."""
+
+    @staticmethod
+    def _method(path: Path, klass: str, method: str):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == klass:
+                for item in node.body:
+                    if isinstance(item, ast.FunctionDef) and item.name == method:
+                        return item
+        raise AssertionError(f"{klass}.{method} not found in {path.name}")
+
+    def test_the_dialog_never_scans_on_the_interface_thread(self):
+        """`find_duplicates` may only be reached from the worker task."""
+        source = PACKAGE / "ui" / "duplicates.py"
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        callers = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            for item in node.body:
+                if not isinstance(item, ast.FunctionDef):
+                    continue
+                for call in ast.walk(item):
+                    if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) \
+                            and call.func.attr == "find_duplicates":
+                        callers.add(f"{node.name}.{item.name}")
+        self.assertEqual(callers, {"_ScanTask.run"},
+                         f"the scan is also started from {sorted(callers)}")
+
+    def test_the_scan_is_given_a_way_to_stop(self):
+        body = ast.dump(self._method(PACKAGE / "ui" / "duplicates.py", "_ScanTask", "run"))
+        self.assertIn("is_set", body, "the worker ignores the stop flag")
+
+    def test_the_table_is_not_measured_cell_by_cell(self):
+        """resizeColumnsToContents walks every cell of every row."""
+        text = (PACKAGE / "ui" / "duplicates.py").read_text(encoding="utf-8")
+        self.assertNotIn("resizeColumnsToContents", text)
+
+    def test_the_table_is_filled_in_chunks(self):
+        body = ast.dump(self._method(PACKAGE / "ui" / "duplicates.py",
+                                     "DuplicatesDialog", "_fill"))
+        self.assertIn("_fill_timer", body, "the whole table is built in one go")
+
+    def test_switching_tabs_reuses_what_was_already_found(self):
+        body = ast.dump(self._method(PACKAGE / "ui" / "duplicates.py",
+                                     "DuplicatesDialog", "reload"))
+        self.assertIn("_results", body, "every tab switch rescans the library")
+
+
+if importlib.util.find_spec("PySide6") is not None:
+    del ScanThreadingTests
+
+
+if __name__ == "__main__":
+    unittest.main()

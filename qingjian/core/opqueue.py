@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from .logsetup import get_logger
+from .safestore import Cancelled
 
 log = get_logger("queue")
 
@@ -69,7 +70,8 @@ class OperationQueue:
         self._queue.put(None)
         if self._thread:
             self._thread.join(timeout)
-            self._thread = None
+            if not self._thread.is_alive():
+                self._thread = None
 
     # -- submission ----------------------------------------------------
     def submit(self, job: Job) -> Job:
@@ -120,7 +122,9 @@ class OperationQueue:
         while not self._stop.is_set():
             job = self._queue.get()
             if job is None:
-                break
+                if self._stop.is_set():
+                    break
+                continue
             self._cancel_current.clear()
             with self._lock:
                 self._current = job
@@ -156,4 +160,4 @@ class OperationQueue:
 
 
 def _is_cancel(error: BaseException) -> bool:
-    return type(error).__name__ == "Cancelled"
+    return isinstance(error, Cancelled)

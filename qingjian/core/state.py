@@ -244,7 +244,10 @@ class StateStore:
                     "ON CONFLICT(path) DO UPDATE SET rating=excluded.rating, "
                     "label=excluded.label, updated=excluded.updated",
                     [(p, int(r), str(lbl or ""), now) for p, r, lbl in tags])
-            cursor.execute("DELETE FROM tags WHERE rating=0 AND label=''")
+                empty_paths = [(p,) for p, r, lbl in tags if int(r) == 0 and not lbl]
+                if empty_paths:
+                    cursor.executemany(
+                        "DELETE FROM tags WHERE path=? AND rating=0 AND label=''", empty_paths)
         if orphan_refs:
             with self._lock:
                 self._orphans.extend(orphan_refs)
@@ -448,7 +451,7 @@ class StateStore:
         return out
 
     def rename_tag(self, old: str, new: str) -> None:
-        """Follow a file so its rating survives a move or rename."""
+        """Follow a file so its rating survives a rename."""
         with self._lock, self._db:
             self._db.execute("UPDATE OR REPLACE tags SET path=? WHERE path=?", (str(new), str(old)))
 

@@ -1,6 +1,5 @@
 import os
 import sys
-import time
 from unittest import mock
 from pathlib import Path
 
@@ -110,20 +109,39 @@ class StateTests(TempCase):
         self.state.apply({"tags_set": [["/a/1.jpg", 0, ""]]})
         self.assertEqual(0, self.state.counts()["tags"])
 
+    def test_apply_without_tags_does_not_scan_or_delete_tags(self):
+        statements = []
+        self.state._db.set_trace_callback(statements.append)
+        self.state.apply({"done_add": ["/a/1.jpg"]})
+        self.state._db.set_trace_callback(None)
+        self.assertFalse(any("DELETE FROM tags" in sql for sql in statements), statements)
+
+    def test_clearing_tags_only_deletes_paths_in_the_delta(self):
+        with self.state._db:
+            self.state._db.execute(
+                "INSERT INTO tags(path,rating,label,updated) VALUES('/old',0,'',0)")
+        self.state.apply({"tags_set": [["/clear", 0, ""], ["/keep", 2, "red"]]})
+        rows = self.state._db.execute("SELECT path FROM tags ORDER BY path").fetchall()
+        self.assertEqual([("/keep",), ("/old",)], rows)
+
     def test_tags_for_handles_more_paths_than_sqlite_allows_variables(self):
         paths = [f"/a/{i}.jpg" for i in range(1200)]
         self.state.apply({"tags_set": [[p, 1, ""] for p in paths]})
         self.assertEqual(1200, len(self.state.tags_for(paths)))
 
-    def test_insertion_cost_does_not_grow_with_history(self):
+    def test_insertion_uses_constant_sql_with_large_history(self):
         bulk = {"records_add": [Record(id=f"x{i}", action="move",
                                        original=f"/a/{i}.jpg").to_dict()
                                 for i in range(3000)]}
         self.state.apply(bulk)
-        start = time.perf_counter()
+        statements = []
+        self.state._db.set_trace_callback(statements.append)
         self.state.apply({"records_add": [Record(id="last", action="move",
                                                  original="/a/z.jpg").to_dict()]})
-        self.assertLess(time.perf_counter() - start, 0.25)
+        self.state._db.set_trace_callback(None)
+        dml = [sql for sql in statements if sql.lstrip().upper().startswith(
+            ("SELECT", "INSERT", "UPDATE", "DELETE"))]
+        self.assertEqual(2, len(dml), dml)
         self.assertEqual(3001, self.state.counts()["history"])
 
     def test_the_ignore_list_is_per_source_folder(self):

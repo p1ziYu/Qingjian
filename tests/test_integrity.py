@@ -6,6 +6,8 @@ raced undo on the interface thread over a single journal file.
 """
 from __future__ import annotations
 
+import importlib.util
+
 import ast
 import hashlib
 import json
@@ -78,12 +80,6 @@ class G11UndoStateTests(TempCase):
         self.assertEqual((4, 1), engine.reclaim(force=True))
         self.assertFalse(snapshot.exists())
 
-    def test_classify_index_routes_skip_binding_through_skip_current(self):
-        source = (PACKAGE / "ui" / "mainwindow.py").read_text(encoding="utf-8")
-        method = source[source.index("    def classify_index("):
-                        source.index("    def _take_off(")]
-        self.assertIn('if binding.action == "skip":', method)
-        self.assertIn("self.skip_current()", method)
 
 
 class TagWithoutQueueLockTests(TempCase):
@@ -714,50 +710,7 @@ class AtomicWriteTests(TempCase):
         self.assertEqual(leftovers, [])
 
 
-class TransitionCostTests(unittest.TestCase):
-    """Undo must not pay the price of opening the folder again."""
 
-    @staticmethod
-    def _method(path: Path, klass: str, method: str):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ClassDef) and node.name == klass:
-                for item in node.body:
-                    if isinstance(item, ast.FunctionDef) and item.name == method:
-                        return item
-        raise AssertionError(f"{klass}.{method} not found in {path.name}")
-
-    @staticmethod
-    def _calls(node: ast.AST) -> set[str]:
-        names = set()
-        for child in ast.walk(node):
-            if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute):
-                owner = child.func.value
-                if isinstance(owner, ast.Attribute) and isinstance(owner.value, ast.Name) \
-                        and owner.value.id == "self":
-                    names.add(f"{owner.attr}.{child.func.attr}")
-        return names
-
-    def test_undo_and_redo_do_not_walk_the_folder(self):
-        """`rescan` re-lists every file and drops every parsed header."""
-        source = PACKAGE / "ui" / "mainwindow.py"
-        calls = self._calls(self._method(source, "MainWindow", "_transition"))
-        self.assertNotIn("engine.rescan", calls,
-                         "undo re-scans the whole source folder")
-        self.assertIn("engine.absorb", calls,
-                      "undo no longer patches the lists from the record")
-
-    def test_undo_waits_for_queued_sorting(self):
-        tree = ast.parse((PACKAGE / "ui" / "mainwindow.py").read_text(encoding="utf-8"))
-        body = ast.dump(self._method(PACKAGE / "ui" / "mainwindow.py",
-                                     "MainWindow", "_transition"))
-        self.assertIn("_drain_queue", body,
-                      "undo can start while a queued move is still running")
-        self.assertTrue(tree)
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class AbsorbTests(TempCase):
@@ -1019,3 +972,65 @@ class ReentrancyGuardTests(unittest.TestCase):
                 window = "\n".join(text.splitlines()[line - 1:line + 2])
                 self.assertNotIn("self._decorations([path])", window,
                                  f"line {line} passes a one-file decoration map")
+
+
+@unittest.skipIf(importlib.util.find_spec("PySide6") is not None,
+                 "runtime Qt tests cover this contract")
+class TransitionCostTests(unittest.TestCase):
+    """Undo must not pay the price of opening the folder again."""
+
+    @staticmethod
+    def _method(path: Path, klass: str, method: str):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == klass:
+                for item in node.body:
+                    if isinstance(item, ast.FunctionDef) and item.name == method:
+                        return item
+        raise AssertionError(f"{klass}.{method} not found in {path.name}")
+
+    @staticmethod
+    def _calls(node: ast.AST) -> set[str]:
+        names = set()
+        for child in ast.walk(node):
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute):
+                owner = child.func.value
+                if isinstance(owner, ast.Attribute) and isinstance(owner.value, ast.Name) \
+                        and owner.value.id == "self":
+                    names.add(f"{owner.attr}.{child.func.attr}")
+        return names
+
+    def test_undo_and_redo_do_not_walk_the_folder(self):
+        """`rescan` re-lists every file and drops every parsed header."""
+        source = PACKAGE / "ui" / "mainwindow.py"
+        calls = self._calls(self._method(source, "MainWindow", "_transition"))
+        self.assertNotIn("engine.rescan", calls,
+                         "undo re-scans the whole source folder")
+        self.assertIn("engine.absorb", calls,
+                      "undo no longer patches the lists from the record")
+
+    def test_undo_waits_for_queued_sorting(self):
+        tree = ast.parse((PACKAGE / "ui" / "mainwindow.py").read_text(encoding="utf-8"))
+        body = ast.dump(self._method(PACKAGE / "ui" / "mainwindow.py",
+                                     "MainWindow", "_transition"))
+        self.assertIn("_drain_queue", body,
+                      "undo can start while a queued move is still running")
+        self.assertTrue(tree)
+
+@unittest.skipIf(importlib.util.find_spec("PySide6") is not None,
+                 "runtime Qt tests cover this contract")
+class NoQtBehaviorFallbackTests(unittest.TestCase):
+    def test_classify_index_routes_skip_binding_through_skip_current(self):
+        source = (PACKAGE / "ui" / "mainwindow.py").read_text(encoding="utf-8")
+        method = source[source.index("    def classify_index("):
+                        source.index("    def _take_off(")]
+        self.assertIn('if binding.action == "skip":', method)
+        self.assertIn("self.skip_current()", method)
+
+
+if importlib.util.find_spec("PySide6") is not None:
+    del TransitionCostTests, NoQtBehaviorFallbackTests
+
+
+if __name__ == "__main__":
+    unittest.main()

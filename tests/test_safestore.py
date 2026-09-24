@@ -410,9 +410,11 @@ class ImpostorTests(StoreCase):
         photo = self.file("a.JPG", b"photo" * 100)
         current = identity(photo)
         slot = self.store.trash_slot(photo)
+        self.assertFalse(slot.parent.exists(), "planning recycle created its hidden folder")
         plan = Plan(forward=[step_move(photo, slot, current)])
         plan.inverse = SafeStore.invert(plan.forward)
         self.store.run(plan)
+        self.assertTrue(slot.parent.is_dir())
         self.assertTrue(slot.is_file())
         self.write(photo, b"other" * 100)                 # same size, same mtime, other bytes
         os.utime(photo, ns=(current["mtime_ns"], current["mtime_ns"]))

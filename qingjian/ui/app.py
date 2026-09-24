@@ -151,15 +151,12 @@ class Doorbell(QObject):
 
 
 def _parse(argv: list[str]) -> dict:
-    options = {"data_dir": None, "language": "", "folder": "", "selfcheck": False,
-               "version": False}
+    options = {"data_dir": None, "language": "", "folder": "", "version": False}
     rest = list(argv[1:])
     while rest:
         item = rest.pop(0)
         if item in ("--version", "-V"):
             options["version"] = True
-        elif item == "--selfcheck":
-            options["selfcheck"] = True
         elif item == "--data-dir" and rest:
             options["data_dir"] = Path(rest.pop(0))
         elif item == "--lang" and rest:
@@ -177,10 +174,6 @@ def main(argv: list[str] | None = None) -> int:
     if options["version"]:
         print(f"{__display_name__} (Qingjian) {__version__}")
         return 0
-    if options["selfcheck"]:
-        from ..selfcheck import run as run_selfcheck
-        return run_selfcheck(argv[argv.index("--selfcheck") + 1:])
-
     if options["data_dir"]:
         os.environ[appdirs.ENV_VAR] = str(options["data_dir"])
 

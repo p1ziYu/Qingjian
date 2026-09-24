@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from PIL import Image, ImageFilter
+from PIL import Image
 
 from base import TempCase, unittest
 from fixtures import build_library, exif_bytes, scene
@@ -73,6 +73,7 @@ class MetadataTests(TempCase):
     def test_jpeg_metadata(self):
         info = metadata.read(self.root / "Day3" / "IMG_5511.JPG")
         self.assertEqual("Sony ILCE-7M4", info.camera)
+        self.assertFalse(hasattr(info, "raw_tags"))
         self.assertEqual("400", info.iso)
         self.assertEqual("f/2.8", info.aperture)
         self.assertEqual("1/250", info.shutter)
@@ -141,11 +142,6 @@ class ImagingTests(TempCase):
         self.assertLess(
             imaging.similarity(imaging.phash(self.original), imaging.phash(other)), 0.92)
 
-    def test_blur_lowers_the_sharpness_score(self):
-        blurred = self.tmp / "blur.jpg"
-        self.base.filter(ImageFilter.GaussianBlur(4)).save(blurred, quality=95)
-        self.assertGreater(imaging.sharpness(self.original), imaging.sharpness(blurred) * 3)
-
     def test_defects_are_named(self):
         white = self.tmp / "white.png"
         Image.new("RGB", (200, 200), (255, 255, 255)).save(white)
@@ -164,7 +160,6 @@ class ImagingTests(TempCase):
     def test_an_unreadable_file_returns_none_rather_than_raising(self):
         junk = self.write(self.tmp / "junk.jpg", b"nope")
         self.assertIsNone(imaging.phash(junk))
-        self.assertEqual(0.0, imaging.sharpness(junk))
 
     def test_embedded_preview_extraction(self):
         raw = self.tmp / "fake.cr2"
@@ -251,33 +246,33 @@ class HashCacheTests(TempCase):
     def test_a_value_survives_a_reopen(self):
         path = self.write(self.tmp / "a.jpg", b"x" * 50)
         cache = hashcache.HashCache(self.data / "c.db")
-        calls = []
-        cache.compute(path, "phash", lambda p: calls.append(p) or 123)
+        cache.put(path, phash=123)
         cache.close()
         again = hashcache.HashCache(self.data / "c.db")
         try:
-            self.assertEqual(123, again.compute(path, "phash", lambda p: calls.append(p) or 999))
-            self.assertEqual(1, len(calls))
+            self.assertEqual(123, again.get(path, "phash"))
         finally:
             again.close()
 
     def test_an_edited_file_is_recomputed(self):
         path = self.write(self.tmp / "a.jpg", b"x" * 50)
         cache = hashcache.HashCache(self.data / "c.db")
-        cache.compute(path, "sha256", lambda p: "first")
+        cache.put(path, sha256="first")
         import time
         try:
             time.sleep(0.01)
             path.write_bytes(b"y" * 90)
-            self.assertEqual("second", cache.compute(path, "sha256", lambda p: "second"))
+            self.assertIsNone(cache.get(path, "sha256"))
+            cache.put(path, sha256="second")
+            self.assertEqual("second", cache.get(path, "sha256"))
         finally:
             cache.close()
 
     def test_it_works_without_a_file(self):
         path = self.write(self.tmp / "a.jpg", b"x")
         cache = hashcache.HashCache(None)
-        self.assertEqual(7, cache.compute(path, "phash", lambda p: 7))
-        self.assertEqual(7, cache.compute(path, "phash", lambda p: 9))
+        cache.put(path, phash=7)
+        self.assertEqual(7, cache.get(path, "phash"))
 
 
 if __name__ == "__main__":

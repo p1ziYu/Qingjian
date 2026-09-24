@@ -37,7 +37,7 @@ def natural_key(path: Path) -> list:
 
 
 def pruned_targets(root: str | Path, targets: Sequence[str | Path]) -> list[Path]:
-    """Resolved destinations strictly below the source root, once per scan."""
+    """Already-normalized destinations strictly below the source root."""
     try:
         base = Path(root).resolve()
     except (OSError, RuntimeError):
@@ -45,7 +45,7 @@ def pruned_targets(root: str | Path, targets: Sequence[str | Path]) -> list[Path
     kept: list[Path] = []
     for item in targets:
         try:
-            resolved = Path(item).resolve()
+            resolved = Path(item)
         except (OSError, RuntimeError):
             continue
         if resolved != base and resolved.is_relative_to(base):

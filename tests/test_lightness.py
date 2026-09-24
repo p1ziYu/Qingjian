@@ -5,8 +5,11 @@ folder, or a full-resolution decode, on the thread that paints the window.
 """
 from __future__ import annotations
 
+import importlib.util
+
 import ast
 import itertools
+import tempfile
 from pathlib import Path
 
 from base import ROOT, TempCase, unittest
@@ -312,8 +315,8 @@ class BlockingDecodeTests(unittest.TestCase):
 
     def test_the_gate_picks_the_formats_that_cannot_be_scaled_while_read(self):
         from qingjian.core import imaging as preview
+        from unittest.mock import patch
 
-        folder = Path(__file__).resolve().parent
         cases = {
             "big.png": (preview.HEAVY_BYTES + 1, True),
             "big.tif": (preview.HEAVY_BYTES + 1, True),
@@ -331,43 +334,26 @@ class BlockingDecodeTests(unittest.TestCase):
             "clip.mkv": (preview.ALWAYS_HEAVY_BYTES + 1, False),
             "clip.avi": (preview.HEAVY_BYTES + 1, False),
         }
-        for name, (size, expected) in cases.items():
-            with self.subTest(name=name):
-                path = folder / "__gate__" / name
-                path.parent.mkdir(exist_ok=True)
-                path.write_bytes(b"\0" * min(size, 4096))
-                try:
-                    # Report the size without writing gigabytes to disk.
-                    real = Path.stat
-                    Path.stat = lambda self, **k: type("S", (), {"st_size": size})()
-                    try:
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            for name, (size, expected) in cases.items():
+                with self.subTest(name=name):
+                    path = folder / name
+                    path.write_bytes(b"\0" * min(size, 4096))
+                    with patch.object(preview, "_file_size", return_value=size):
                         self.assertEqual(preview.decodes_slowly(path), expected)
-                    finally:
-                        Path.stat = real
-                finally:
-                    path.unlink(missing_ok=True)
-        (folder / "__gate__").rmdir()
-
-    def test_the_preview_asks_a_worker_for_heavy_files(self):
-        source = PACKAGE / "ui" / "mainwindow.py"
-        tree = ast.parse(source.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ClassDef) and node.name == "MainWindow":
-                for item in node.body:
-                    if isinstance(item, ast.FunctionDef) and item.name == "_refresh_view":
-                        body = ast.dump(item)
-                        self.assertIn("decodes_slowly", body,
-                                      "every image is decoded on the interface thread")
-                        self.assertIn("show_loading", body)
-                        return
-        raise AssertionError("MainWindow._refresh_view not found")
-
-    def test_a_worker_result_is_shown_when_it_lands(self):
-        text = (PACKAGE / "ui" / "mainwindow.py").read_text(encoding="utf-8")
-        self.assertIn("self.preloader.arrived.connect", text,
-                      "a decode finishing on a worker never reaches the screen")
 
 
+
+
+
+
+
+
+
+
+@unittest.skipIf(importlib.util.find_spec("PySide6") is not None,
+                 "runtime Qt tests cover this contract")
 class AsyncPreviewContractTests(unittest.TestCase):
     """Whatever is deferred must be something a worker can actually deliver."""
 
@@ -399,7 +385,8 @@ class AsyncPreviewContractTests(unittest.TestCase):
         self.assertIn("_preview_retries", body,
                       "resizing during a heavy decode fails the file for good")
 
-
+@unittest.skipIf(importlib.util.find_spec("PySide6") is not None,
+                 "runtime Qt tests cover this contract")
 class TableCostTests(unittest.TestCase):
     """Shared table dialogs must not measure every cell they hold."""
 
@@ -418,7 +405,8 @@ class TableCostTests(unittest.TestCase):
                 return
         raise AssertionError("TableDialog not found")
 
-
+@unittest.skipIf(importlib.util.find_spec("PySide6") is not None,
+                 "runtime Qt tests cover this contract")
 class RebuildCostTests(unittest.TestCase):
     """Nothing may rebuild the whole queue for a change it can describe."""
 
@@ -461,6 +449,28 @@ class RebuildCostTests(unittest.TestCase):
         body = ast.dump(self._method("MainWindow", "closeEvent"))
         self.assertIn("_drain_queue", body)
         self.assertNotIn("wait_idle", body, "closing blocks with nothing on screen")
+
+@unittest.skipIf(importlib.util.find_spec("PySide6") is not None,
+                 "runtime Qt tests cover this contract")
+class NoQtBehaviorFallbackTests(unittest.TestCase):
+    def test_the_preview_asks_a_worker_for_heavy_files(self):
+        source = PACKAGE / "ui" / "mainwindow.py"
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == "MainWindow":
+                for item in node.body:
+                    if isinstance(item, ast.FunctionDef) and item.name == "_refresh_view":
+                        body = ast.dump(item)
+                        self.assertIn("decodes_slowly", body,
+                                      "every image is decoded on the interface thread")
+                        self.assertIn("show_loading", body)
+                        return
+        raise AssertionError("MainWindow._refresh_view not found")
+
+    def test_a_worker_result_is_shown_when_it_lands(self):
+        text = (PACKAGE / "ui" / "mainwindow.py").read_text(encoding="utf-8")
+        self.assertIn("self.preloader.arrived.connect", text,
+                      "a decode finishing on a worker never reaches the screen")
 
 
 if __name__ == "__main__":
@@ -635,3 +645,7 @@ class G06Task5Tests(TestCase):
         path = self.root / "a.jpg"
         path.write_bytes(b"one")
         self.assertTrue(preview.PreviewPrefetcher._key(path, QSize(2800, 1000)) != preview.PreviewPrefetcher._key(path, QSize(2800, 2400)), "target height is absent from key")
+
+
+if importlib.util.find_spec("PySide6") is not None:
+    del AsyncPreviewContractTests, TableCostTests, RebuildCostTests, NoQtBehaviorFallbackTests

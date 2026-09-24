@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import threading
 from collections import OrderedDict
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import exifread, isobmff, mediatypes
@@ -144,7 +144,6 @@ class MediaInfo:
     captured: datetime | None = None
     captured_is_fallback: bool = True
     error: str = ""
-    raw_tags: dict = field(default_factory=dict)
 
     @property
     def is_landscape(self) -> bool:
@@ -218,7 +217,6 @@ def _apply_exif(info: MediaInfo, tags: dict) -> None:
             info.captured = parsed
             info.captured_is_fallback = False
             break
-    info.raw_tags = {k: v for k, v in tags.items() if not k.startswith("_")}
 
 
 def _read_image(info: MediaInfo) -> None:
@@ -364,10 +362,8 @@ def capture_only(path: str | Path) -> float | None:
     """The capture time alone, without reading the rest of the metadata.
 
     Sorting a folder by date needs one timestamp per file and nothing else.
-    :func:`read` builds a named dictionary of every EXIF tag and then copies it
-    again into ``raw_tags``, which is three quarters of its cost -- five and a
-    half seconds for twenty thousand photographs. This reads the three date
-    tags by number and stops.
+    :func:`read` builds a named dictionary of every EXIF tag. This reads the
+    three date tags by number and stops.
 
     Returns None when this file needs the full reader (raw and video go through
     their own parsers), so the caller falls back to :func:`capture_time`.
@@ -412,10 +408,6 @@ def capture_time(path: str | Path) -> float:
         return info.mtime
 
 
-def duration_seconds(path: str | Path) -> float | None:
-    return read(path).duration
-
-
 def clear_cache() -> None:
     with _CACHE_LOCK:
         _CACHE.clear()
@@ -431,7 +423,3 @@ def forget(paths) -> None:
     with _CACHE_LOCK:
         for key in [k for k in _CACHE if k and str(k[0]) in wanted]:
             _CACHE.pop(key, None)
-
-
-def utc_now() -> datetime:  # pragma: no cover - trivial helper used by callers
-    return datetime.now(timezone.utc)

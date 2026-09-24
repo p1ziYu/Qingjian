@@ -90,9 +90,6 @@ def read_header(path: str | Path) -> dict:
                         if width and height:
                             result["width"] = int(width / 65536)
                             result["height"] = int(height / 65536)
-                if kind == b"mdat":
-                    # Payload; nothing after it is worth the seek on a big file.
-                    continue
     except (OSError, struct.error, ValueError):
         return result
     return result

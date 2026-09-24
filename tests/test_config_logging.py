@@ -92,6 +92,28 @@ class ConfigTests(TempCase):
         folders = {p.name for p in settings.target_folders()}
         self.assertEqual({"A", "B"}, folders)
 
+    def test_target_folders_are_not_resolved_again_by_scanner(self):
+        from collections import Counter
+        from pathlib import Path
+        from unittest.mock import patch
+        from qingjian.core import scanner
+        settings = config.Settings()
+        settings.ensure_profile()
+        targets = [self.tmp / "A", self.tmp / "B"]
+        for binding, target in zip(settings.bindings, targets):
+            binding.folder = str(target)
+        real = Path.resolve
+        seen = Counter()
+
+        def counted(path, *args, **kwargs):
+            seen[str(path)] += 1
+            return real(path, *args, **kwargs)
+
+        with patch.object(Path, "resolve", counted):
+            normalized = settings.target_folders()
+            scanner.pruned_targets(self.tmp, normalized)
+        self.assertEqual([1, 1], [seen[str(path)] for path in targets])
+
     def test_actions_that_need_a_folder(self):
         self.assertTrue(config.Binding("1", "move").needs_folder())
         self.assertFalse(config.Binding("1", "skip").needs_folder())

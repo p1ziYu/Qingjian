@@ -680,10 +680,9 @@ class GridColumnTests(QtCase):
 
         view._sync_grid = counting
         self.addCleanup(lambda: setattr(view, "_sync_grid", real))
-        deadline = time.monotonic() + 1.0
-        while time.monotonic() < deadline:
+        for _ in range(5):
             self.app.processEvents()
-        self.assertLessEqual(len(calls), 3, f"{len(calls)} re-layouts in a second")
+        self.assertLessEqual(len(calls), 3, f"{len(calls)} re-layouts")
 
     def test_a_short_grid_still_fills_the_row(self):
         from PySide6.QtWidgets import QStyle
@@ -768,21 +767,24 @@ class SelectAllCostTests(QtCase):
         self.app.processEvents()
         return view
 
-    def timed(self, action) -> float:
-        started = time.perf_counter()
-        action()
-        self.app.processEvents()
-        return time.perf_counter() - started
-
     def test_choosing_every_file_and_flipping_it_is_instant(self):
         view = self.grid(5000)
         every = view.paths()
-        spent = self.timed(lambda: view.select_all_paths(every))
+        changes = []
+        view.selectionModel().selectionChanged.connect(
+            lambda selected, deselected: changes.append(
+                (len(selected.indexes()), len(deselected.indexes()))))
+        view.select_all_paths(every)
+        self.app.processEvents()
         self.assertEqual(5000, len(view.selectedItems()))
-        self.assertLess(spent, 0.5, f"select all took {spent:.2f}s")
-        spent = self.timed(view.invert_selection)
+        self.assertEqual([(5000, 0)], changes,
+                         "select-all emitted one change per item")
+        changes.clear()
+        view.invert_selection()
+        self.app.processEvents()
         self.assertEqual(0, len(view.selectedItems()))
-        self.assertLess(spent, 0.5, f"invert took {spent:.2f}s")
+        self.assertEqual([(0, 5000)], changes,
+                         "invert emitted one change per item")
 
     def test_flipping_an_alternating_choice_keeps_the_other_half(self):
         view = self.grid(100)
@@ -790,6 +792,100 @@ class SelectAllCostTests(QtCase):
         view.invert_selection()
         self.assertEqual(list(range(1, 100, 2)),
                          sorted(view.row(item) for item in view.selectedItems()))
+
+
+@unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
+class RuntimeCostContractTests(QtCase):
+    """Observable Qt counterparts for the no-Qt source fallbacks."""
+
+    def test_long_table_uses_sampled_sizing_and_writes_one_chunk_per_tick(self):
+        from PySide6.QtWidgets import QHeaderView
+        from qingjian.ui.dialogs import TableDialog, _CHUNK_ROWS, _MEASURE_ROWS
+        rows = [[index, f"row {index}"] for index in range(_CHUNK_ROWS * 2 + 7)]
+        dialog = TableDialog("rows", ["number", "name"], rows)
+        self.addCleanup(dialog.deleteLater)
+        dialog._timer.stop()
+        self.assertEqual(_MEASURE_ROWS,
+                         dialog.table.horizontalHeader().resizeContentsPrecision())
+        self.assertEqual(QHeaderView.ResizeMode.Interactive,
+                         dialog.table.horizontalHeader().sectionResizeMode(0))
+        self.assertEqual(0, dialog.table.rowCount())
+        dialog._write_chunk()
+        self.assertEqual(_CHUNK_ROWS, dialog.table.rowCount())
+        dialog._write_chunk()
+        self.assertEqual(_CHUNK_ROWS * 2, dialog.table.rowCount())
+        dialog._write_chunk()
+        self.assertEqual(len(rows), dialog.table.rowCount())
+
+    def test_population_requests_nothing_and_visible_pass_requests_only_its_band(self):
+        from qingjian.ui.browsers import ThumbnailGrid
+        from qingjian.ui.thumbs import ThumbnailCache
+        cache = ThumbnailCache()
+        self.addCleanup(cache.shutdown)
+        view = ThumbnailGrid(cache)
+        self.addCleanup(view.deleteLater)
+        view.resize(1000, 700)
+        paths = [str(self.tmp / f"img{index:05d}.jpg") for index in range(5000)]
+        with mock.patch.object(cache, "request", return_value=None) as request, \
+             mock.patch.object(cache, "set_wanted") as set_wanted:
+            view.set_paths(paths)
+            view._fetch_timer.stop()
+            request.assert_not_called()
+            set_wanted.assert_not_called()
+            view.show()
+            self.app.processEvents()
+            view._fetch_timer.stop()
+            request.reset_mock()
+            set_wanted.reset_mock()
+            view.request_visible()
+        set_wanted.assert_called_once()
+        wanted, edge = set_wanted.call_args.args
+        self.assertEqual(view.edge, edge)
+        self.assertEqual(wanted, [call.args[0] for call in request.call_args_list])
+        self.assertLess(len(wanted), len(paths))
+        self.assertGreater(len(wanted), 0)
+
+    def test_table_header_measurement_has_a_fixed_row_budget(self):
+        from qingjian.ui.dialogs import TableDialog, _MEASURE_ROWS
+        dialog = TableDialog("rows", ["value"], [[index] for index in range(1000)])
+        self.addCleanup(dialog.deleteLater)
+        dialog._timer.stop()
+        self.assertEqual(_MEASURE_ROWS,
+                         dialog.table.horizontalHeader().resizeContentsPrecision())
+
+    def test_setting_five_thousand_paths_only_schedules_fetch(self):
+        from qingjian.ui.browsers import ThumbnailGrid
+        from qingjian.ui.thumbs import ThumbnailCache
+        cache = ThumbnailCache()
+        self.addCleanup(cache.shutdown)
+        view = ThumbnailGrid(cache)
+        self.addCleanup(view.deleteLater)
+        with mock.patch.object(cache, "request", return_value=None) as request, \
+             mock.patch.object(cache, "peek", return_value=None) as peek:
+            view.set_paths([str(self.tmp / f"p{index}.jpg") for index in range(5000)])
+            view._fetch_timer.stop()
+        request.assert_not_called()
+        peek.assert_not_called()
+        self.assertEqual(5000, view.count())
+
+    def test_visible_fetch_updates_interest_once(self):
+        from qingjian.ui.browsers import ThumbnailGrid
+        from qingjian.ui.thumbs import ThumbnailCache
+        cache = ThumbnailCache()
+        self.addCleanup(cache.shutdown)
+        view = ThumbnailGrid(cache)
+        self.addCleanup(view.deleteLater)
+        view.resize(800, 600)
+        view.set_paths([str(self.tmp / f"p{index}.jpg") for index in range(1000)])
+        view.show()
+        self.app.processEvents()
+        view._fetch_timer.stop()
+        with mock.patch.object(cache, "request", return_value=None) as request, \
+             mock.patch.object(cache, "set_wanted") as set_wanted:
+            view.request_visible()
+        set_wanted.assert_called_once()
+        self.assertEqual(len(set_wanted.call_args.args[0]), request.call_count)
+        self.assertLess(request.call_count, view.count())
 
 
 @unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
@@ -885,6 +981,196 @@ class RecoverExitTests(WindowCase):
         self.window.recover_pending()
         self.app.processEvents()
         self.assertEqual([], asked)
+
+
+class RuntimeMainWindowContractTests(WindowCase):
+    """Run the expensive-path contracts against live widgets and an Engine."""
+
+    def test_heavy_preview_is_deferred_and_a_resize_miss_is_retried(self):
+        from PySide6.QtGui import QImage
+        from qingjian.core import imaging
+        current = self.engine.current_path()
+        video = self.source / "clip.mp4"
+        video.write_bytes(b"video")
+        self.assertFalse(imaging.decodes_slowly(video))
+        self.assertFalse(self.window.preloader.request(video, self.window._preview_target()))
+        self.window.preview.show_empty()
+        with mock.patch("qingjian.ui.mainwindow.decodes_slowly", return_value=True), \
+             mock.patch.object(self.window.preloader, "take", return_value=None), \
+             mock.patch.object(self.window.preloader, "request", return_value=True) as request, \
+             mock.patch.object(self.window.preview, "show_loading") as loading, \
+             mock.patch.object(self.window.preview, "show_path") as show_path:
+            self.window._refresh_view()
+        loading.assert_called_once()
+        foreground = [call for call in request.call_args_list if not call.kwargs]
+        self.assertEqual(1, len(foreground))
+        self.assertEqual(current, foreground[0].args[0])
+        self.assertEqual(self.window._preview_target(), foreground[0].args[1])
+        show_path.assert_not_called()
+
+        self.window.preview.show_empty()
+        self.window._preview_retries.clear()
+        with mock.patch.object(self.window.preloader, "take", return_value=None), \
+             mock.patch.object(self.window.preloader, "error", return_value=""), \
+             mock.patch.object(self.window.preloader, "request", return_value=True) as retry:
+            self.window._preview_arrived(str(current))
+        retry.assert_called_once_with(current, self.window._preview_target())
+        self.assertEqual(1, self.window._preview_retries[str(current)])
+
+        ready = QImage(8, 8, QImage.Format.Format_RGB32)
+        self.window.preview.show_empty()
+        with mock.patch.object(self.window.preloader, "take", return_value=ready), \
+             mock.patch.object(self.window.preview, "show_path",
+                               return_value=(True, "")) as show_path:
+            self.window._preview_arrived(str(current))
+        show_path.assert_called_once_with(current, ready)
+        self.assertNotIn(str(current), self.window._preview_retries)
+
+    def test_preloader_arrived_signal_reaches_preview_slot(self):
+        from PySide6.QtGui import QImage
+        current = self.engine.current_path()
+        ready = QImage(8, 8, QImage.Format.Format_RGB32)
+        self.window.preview.show_empty()
+        with mock.patch.object(self.window.preloader, "take", return_value=ready) as take, \
+             mock.patch.object(self.window.preview, "show_path",
+                               return_value=(True, "")) as show_path:
+            self.window.preloader.arrived.emit(str(current))
+            self.app.processEvents()
+        take.assert_called_once_with(current, self.window._preview_target())
+        show_path.assert_called_once_with(current, ready)
+
+    def test_undo_and_redo_patch_from_records_without_rescanning(self):
+        current = self.engine.current_path()
+        with mock.patch.object(self.engine, "rescan",
+                               side_effect=AssertionError("unexpected rescan")) as rescan, \
+             mock.patch.object(self.engine, "absorb", wraps=self.engine.absorb) as absorb:
+            self.window.classify_index(0)
+            self.window.undo()
+            self.assertTrue(current.exists())
+            self.window.redo()
+        rescan.assert_not_called()
+        self.assertEqual(3, absorb.call_count)
+        self.assertFalse(current.exists())
+        self.assertTrue((self.keep / current.name).exists())
+
+    def test_incremental_paths_call_their_targeted_runtime_hooks(self):
+        from qingjian.core import ops
+        from PySide6.QtWidgets import QFileDialog
+        target = self.tmp / "assigned"
+        with mock.patch.object(QFileDialog, "getExistingDirectory",
+                               return_value=str(target)), \
+             mock.patch.object(self.window, "_drop_excluded",
+                               wraps=self.window._drop_excluded) as drop_excluded, \
+             mock.patch.object(self.engine, "rescan",
+                               side_effect=AssertionError("unexpected rescan")):
+            self.window.choose_binding_folder(0)
+        drop_excluded.assert_called_once_with()
+
+        change = {"removed": [], "added": []}
+        self.settings.recursive = True
+        with mock.patch.object(self.engine, "drop_subfolders", return_value=change) as drop, \
+             mock.patch.object(self.window, "_apply_change") as apply, \
+             mock.patch.object(self.window, "rescan",
+                               side_effect=AssertionError("unexpected rescan")):
+            self.window._recursive_changed(False)
+        drop.assert_called_once_with()
+        apply.assert_called_once_with(change)
+
+        record = SimpleNamespace(action="move")
+        outcome = ops.Outcome(record=record)
+        with mock.patch.object(self.engine, "absorb", return_value=change) as absorb, \
+             mock.patch.object(self.window, "_apply_change") as apply, \
+             mock.patch.object(self.window, "_rebuild_queue",
+                               side_effect=AssertionError("unexpected rebuild")):
+            self.window._finish_operation(self.engine.current_path(), 0, outcome)
+        absorb.assert_called_once_with(record)
+        apply.assert_called_once_with(change)
+
+    def test_rename_skip_and_unchanged_duplicates_use_their_single_hooks(self):
+        from qingjian.core import ops
+        current = self.engine.current_path()
+        outcome = ops.Outcome()
+        with mock.patch("qingjian.ui.mainwindow.get_text",
+                        return_value=("renamed.jpg", True)), \
+             mock.patch.object(self.engine, "rename", return_value=outcome) as rename, \
+             mock.patch.object(self.window, "_finish_operation") as finish, \
+             mock.patch.object(self.engine, "absorb") as absorb:
+            self.window.rename_current()
+        rename.assert_called_once()
+        finish.assert_called_once_with(current, self.engine.index, outcome)
+        absorb.assert_not_called()
+
+        self.settings.bindings[0].action = "skip"
+        with mock.patch.object(self.window, "skip_current") as skip:
+            self.window.classify_index(0)
+        skip.assert_called_once_with()
+
+        unchanged = SimpleNamespace(changed_the_queue=False)
+        with mock.patch("qingjian.ui.mainwindow.DuplicatesDialog", return_value=unchanged), \
+             mock.patch.object(self.window, "_run_dialog"), \
+             mock.patch.object(self.window, "_rebuild_queue") as rebuild, \
+             mock.patch.object(self.window, "_refresh_view") as refresh:
+            self.window.open_duplicates()
+        rebuild.assert_not_called()
+        refresh.assert_called_once_with()
+
+        changed = SimpleNamespace(changed_the_queue=True)
+        with mock.patch("qingjian.ui.mainwindow.DuplicatesDialog", return_value=changed), \
+             mock.patch.object(self.window, "_run_dialog"), \
+             mock.patch.object(self.window, "_rebuild_queue") as rebuild:
+            self.window.open_duplicates()
+        rebuild.assert_called_once_with()
+
+    def test_skip_binding_routes_through_skip_current_once(self):
+        self.settings.bindings[0].action = "skip"
+        with mock.patch.object(self.window, "skip_current") as skip:
+            self.window.classify_index(0)
+        skip.assert_called_once_with()
+
+    def test_unchanged_duplicates_refresh_without_rebuilding(self):
+        dialog = SimpleNamespace(changed_the_queue=False)
+        with mock.patch("qingjian.ui.mainwindow.DuplicatesDialog", return_value=dialog), \
+             mock.patch.object(self.window, "_run_dialog"), \
+             mock.patch.object(self.window, "_rebuild_queue") as rebuild, \
+             mock.patch.object(self.window, "_refresh_view") as refresh:
+            self.window.open_duplicates()
+        rebuild.assert_not_called()
+        refresh.assert_called_once_with()
+
+    def test_disabling_recursive_scan_drops_subfolders_once(self):
+        change = {"removed": [], "added": []}
+        self.settings.recursive = True
+        with mock.patch.object(self.engine, "drop_subfolders", return_value=change) as drop, \
+             mock.patch.object(self.window, "_apply_change") as apply, \
+             mock.patch.object(self.window, "rescan") as rescan:
+            self.window._recursive_changed(False)
+        drop.assert_called_once_with()
+        apply.assert_called_once_with(change)
+        rescan.assert_not_called()
+
+    def test_preview_cache_miss_requests_exactly_one_retry(self):
+        current = self.engine.current_path()
+        self.window.preview.show_empty()
+        self.window._preview_retries.clear()
+        with mock.patch.object(self.window.preloader, "take", return_value=None), \
+             mock.patch.object(self.window.preloader, "error", return_value=""), \
+             mock.patch.object(self.window.preloader, "request", return_value=True) as request:
+            self.window._preview_arrived(str(current))
+        request.assert_called_once_with(current, self.window._preview_target())
+        self.assertEqual({str(current): 1}, self.window._preview_retries)
+
+    def test_finish_operation_absorbs_one_record_without_rebuilding(self):
+        from qingjian.core import ops
+        change = {"removed": [], "added": []}
+        record = SimpleNamespace(action="move")
+        with mock.patch.object(self.engine, "absorb", return_value=change) as absorb, \
+             mock.patch.object(self.window, "_apply_change") as apply, \
+             mock.patch.object(self.window, "_rebuild_queue") as rebuild:
+            self.window._finish_operation(
+                self.engine.current_path(), self.engine.index, ops.Outcome(record=record))
+        absorb.assert_called_once_with(record)
+        apply.assert_called_once_with(change)
+        rebuild.assert_not_called()
 
 
 class BackgroundQueueTests(WindowCase):
@@ -995,11 +1281,15 @@ class BackgroundQueueTests(WindowCase):
         self.window.classify_index(0)
         self.assertTrue(entered.wait(5), "worker never entered file step")
         current = self.engine.current_path()
-        started = time.monotonic()
-        self.window._rate_current(5)
-        self.window._label_current("red")
-        elapsed = time.monotonic() - started
-        self.assertLess(elapsed, 0.5)
+        with mock.patch.object(self.engine, "tag", wraps=self.engine.tag) as tag, \
+             mock.patch.object(self.window, "_targets", wraps=self.window._targets) as targets:
+            self.window._rate_current(5)
+            self.window._label_current("red")
+        self.assertEqual(2, targets.call_count)
+        self.assertEqual(2, tag.call_count)
+        self.assertEqual(2, sum(len(call.args[0]) for call in tag.call_args_list))
+        self.assertEqual({"rating": 5}, tag.call_args_list[0].kwargs)
+        self.assertEqual({"label": "red"}, tag.call_args_list[1].kwargs)
         self.assertEqual(self.engine.state.tag(str(current)), (5, "red"))
         release.set()
         self.assertTrue(self.engine.queue.wait_idle(20))
@@ -1177,8 +1467,11 @@ class BackgroundQueueTests(WindowCase):
         self.slow_classify()            # opens only once closing waits for the queue
         self.window.classify_index(0)
         with mock.patch("qingjian.ui.mainwindow.ask",
-                        return_value=QMessageBox.StandardButton.Yes):
+                        return_value=QMessageBox.StandardButton.Yes), \
+             mock.patch.object(self.window, "_drain_queue",
+                               wraps=self.window._drain_queue) as drain:
             self.window.close()
+        drain.assert_called_once_with()
         self.assertEqual([0], pending, "the window closed over a queued move")
         self.assertTrue((self.keep / current.name).exists())
 

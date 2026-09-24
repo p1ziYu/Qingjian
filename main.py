@@ -9,11 +9,8 @@ if __package__ in (None, "") and str(Path(__file__).resolve().parent) not in sys
 
 
 def main() -> int:
-    if "--selfcheck" in sys.argv:
-        from qingjian.selfcheck import run
-        return run(sys.argv[sys.argv.index("--selfcheck") + 1:])
-    from qingjian.ui.app import main as run_app
-    return run_app(sys.argv)
+    from qingjian.entry import main as dispatch
+    return dispatch(sys.argv)
 
 
 if __name__ == "__main__":

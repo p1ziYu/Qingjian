@@ -9,6 +9,18 @@ from qingjian import selfcheck
 from qingjian.core import i18n
 
 
+class EntryPointTests(unittest.TestCase):
+    def test_script_and_module_entries_share_selfcheck_dispatch(self):
+        import main as script_entry
+        from qingjian import __main__ as module_entry
+        calls = []
+        with patch.object(sys, "argv", ["qingjian", "--selfcheck", "--json"]), \
+             patch.object(selfcheck, "run", side_effect=lambda args: calls.append(args) or 17):
+            self.assertEqual(17, script_entry.main())
+            self.assertEqual(17, module_entry.main())
+        self.assertEqual([["--json"], ["--json"]], calls)
+
+
 class StartupLocaleTests(TempCase):
     def test_windows_ui_language_wins_when_environment_is_empty(self):
         kernel = Mock()

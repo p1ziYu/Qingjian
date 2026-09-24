@@ -5,6 +5,8 @@ the size of the folder, done at a moment when only one item is on screen.
 """
 from __future__ import annotations
 
+import importlib.util
+
 import ast
 from pathlib import Path
 
@@ -15,51 +17,6 @@ from qingjian.core.engine import Engine
 PACKAGE = ROOT / "qingjian"
 
 
-class LazyLoadingTests(unittest.TestCase):
-    """The browsers must not ask for a thumbnail they are not showing."""
-
-    @staticmethod
-    def _method(path: Path, klass: str, method: str):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ClassDef) and node.name == klass:
-                for item in node.body:
-                    if isinstance(item, ast.FunctionDef) and item.name == method:
-                        return item
-        raise AssertionError(f"{klass}.{method} not found in {path.name}")
-
-    @staticmethod
-    def _calls(node: ast.AST) -> set[str]:
-        names = set()
-        for child in ast.walk(node):
-            if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute):
-                owner = child.func.value
-                if isinstance(owner, ast.Attribute) and isinstance(owner.value, ast.Name) \
-                        and owner.value.id == "self":
-                    names.add(f"{owner.attr}.{child.func.attr}")
-        return names
-
-    def test_populating_a_list_does_not_decode_anything(self):
-        """set_paths runs once per file; a decode there is a decode per file."""
-        source = PACKAGE / "ui" / "browsers.py"
-        calls = self._calls(self._method(source, "_Browser", "set_paths"))
-        self.assertNotIn("cache.request", calls)
-        self.assertNotIn("cache.peek", calls)
-
-    def test_thumbnails_are_only_asked_for_by_the_visible_pass(self):
-        source = PACKAGE / "ui" / "browsers.py"
-        tree = ast.parse(source.read_text(encoding="utf-8"))
-        requesting = set()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef):
-                if "cache.request" in self._calls(node):
-                    requesting.add(node.name)
-        self.assertEqual({"request_visible"}, requesting)
-
-    def test_the_window_asks_the_cache_to_forget_the_rest(self):
-        source = PACKAGE / "ui" / "browsers.py"
-        calls = self._calls(self._method(source, "_Browser", "request_visible"))
-        self.assertIn("cache.set_wanted", calls)
 
 
 class ScanCostTests(TempCase):
@@ -259,9 +216,6 @@ class FolderWorkTests(TempCase):
         self.assertEqual(50, self.engine.state.review_count(str(self.library)))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class BindingFolderTests(TempCase):
     """Pointing a key at a folder must not re-read the library."""
@@ -371,3 +325,60 @@ class BindingFolderTests(TempCase):
         engine, _source, nested = self.build(recursive=False)
         engine.settings.bindings[0].folder = str(nested)
         self.assertIsNone(engine.exclude_targets())
+
+
+@unittest.skipIf(importlib.util.find_spec("PySide6") is not None,
+                 "runtime Qt tests cover this contract")
+class LazyLoadingTests(unittest.TestCase):
+    """The browsers must not ask for a thumbnail they are not showing."""
+
+    @staticmethod
+    def _method(path: Path, klass: str, method: str):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == klass:
+                for item in node.body:
+                    if isinstance(item, ast.FunctionDef) and item.name == method:
+                        return item
+        raise AssertionError(f"{klass}.{method} not found in {path.name}")
+
+    @staticmethod
+    def _calls(node: ast.AST) -> set[str]:
+        names = set()
+        for child in ast.walk(node):
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute):
+                owner = child.func.value
+                if isinstance(owner, ast.Attribute) and isinstance(owner.value, ast.Name) \
+                        and owner.value.id == "self":
+                    names.add(f"{owner.attr}.{child.func.attr}")
+        return names
+
+    def test_populating_a_list_does_not_decode_anything(self):
+        """set_paths runs once per file; a decode there is a decode per file."""
+        source = PACKAGE / "ui" / "browsers.py"
+        calls = self._calls(self._method(source, "_Browser", "set_paths"))
+        self.assertNotIn("cache.request", calls)
+        self.assertNotIn("cache.peek", calls)
+
+    def test_thumbnails_are_only_asked_for_by_the_visible_pass(self):
+        source = PACKAGE / "ui" / "browsers.py"
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        requesting = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                if "cache.request" in self._calls(node):
+                    requesting.add(node.name)
+        self.assertEqual({"request_visible"}, requesting)
+
+    def test_the_window_asks_the_cache_to_forget_the_rest(self):
+        source = PACKAGE / "ui" / "browsers.py"
+        calls = self._calls(self._method(source, "_Browser", "request_visible"))
+        self.assertIn("cache.set_wanted", calls)
+
+
+if importlib.util.find_spec("PySide6") is not None:
+    del LazyLoadingTests
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -357,11 +357,6 @@ def step_copy(src: str | Path, dst: str | Path, src_id: dict) -> dict:
     return {"kind": COPY, "src": str(src), "dst": str(dst), "src_id": src_id, "result": None}
 
 
-def step_write(dst: str | Path, snapshot: dict, expect: dict | None) -> dict:
-    return {"kind": WRITE, "dst": str(dst), "snapshot": snapshot, "expect": expect,
-            "result": {"size": snapshot.get("size"), "hash": snapshot.get("hash")}}
-
-
 def step_unlink(path: str | Path, expect: dict | None) -> dict:
     return {"kind": UNLINK, "dst": str(path), "expect": expect, "result": None}
 
@@ -390,9 +385,6 @@ class Plan:
                 if not same_volume(step["src"], Path(step["dst"]).parent):
                     total += int((step.get("src_id") or {}).get("size") or 0)
         return total
-
-    def targets(self) -> list[str]:
-        return [step["dst"] for step in self.forward]
 
     def to_dict(self) -> dict:
         return {"forward": self.forward, "inverse": self.inverse, "state": self.state,
@@ -490,11 +482,6 @@ class SafeStore:
     def has_pending(self) -> bool:
         return self.journal_path.exists()
 
-    def pending_plan(self) -> Plan | None:
-        if not self.has_pending():
-            return None
-        return Plan.from_dict(read_json(self.journal_path, {}) or {})
-
     # -- snapshots -----------------------------------------------------
     def snapshot(self, path: str | Path, progress: Progress = _NOOP_PROGRESS,
                  cancel: Cancel = _NEVER) -> dict | None:
@@ -523,9 +510,7 @@ class SafeStore:
         slot = path.parent / TRASH_DIR / (uuid.uuid4().hex + path.suffix)
         if len(str(slot)) > 259:
             return None
-        try:
-            self._prepare_trash_folder(slot.parent)
-        except OSError:
+        if slot.parent.exists() and not slot.parent.is_dir():
             return None
         return slot
 
@@ -958,6 +943,8 @@ class SafeStore:
             # copy inside `_staged_copy`. Hashing both ends first read a 300 MB
             # video twice for a rename that takes a millisecond.
             src = Path(step["src"])
+            if dst.parent.name == TRASH_DIR and src.parent.name != TRASH_DIR:
+                self._prepare_trash_folder(dst.parent)
             done_at_dst = identity_matches(dst, result, VERIFY_FAST)
             if done_at_dst and not src.exists():
                 # An impostor of the same size and mtime is not "already restored".
@@ -1061,16 +1048,9 @@ class SafeStore:
                             "expect": step.get("result") or step.get("src_id"),
                             "result": None})
             elif kind == WRITE:
-                previous = step.get("expect")
-                if previous is None:
-                    out.append({"kind": UNLINK, "dst": step["dst"],
-                                "expect": step.get("result") or (step.get("snapshot") or None),
-                                "result": None})
-                else:
-                    out.append({"kind": WRITE, "dst": step["dst"],
-                                "snapshot": step.get("previous_snapshot") or {},
-                                "expect": step.get("result"),
-                                "result": previous})
+                out.append({"kind": UNLINK, "dst": step["dst"],
+                            "expect": step.get("result") or (step.get("snapshot") or None),
+                            "result": None})
             elif kind == UNLINK:
                 snapshot = step.get("snapshot") or {}
                 out.append({"kind": WRITE, "dst": step["dst"], "snapshot": snapshot,

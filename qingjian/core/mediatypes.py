@@ -52,10 +52,6 @@ ANIMATABLE_EXTENSIONS: frozenset[str] = frozenset({".gif", ".webp", ".apng", ".p
 
 MEDIA_EXTENSIONS: frozenset[str] = IMAGE_EXTENSIONS | RAW_EXTENSIONS | VIDEO_EXTENSIONS
 
-#: Raw files whose embedded preview the viewer can usually show without a raw
-#: decoder, because the container is a TIFF/JPEG the imaging stack can open.
-RAW_WITH_TIFF_CONTAINER: frozenset[str] = frozenset({".dng", ".nef", ".cr2", ".arw", ".pef", ".srw"})
-
 KIND_IMAGE = "image"
 KIND_RAW = "raw"
 KIND_VIDEO = "video"

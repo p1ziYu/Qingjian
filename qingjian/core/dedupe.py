@@ -42,7 +42,7 @@ def _never() -> bool:
     return False
 
 
-def _sized(paths: Sequence[Path], minimum: int = MIN_SIZE) -> list[tuple[Path, int]]:
+def _sized(paths: Sequence[Path], minimum: int = MIN_SIZE) -> list[tuple[Path, int, tuple]]:
     """Files worth comparing, keeping one name for each physical file."""
     out: list[tuple[Path, int]] = []
     seen: set[tuple[int, int]] = set()
@@ -58,7 +58,7 @@ def _sized(paths: Sequence[Path], minimum: int = MIN_SIZE) -> list[tuple[Path, i
             if identity in seen:
                 continue
             seen.add(identity)
-        out.append((path, stat.st_size))
+        out.append((path, stat.st_size, (str(path), stat.st_size, stat.st_mtime_ns)))
     return out
 
 
@@ -136,7 +136,9 @@ def find_exact(paths: Sequence[Path], cache=None, ignored: set[str] | None = Non
         cache.preload(paths)
 
     by_size: dict[int, list[Path]] = defaultdict(list)
-    for path, size in _sized(paths):
+    sized = _sized(paths)
+    keys = {path: key for path, _size, key in sized}
+    for path, size, _key in sized:
         if cancel():
             raise Cancelled("cancelled")
         by_size[size].append(path)
@@ -159,7 +161,7 @@ def find_exact(paths: Sequence[Path], cache=None, ignored: set[str] | None = Non
         return []
 
     def full(path: Path) -> str | None:
-        cached = cache.get(path, "sha256") if cache is not None else None
+        cached = cache.get_by_key(keys[path], "sha256") if cache is not None else None
         if cached:
             return str(cached)
         try:
@@ -175,8 +177,8 @@ def find_exact(paths: Sequence[Path], cache=None, ignored: set[str] | None = Non
             if not digest:
                 continue
             if cache is not None:
-                cache.put(path, sha256=digest)
-            if identity_key(path, digest) in ignored:
+                cache.put_by_key(keys[path], sha256=digest)
+            if ignored and identity_key(path, digest) in ignored:
                 continue
             by_digest[digest].append(path)
 
@@ -249,12 +251,14 @@ def find_similar(paths: Sequence[Path], threshold: float = 0.92, cache=None,
     ignored = ignored or set()
     from . import mediatypes
 
-    stills = [p for p, _size in _sized(paths) if mediatypes.is_image(p)]
+    sized = [(p, key) for p, _size, key in _sized(paths) if mediatypes.is_image(p)]
+    stills = [p for p, _key in sized]
+    keys = dict(sized)
     if cache is not None:
         cache.preload(stills)
 
     def hash_of(path: Path) -> int | None:
-        cached = cache.get(path, "phash") if cache is not None else None
+        cached = cache.get_by_key(keys[path], "phash") if cache is not None else None
         if cached is not None:
             return int(cached)
         return imaging.phash(path)
@@ -266,7 +270,7 @@ def find_similar(paths: Sequence[Path], threshold: float = 0.92, cache=None,
             if value is None:
                 continue
             if cache is not None:
-                cache.put(path, phash=int(value))
+                cache.put_by_key(keys[path], phash=int(value))
             usable.append(path)
             hashes.append(int(value))
 
@@ -293,9 +297,10 @@ def find_similar(paths: Sequence[Path], threshold: float = 0.92, cache=None,
                 raise Cancelled("cancelled")
             candidates = _build_candidates(
                 [usable[i] for i in members], [hashes[i] for i in members], cache,
-                score_quality, ignored, progress, cancel)
-            candidates = [c for c in candidates
-                          if identity_key(c.path, c.digest or "") not in ignored]
+                score_quality, ignored, progress, cancel, keys)
+            if ignored:
+                candidates = [c for c in candidates
+                              if identity_key(c.path, c.digest or "") not in ignored]
             if len(candidates) < 2:
                 continue
             groups.append(_ranked_group(MODE_SIMILAR, candidates))
@@ -304,8 +309,11 @@ def find_similar(paths: Sequence[Path], threshold: float = 0.92, cache=None,
     return groups
 
 
-def _digest_for_ignore(path: Path, cache, ignored: set[str], cancel: Cancel) -> str:
-    digest = str(cache.get(path, "sha256") or "") if cache is not None else ""
+def _digest_for_ignore(path: Path, cache, ignored: set[str], cancel: Cancel,
+                       key: tuple | None = None) -> str:
+    digest = str(cache.get_by_key(key, "sha256") or "") if cache is not None else ""
+    if not ignored:
+        return digest
     prefix = f"{path.resolve()}\n"
     if prefix in ignored:
         return ""
@@ -317,26 +325,26 @@ def _digest_for_ignore(path: Path, cache, ignored: set[str], cancel: Cancel) -> 
         except OSError:
             return ""
         if cache is not None:
-            cache.put(path, sha256=digest)
+            cache.put_by_key(key, sha256=digest)
     return digest
 
 
 def _build_candidates(paths: list[Path], hashes: list[int], cache, score_quality: bool,
                       ignored: set[str] | None = None, progress: Progress = _noop,
-                      cancel: Cancel = _never) -> list[Candidate]:
+                      cancel: Cancel = _never, keys: dict[Path, tuple] | None = None) -> list[Candidate]:
     ignored = ignored or set()
+    keys = keys or {}
 
     def build(item: tuple[int, Path, int]):
         _index, path, value = item
         if cancel():
             raise Cancelled("cancelled")
         info = metadata.read(path)
-        digest = _digest_for_ignore(path, cache, ignored, cancel)
+        digest = _digest_for_ignore(path, cache, ignored, cancel, keys.get(path))
         sharp = 0.0
         defect = ""
         if score_quality:
-            cached = ({field: cache.get(path, field)
-                       for field in ("sharpness", "blown", "crushed")}
+            cached = (cache.get_many(keys[path], ("sharpness", "blown", "crushed"))
                       if cache is not None else {})
             if not cached or any(value is None for value in cached.values()):
                 if cancel():
@@ -344,8 +352,8 @@ def _build_candidates(paths: list[Path], hashes: list[int], cache, score_quality
                 score = imaging.quality_score(path)
                 sharp = score["sharpness"]
                 if cache is not None:
-                    cache.put(path, sharpness=sharp, blown=score.get("blown", 0.0),
-                              crushed=score.get("crushed", 0.0))
+                    cache.put_by_key(keys[path], sharpness=sharp, blown=score.get("blown", 0.0),
+                                     crushed=score.get("crushed", 0.0))
             else:
                 score = cached
                 sharp = float(cached["sharpness"])
@@ -396,7 +404,9 @@ def find_bursts(paths: Sequence[Path], gap_seconds: float = 2.0, minimum: int = 
     ignored = ignored or set()
     from . import mediatypes
 
-    stills = [p for p, _size in _sized(paths) if mediatypes.is_image(p)]
+    sized = [(p, key) for p, _size, key in _sized(paths) if mediatypes.is_image(p)]
+    stills = [p for p, _key in sized]
+    keys = dict(sized)
     if cache is not None:
         cache.preload(stills)
 
@@ -406,7 +416,7 @@ def find_bursts(paths: Sequence[Path], gap_seconds: float = 2.0, minimum: int = 
             # Without a real capture time, "shot within two seconds" means
             # nothing: a bulk copy gives every file the same mtime.
             return None
-        cached = cache.get(path, "phash") if cache is not None else None
+        cached = cache.get_by_key(keys[path], "phash") if cache is not None else None
         value = int(cached) if cached is not None else imaging.phash(path)
         if value is None:
             return None
@@ -419,7 +429,7 @@ def find_bursts(paths: Sequence[Path], gap_seconds: float = 2.0, minimum: int = 
                 continue
             when, value = found
             if cache is not None:
-                cache.put(path, phash=value)
+                cache.put_by_key(keys[path], phash=value)
             entries.append((when, path, value))
 
     entries.sort(key=lambda item: item[0])
@@ -431,7 +441,7 @@ def find_bursts(paths: Sequence[Path], gap_seconds: float = 2.0, minimum: int = 
             raise Cancelled("cancelled")
         if len(run) >= minimum:
             candidates = _build_candidates([r[1] for r in run], [r[2] for r in run],
-                                           cache, True, ignored, progress, cancel)
+                                           cache, True, ignored, progress, cancel, keys)
             # Ignoring a burst has to stick, or the group the user dismissed
             # comes straight back on the next scan.
             candidates = [c for c in candidates

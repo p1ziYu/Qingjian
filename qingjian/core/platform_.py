@@ -313,22 +313,6 @@ def free_space(path: str | Path) -> int | None:
         return None
 
 
-def filesystem_is_case_insensitive(path: str | Path) -> bool:
-    """Probe rather than assume: a case-sensitive volume can be mounted on
-    Windows, and macOS can be formatted either way."""
-    base = nearest_existing(path)
-    try:
-        probe = base / ".qingjian-case-probe"
-        alt = base / ".QINGJIAN-CASE-PROBE"
-        probe.touch(exist_ok=True)
-        try:
-            return alt.exists()
-        finally:
-            probe.unlink(missing_ok=True)
-    except OSError:
-        return IS_WINDOWS or IS_MACOS
-
-
 def path_equal(a: str | Path, b: str | Path, case_insensitive: bool | None = None) -> bool:
     if case_insensitive is None:
         case_insensitive = IS_WINDOWS or IS_MACOS

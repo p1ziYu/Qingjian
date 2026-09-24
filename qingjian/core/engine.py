@@ -381,10 +381,6 @@ class Engine:
         if path not in bucket:
             bucket.append(path)
 
-    def listing_for(self, folder: Path) -> list[Path]:
-        """Every indexed entry of *folder*, for callers that want them all."""
-        return [item for bucket in self._index_for(Path(folder)).values() for item in bucket]
-
     def siblings_of(self, path: Path) -> list[Path]:
         """Only the entries that could belong to the same shot as *path*."""
         return list(self._index_for(path.parent).get(
@@ -496,7 +492,8 @@ class Engine:
         target = Path(path) if path else self.current_path()
         if target is None:
             return None
-        return self.planner.preview_target(group or self.group_for(target), binding,
+        return self.planner.preview_target(
+            group if group is not None else self.group_for(target), binding,
                                            self.source_root)
 
     def classify(self, binding: config.Binding, path: str | Path | None = None,
@@ -833,19 +830,7 @@ class Engine:
             return None
         # Rebuild both lists in one pass. Removing several hundred entries from a
         # list of twenty thousand one `remove` at a time is quadratic.
-        current = self.current_path()
-        self.all_files = [path for path in self.all_files if path not in doomed]
-        removed = [path for path in self.queue_paths if path in doomed]
-        if removed:
-            self.queue_paths = [path for path in self.queue_paths if path not in doomed]
-        for path in doomed:
-            self._index_forget(path)
-        if current is not None and current not in doomed:
-            try:
-                self.index = self.queue_paths.index(current)
-            except ValueError:
-                pass
-        self.index = clamp_index(self.index, len(self.queue_paths))
+        removed = self._drop_paths(doomed)
         log.info("excluded %d files now inside a destination folder", len(doomed))
         return {"added": [], "removed": removed}
 
@@ -861,6 +846,11 @@ class Engine:
         doomed = {path for path in self.all_files if path.parent != root}
         if not doomed:
             return {"added": [], "removed": []}
+        removed = self._drop_paths(doomed)
+        return {"added": [], "removed": removed}
+
+    def _drop_paths(self, doomed: set[Path]) -> list[Path]:
+        """Remove paths from queue, source listing, and stem indexes together."""
         current = self.current_path()
         self.all_files = [path for path in self.all_files if path not in doomed]
         removed = [path for path in self.queue_paths if path in doomed]
@@ -874,7 +864,7 @@ class Engine:
             except ValueError:
                 pass
         self.index = clamp_index(self.index, len(self.queue_paths))
-        return {"added": [], "removed": removed}
+        return removed
 
     def _sort_key(self, touched: Sequence[Path]):
         """The key the queue is ordered by, valid for the whole queue.

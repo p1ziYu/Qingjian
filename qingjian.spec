@@ -14,22 +14,15 @@ called 轻拣; a non-ASCII executable name reproduced a native-window crash on
 the delivery machine, so the file name stays ASCII.
 """
 
-from PyInstaller.utils.hooks import collect_all, collect_submodules
+from PyInstaller.utils.hooks import collect_submodules
 
-multimedia = collect_all("PySide6.QtMultimedia")
-
-hidden = list(multimedia[2]) + [
-    "PySide6.QtMultimediaWidgets",
-    "send2trash",
-    "send2trash.win",
-]
-hidden += collect_submodules("qingjian")
+hidden = collect_submodules("qingjian")
 
 a = Analysis(
     ["main.py"],
     pathex=[],
-    binaries=list(multimedia[1]),
-    datas=list(multimedia[0]),
+    binaries=[],
+    datas=[],
     hiddenimports=hidden,
     hookspath=[],
     hooksconfig={},

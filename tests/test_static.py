@@ -81,6 +81,26 @@ class TranslationTests(unittest.TestCase):
                     missing.append(f"{path.name}:{line} {key!r}")
         self.assertEqual([], missing)
 
+    def test_every_catalogue_key_is_used_or_an_explicit_pending_prompt(self):
+        literals = set()
+        for path in python_files(PACKAGE):
+            if path.name == "i18n.py":
+                continue
+            for node in ast.walk(parse(path)):
+                if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    literals.add(node.value)
+        dynamic = {
+            *(f"filter.{name}" for name in
+              ("all", "images", "videos", "raw", "landscape", "portrait", "square",
+               "short", "animated", "rated", "unrated", "labelled")),
+            *(f"sort.{name}" for name in
+              ("name", "date", "modified", "size", "rating", "random")),
+            "conflict.mode.replace", "conflict.mode.sequence",
+            "dup.defect.blurry", "dup.defect.overexposed", "dup.defect.black",
+        }
+        pending = {"error.permission", "dup.none_found", "dup.none_similar"}
+        self.assertEqual(pending, set(CATALOG) - literals - dynamic)
+
     def test_translated_calls_supply_every_placeholder(self):
         """A missing field would print a raw {brace} to the user."""
         problems = []
@@ -269,9 +289,6 @@ class SignalTests(unittest.TestCase):
         return [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class CrossLayerTests(unittest.TestCase):
     """The interface calls into the core by name; check those names exist.
@@ -353,3 +370,7 @@ class CrossLayerTests(unittest.TestCase):
                                 and value.value not in names:
                             offenders.append(f"{path.name}:{node.lineno} {value.value!r}")
         self.assertEqual([], offenders)
+
+
+if __name__ == "__main__":
+    unittest.main()

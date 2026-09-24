@@ -196,6 +196,40 @@ class QueueTests(TempCase):
         self.assertIn("queued", seen)
         self.assertIn("finished", seen)
 
+    def test_cancelled_is_classified_by_type_not_name(self):
+        from qingjian.core.safestore import Cancelled
+        class CancelledLookalike(Exception):
+            pass
+        CancelledLookalike.__name__ = "Cancelled"
+        queue = OperationQueue()
+        self.addCleanup(queue.stop)
+        real = queue.submit(Job(run=lambda _p, _c: (_ for _ in ()).throw(Cancelled("x"))))
+        fake = queue.submit(Job(run=lambda _p, _c: (_ for _ in ()).throw(CancelledLookalike("x"))))
+        self.assertTrue(queue.wait_idle(10))
+        self.assertEqual("cancelled", real.state)
+        self.assertEqual("failed", fake.state)
+
+    def test_stop_timeout_keeps_the_live_worker_and_restart_is_serial(self):
+        import threading
+        entered = threading.Event()
+        release = threading.Event()
+        ran_second = threading.Event()
+        queue = OperationQueue()
+        queue.submit(Job(run=lambda _p, _c: (entered.set(), release.wait(10))))
+        self.assertTrue(entered.wait(10))
+        worker = queue._thread
+        queue.stop(0.001)
+        self.assertIs(worker, queue._thread)
+        self.assertTrue(worker.is_alive())
+        queue.submit(Job(run=lambda _p, _c: ran_second.set()))
+        self.assertIs(worker, queue._thread)
+        release.set()
+        worker.join(10)
+        queue.start()
+        self.assertTrue(ran_second.wait(10))
+        self.assertTrue(queue.wait_idle(10))
+        queue.stop()
+
 
 class EngineTests(TempCase):
     def test_recycling_a_shot_larger_than_the_cap_stays_undoable(self):
@@ -358,6 +392,16 @@ class EngineTests(TempCase):
         settings.bindings[1].name_template = "{name}"
         self.engine = Engine(self.data, settings)
         self.engine.open_folder(self.root)
+
+    def test_preview_uses_a_supplied_master_only_group_without_lookup(self):
+        from unittest.mock import patch
+        from qingjian.core.sidecar import KIND_MASTER, SidecarGroup, SidecarMember
+        path = self.engine.current_path()
+        group = SidecarGroup(path, [SidecarMember(path, KIND_MASTER, path.stat().st_size)])
+        binding = self.engine.settings.bindings[0]
+        expected = self.engine.planner.preview_target(group, binding, self.engine.source_root)
+        with patch.object(self.engine, "group_for", side_effect=AssertionError("looked up")):
+            self.assertEqual(expected, self.engine.preview_target(binding, path, group))
 
     def tearDown(self):
         self.engine.close()

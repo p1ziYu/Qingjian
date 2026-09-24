@@ -316,28 +316,3 @@ def validate(path_template: str, name_template: str) -> None:
         if is_reserved_name(raw_name):
             raise NameError_("error.name_reserved", name=raw_name)
         raise NameError_("error.name_invalid")
-
-
-def describe_tokens() -> list[tuple[str, str]]:
-    """(token, rendered example) pairs for the template editor's help."""
-    probe = TemplateContext(
-        source=Path("Iceland/IMG_4821.JPG"),
-        when=datetime(2026, 8, 14, 19, 42, 8),
-        camera="Sony ILCE-7M4",
-        lens="FE 24mm F2.8 G",
-        iso="400",
-        aperture="f/2.8",
-        shutter="1/250",
-        focal="24mm",
-        rating=3,
-        label="green",
-        sequence=7,
-        source_root=Path("."),
-    )
-    rows = []
-    for name in TOKENS:
-        try:
-            rows.append(("{" + name + "}", _resolve_one(name, probe, False)))
-        except NameError_:  # pragma: no cover - defensive
-            continue
-    return rows

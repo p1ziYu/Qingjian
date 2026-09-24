@@ -135,6 +135,10 @@ ALWAYS_HEAVY_BYTES = 64 * 1024 * 1024
 SCALES_WHILE_DECODING = frozenset({".jpg", ".jpeg", ".jpe", ".jfif"})
 
 
+def _file_size(path: Path) -> int:
+    return path.stat().st_size
+
+
 def decodes_slowly(path: str | Path) -> bool:
     """Would decoding *path* stall the window long enough to notice?
 
@@ -153,7 +157,7 @@ def decodes_slowly(path: str | Path) -> bool:
     if mediatypes.suffix(target) in {".heic", ".heif", ".hif"}:
         return True
     try:
-        size = target.stat().st_size
+        size = _file_size(target)
     except OSError:
         return False
     if target.suffix.lower() in SCALES_WHILE_DECODING or mediatypes.is_raw(target):
@@ -280,18 +284,6 @@ def phash(path: str | Path) -> int | None:
     return value
 
 
-def dhash(path: str | Path) -> int | None:
-    """64-bit difference hash: cheaper than pHash, good at catching crops."""
-    pixels = _gray_array(path, _HASH_SIDE + 1)
-    if pixels is None:
-        return None
-    diff = pixels[:_HASH_SIDE, 1:] > pixels[:_HASH_SIDE, :-1]
-    value = 0
-    for bit in diff.flatten():
-        value = (value << 1) | int(bit)
-    return value
-
-
 def hamming(left: int, right: int) -> int:
     return int(left ^ right).bit_count()
 
@@ -301,28 +293,6 @@ def similarity(left: int | None, right: int | None) -> float:
     if left is None or right is None:
         return 0.0
     return 1.0 - hamming(left, right) / HASH_BITS
-
-
-def sharpness(path: str | Path, side: int = 256) -> float:
-    """Variance of the Laplacian: higher is crisper.
-
-    Comparable only between frames of the same scene, which is exactly how it
-    is used — picking the best frame of one burst.
-    """
-    pixels = _gray_array(path, side)
-    if pixels is None:
-        return 0.0
-    laplace = (
-        -4.0 * pixels[1:-1, 1:-1]
-        + pixels[:-2, 1:-1] + pixels[2:, 1:-1]
-        + pixels[1:-1, :-2] + pixels[1:-1, 2:]
-    )
-    return float(np.var(laplace))
-
-
-def average_brightness(path: str | Path, side: int = 64) -> float:
-    pixels = _gray_array(path, side)
-    return float(np.mean(pixels)) if pixels is not None else 0.0
 
 
 def quality_score(path: str | Path) -> dict:

@@ -66,13 +66,6 @@ class CatalogueTests(unittest.TestCase):
             else:
                 os.environ["QINGJIAN_LANG"] = previous
 
-    def test_listeners_hear_a_language_change(self):
-        translator = i18n.Translator("zh")
-        seen = []
-        translator.on_change(seen.append)
-        translator.set_language("en")
-        self.assertEqual(["en"], seen)
-
     def test_english_strings_are_not_left_as_chinese(self):
         """A copy-paste slip would leave CJK characters in the English column."""
         offenders = [

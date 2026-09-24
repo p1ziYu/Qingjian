@@ -61,13 +61,13 @@ UI_FAMILY = "Microsoft YaHei UI"
 NUMERAL_FAMILY = "Bahnschrift"
 MONO_STACK = '"Cascadia Mono", "Consolas", monospace'
 
-#: Height, compact height, base font, gap and padding per density.
+#: Height, compact height, base font and padding per density.
 #: English strings run about 60% longer than Chinese, which is what "roomy"
 #: buys room for.
 DENSITY = {
-    "compact": {"button": 28, "compact": 24, "font": 12, "gap": 6, "pad": 11},
-    "standard": {"button": 32, "compact": 27, "font": 13, "gap": 8, "pad": 14},
-    "roomy": {"button": 36, "compact": 30, "font": 14, "gap": 10, "pad": 17},
+    "compact": {"button": 28, "compact": 24, "font": 12, "pad": 11},
+    "standard": {"button": 32, "compact": 27, "font": 13, "pad": 14},
+    "roomy": {"button": 36, "compact": 30, "font": 14, "pad": 17},
 }
 
 
@@ -267,11 +267,14 @@ def _chevron(painter: QPainter, rect: QRectF, direction: str, colour: QColor) ->
 
 def apply(app: QApplication, density: str = "standard") -> None:
     """Style, palette, font and stylesheet, in the order Qt needs them."""
+    if app.property("qingjianThemeDensity") == density:
+        return
     if not isinstance(app.style(), CounterStyle):
         app.setStyle(CounterStyle())
     app.setPalette(palette())
     app.setFont(ui_font(metrics(density)["font"]))
     app.setStyleSheet(stylesheet(density))
+    app.setProperty("qingjianThemeDensity", density)
 
 
 def stylesheet(density: str = "standard") -> str:

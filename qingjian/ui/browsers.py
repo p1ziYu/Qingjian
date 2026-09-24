@@ -576,7 +576,7 @@ class Filmstrip(_Browser):
             self._decorations = held
         self.show_path(self._all[index])
 
-    def drop(self, path: str | Path) -> None:
+    def drop(self, path: str | Path, row: int | None = None) -> None:
         """Remove one item, keeping the loaded window aligned with the queue.
 
         A bulk classification in the grid removes items from anywhere, not just
@@ -585,11 +585,17 @@ class Filmstrip(_Browser):
         into a full rebuild.
         """
         key = str(path)
-        try:
-            position = self._all.index(key)
-        except ValueError:
-            self.remove_path(key)
-            return
+        if row is None:
+            try:
+                position = self._all.index(key)
+            except ValueError:
+                self.remove_path(key)
+                return
+        else:
+            position = int(row)
+            if not 0 <= position < len(self._all) or self._all[position] != key:
+                self.remove_path(key)
+                return
         self._all.pop(position)
         self.remove_path(key)
         low, high = self._window

@@ -526,6 +526,48 @@ class G10RestoreButtonTests(unittest.TestCase):
 class RuntimeScanContractTests(unittest.TestCase):
     """Observable Qt coverage paired with the source-only fallback below."""
 
+    def test_late_scan_signals_do_nothing_after_close(self):
+        from PySide6.QtCore import SIGNAL
+        from PySide6.QtWidgets import QApplication
+        from qingjian.ui.duplicates import DuplicatesDialog
+
+        class State:
+            ignored_keys = staticmethod(lambda _root: set())
+
+        class Engine:
+            source_root = None
+            state = State()
+            find_duplicates = staticmethod(lambda *_args: [])
+
+        app = QApplication.instance() or QApplication([])
+        dialog = DuplicatesDialog(Engine())
+        self.assertTrue(dialog._pool.waitForDone(3000))
+        app.processEvents()
+        signatures = (
+            "progress(QString,int)",
+            "done(QString,PyObject)",
+            "failed(QString,QString)",
+            "cancelled(QString)",
+        )
+        self.assertEqual([1, 1, 1, 1], [
+            dialog._signals.receivers(SIGNAL(signature)) for signature in signatures
+        ])
+        dialog.done(0)
+        self.assertEqual([0, 0, 0, 0], [
+            dialog._signals.receivers(SIGNAL(signature)) for signature in signatures
+        ])
+        before = (dialog.progress.value(), dialog.progress.isVisible(),
+                  dialog.summary.text(), dict(dialog._results))
+
+        dialog._signals.progress.emit("late", 83)
+        dialog._signals.done.emit(dedupe.MODE_EXACT, ["late"])
+        dialog._signals.failed.emit(dedupe.MODE_EXACT, "late failure")
+        dialog._signals.cancelled.emit(dedupe.MODE_EXACT)
+        app.processEvents()
+
+        self.assertEqual(before, (dialog.progress.value(), dialog.progress.isVisible(),
+                                  dialog.summary.text(), dict(dialog._results)))
+
     def test_scan_runs_off_thread_reuses_results_and_fills_in_chunks(self):
         from PySide6.QtTest import QTest
         from PySide6.QtWidgets import QApplication, QHeaderView

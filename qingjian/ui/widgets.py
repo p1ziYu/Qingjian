@@ -25,10 +25,6 @@ def separator(vertical: bool = True, length: int = 20) -> QFrame:
     return line
 
 
-def stretch(layout) -> None:
-    layout.addStretch(1)
-
-
 def icon_button(name: str, tooltip: str = "", size: int = 18, object_name: str = "iconButton",
                 color: str = theme.PAPER_DIM) -> QToolButton:
     button = QToolButton()
@@ -199,7 +195,6 @@ class Segmented(QFrame):
         self._group = QButtonGroup(self)
         self._group.setExclusive(True)
         self._buttons: dict[str, QPushButton] = {}
-        self._quiet = False
         self._group.buttonClicked.connect(self._emit)
         if options:
             self.set_options(options)
@@ -228,13 +223,12 @@ class Segmented(QFrame):
             self._layout.addWidget(button)
             self._buttons[value] = button
         if current in self._buttons:
-            self.set_value(current, quiet=True)
+            self.set_value(current)
         elif options:
-            self.set_value(options[0][0], quiet=True)
+            self.set_value(options[0][0])
 
     def _emit(self, button: QPushButton) -> None:
-        if not self._quiet:
-            self.changed.emit(str(button.property("value")))
+        self.changed.emit(str(button.property("value")))
 
     def value(self) -> str:
         for value, button in self._buttons.items():
@@ -242,13 +236,11 @@ class Segmented(QFrame):
                 return value
         return ""
 
-    def set_value(self, value: str, quiet: bool = False) -> None:
+    def set_value(self, value: str) -> None:
         button = self._buttons.get(value)
         if button is None:
             return
-        self._quiet = quiet
         button.setChecked(True)
-        self._quiet = False
 
 
 def set_primary_button(dialog: QWidget, primary: QPushButton) -> None:

@@ -109,7 +109,6 @@ class MainWindow(QMainWindow):
         self._binding_shortcuts: list[QShortcut] = []
         self._fixed_shortcuts: list[QShortcut] = []
         self._arrow_shortcuts: list[QShortcut] = []
-        self._retranslators: list = []
         self._inflight: dict[str, tuple[Path, int]] = {}
         #: The copy that drops into an envelope, its animation and where it lands.
         #: Made once: a widget created per key press is polished against the
@@ -604,7 +603,14 @@ class MainWindow(QMainWindow):
         """Keys the window itself answers to, which no binding may take."""
         return [item.key().toString() for item in self._fixed_shortcuts]
 
+    def _cache_binding_targets(self) -> None:
+        self._binding_targets = [
+            str(Path(binding.folder).resolve()) if binding.folder else ""
+            for binding in self.settings.bindings
+        ]
+
     def _install_binding_shortcuts(self) -> None:
+        self._cache_binding_targets()
         for item in self._binding_shortcuts:
             item.setEnabled(False)
             item.deleteLater()
@@ -709,7 +715,7 @@ class MainWindow(QMainWindow):
         self.view_switch.set_options(
             [(config.VIEW_SINGLE, tr("view.single")), (config.VIEW_GRID, tr("view.grid"))],
             {config.VIEW_SINGLE: "single", config.VIEW_GRID: "grid"})
-        self.view_switch.set_value(self.view_mode, quiet=True)
+        self.view_switch.set_value(self.view_mode)
 
         self.filter_combo.blockSignals(True)
         self.filter_combo.clear()
@@ -1051,16 +1057,20 @@ class MainWindow(QMainWindow):
         self.sidecar_badge.setVisible(False)
         self.filmstrip.follow(self.engine.index)
         self._flipped.append(str(path))
-        pixmap = self.preloader.take(path, self._preview_target())
+        target = self._preview_target()
+        preview_key = self.preloader.key(path, target)
+        pixmap = self.preloader.take(path, target, key=preview_key)
+        thumb_key = None
         if pixmap is None:
-            pixmap = self.thumbs.peek(path, HOLD_EDGE)
+            thumb_key = self.thumbs.key(path, HOLD_EDGE)
+            pixmap = self.thumbs.peek(path, HOLD_EDGE, key=thumb_key)
         if pixmap is not None:
             self.preview.show_still(path, pixmap)
         else:
             # Decode on a worker. Only the last few items stay wanted, so a long
             # hold never leaves a backlog behind it.
             self.thumbs.set_wanted(self._flipped, HOLD_EDGE)
-            self.thumbs.request(path, HOLD_EDGE)
+            self.thumbs.request(path, HOLD_EDGE, key=thumb_key)
         self._settle_pending = True
         self._settle_timer.start()
 
@@ -1141,13 +1151,14 @@ class MainWindow(QMainWindow):
             wanted = [path] + ([queue[(index + step) % total]
                                  for step in (1, 2, -1)] if total > 1 else [])
             self.preloader.set_wanted(wanted, target)
-            ready = self.preloader.take(path, target)
+            preview_key = self.preloader.key(path, target)
+            ready = self.preloader.take(path, target, key=preview_key)
             if ready is None and decodes_slowly(path):
                 # A large PNG or TIFF cannot be scaled while it is decoded, so it
                 # would hold the window for seconds. Show its name, decode on a
                 # worker, and swap the picture in when it lands.
                 self.preview.show_loading(path, path.name, tr("scan.reading"))
-                self.preloader.request(path, target)
+                self.preloader.request(path, target, key=preview_key)
             else:
                 ok, error = self.preview.show_path(path, ready)
                 if not ok:
@@ -1192,9 +1203,10 @@ class MainWindow(QMainWindow):
         if self.preview.stack.currentIndex() != self.preview.EMPTY:
             return                      # something else is already on screen
         target = self._preview_target()
-        ready = self.preloader.take(current, target)
+        preview_key = self.preloader.key(current, target)
+        ready = self.preloader.take(current, target, key=preview_key)
         if ready is None:
-            error = self.preloader.error(current, target)
+            error = self.preloader.error(current, target, key=preview_key)
             if error:
                 self._preview_retries.pop(path, None)
                 message = tr("status.preview_failed", name=Path(path).name, error=error)
@@ -1205,7 +1217,7 @@ class MainWindow(QMainWindow):
             # while this was decoding misses. Ask again at the size we want now
             # rather than declaring the file unreadable.
             if self._preview_retries.get(path, 0) < 2 and self.preloader.request(
-                    current, target):
+                    current, target, key=preview_key):
                 self._preview_retries[path] = self._preview_retries.get(path, 0) + 1
                 return
             self._preview_retries.pop(path, None)
@@ -1272,7 +1284,7 @@ class MainWindow(QMainWindow):
     # ============================================================== views
     def _set_view(self, mode: str) -> None:
         self.view_mode = mode
-        self.view_switch.set_value(mode, quiet=True)
+        self.view_switch.set_value(mode)
         self._place_stamps(mode)
         self.viewer_stack.setCurrentIndex(0 if mode == config.VIEW_SINGLE else 1)
         # Left/Right belong to whichever view is on screen: the grid moves its
@@ -1425,15 +1437,16 @@ class MainWindow(QMainWindow):
 
     def _refresh_bindings(self) -> None:
         counts = self.engine.folder_counts()
-        for card, binding in zip(self._binding_cards, self.settings.bindings):
-            label_key, _desc, needs = config.ACTIONS.get(binding.action,
-                                                         ("action.move", "", True))
+        for card, binding, folder in zip(
+                self._binding_cards, self.settings.bindings, self._binding_targets,
+                strict=False):
+            label_key, _desc, _ = config.ACTIONS.get(binding.action,
+                                                     ("action.move", "", True))
             # Moving is what nearly every key does; a box saying so on all ten
             # envelopes hid the ones that copy or recycle.
             badge_key = {"copy": "action.badge.copy",
                          "favorite": "action.badge.favorite",
                          "trash": "action.badge.undoable"}.get(binding.action, "")
-            folder = str(Path(binding.folder).resolve()) if binding.folder else ""
             card.update_binding(binding, counts.get(folder, 0), tr(label_key),
                                 tr(badge_key) if badge_key else "")
             card.setVisible(True)
@@ -1475,6 +1488,7 @@ class MainWindow(QMainWindow):
             self._conflict_defaults.clear()
             binding.folder = folder
             self.engine.save_settings()
+            self._cache_binding_targets()
             self._refresh_bindings()
             self._drop_excluded()
 
@@ -1764,7 +1778,7 @@ class MainWindow(QMainWindow):
         """
         position = self.engine.drop_from_queue(path)
         if position >= 0:
-            self.filmstrip.drop(path)
+            self.filmstrip.drop(path, row=position)
             if not self._grid_dirty and not self._grid_building:
                 self.grid.remove_path(path)
         self._refresh_view()
@@ -2425,6 +2439,8 @@ class MainWindow(QMainWindow):
                     return
         QApplication.processEvents()
         self._closed = True
+        self._settle_timer.stop()
+        self._settle_pending = False
         if self._queue_listener in self.engine.queue_listeners:
             self.engine.queue_listeners.remove(self._queue_listener)
         QApplication.instance().removeEventFilter(self._arrows)

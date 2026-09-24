@@ -28,16 +28,14 @@ from .widgets import Segmented, caption, separator, set_primary_button
 
 log = get_logger("duplicates")
 
-_ROLE_INDEX = int(Qt.ItemDataRole.UserRole) + 1
-
 #: Rows added per timer tick while filling the table. Inserting tens of
 #: thousands in one go blocks the interface for as long as the scan did.
 _CHUNK = 300
 
-_MARK_STYLE = {
-    "keep": (theme.RAISED, theme.LINE_CONTROL, theme.BALLPOINT_LIGHT),
-    "extra": ("#3A201C", "#6B2F28", theme.GREASE),
-    "lower": ("#3A2E1C", "#6B5530", theme.AMBER),
+_MARK_COLOURS = {
+    "keep": theme.BALLPOINT_LIGHT,
+    "extra": theme.GREASE,
+    "lower": theme.AMBER,
 }
 
 _COLUMN_WIDTHS = (260, 380, 120, 100, 80, 120)
@@ -305,13 +303,15 @@ class DuplicatesDialog(QDialog):
                                 and not self._fill_timer.isActive())
 
     def _on_progress(self, message: str, percent: int) -> None:
-        if not self._scanning:
+        if self._closing or not self._scanning:
             return
         self.progress.setValue(max(0, min(100, int(percent))))
         if message:
             self.summary.setText(tr("dup.hashing", name=message))
 
     def _on_done(self, mode: str, groups) -> None:
+        if self._closing:
+            return
         self._scanning = ""
         self.progress.setVisible(False)
         self._results[mode] = list(groups)
@@ -323,6 +323,8 @@ class DuplicatesDialog(QDialog):
         self._catch_up()
 
     def _on_failed(self, mode: str, error: str) -> None:
+        if self._closing:
+            return
         self._scanning = ""
         self.progress.setVisible(False)
         self._set_busy(False)
@@ -331,6 +333,8 @@ class DuplicatesDialog(QDialog):
             self._catch_up()
 
     def _on_cancelled(self, mode: str) -> None:
+        if self._closing:
+            return
         self._scanning = ""
         self.progress.setVisible(False)
         self._set_busy(False)
@@ -417,7 +421,7 @@ class DuplicatesDialog(QDialog):
             item.setBackground(tint)
             item.setForeground(QColor(theme.PAPER))
             if column == 5:
-                item.setForeground(QColor(_MARK_STYLE[mark][2]))
+                item.setForeground(QColor(_MARK_COLOURS[mark]))
             self.table.setItem(row, column, item)
 
     def _finish_fill(self) -> None:
@@ -556,10 +560,16 @@ class DuplicatesDialog(QDialog):
         # Cut the signals before waiting. A `cancelled` emitted from the worker
         # is queued, so it would otherwise arrive after this returns and start a
         # fresh scan on a dialog already on its way out.
-        try:
-            self._signals.disconnect()
-        except (RuntimeError, TypeError):
-            pass
+        for signal, slot in (
+            (self._signals.progress, self._on_progress),
+            (self._signals.done, self._on_done),
+            (self._signals.failed, self._on_failed),
+            (self._signals.cancelled, self._on_cancelled),
+        ):
+            try:
+                signal.disconnect(slot)
+            except (RuntimeError, TypeError):
+                pass
         # A worker stuck in a decoder must not make closing the dialog block.
         # The unparented pool is retained until it becomes idle, rather than
         # being synchronously destroyed along with this dialog.

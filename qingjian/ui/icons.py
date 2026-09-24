@@ -191,7 +191,3 @@ def app_icon(size: int = 256) -> QIcon:
         result.addPixmap(canvas.scaled(QSize(step, step), Qt.AspectRatioMode.KeepAspectRatio,
                                        Qt.TransformationMode.SmoothTransformation))
     return result
-
-
-def available() -> list[str]:
-    return sorted(_SHAPES)

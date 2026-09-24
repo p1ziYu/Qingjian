@@ -633,6 +633,65 @@ class G06Task4Tests(TestCase):
         self.assertEqual(0, cache.pending())
         cache.shutdown()
 
+    def test_preview_cache_hit_refreshes_lru_order(self):
+        paths = [self.root / f"{name}.jpg" for name in ("a", "b", "c")]
+        for path in paths:
+            path.write_bytes(b"same")
+        target = QSize(80, 60)
+        fetcher = preview.PreviewPrefetcher(depth=2)
+        self.addCleanup(fetcher.shutdown)
+        image = QImage(8, 8, QImage.Format.Format_RGB32)
+        image.fill(0)
+        keys = [fetcher._key(path, target) for path in paths]
+        fetcher._cache[keys[0]] = image
+        fetcher._cache[keys[1]] = image
+
+        self.assertFalse(fetcher.take(paths[0], target).isNull())
+        fetcher._wanted.add(keys[2][:3])
+        fetcher._store(keys[2], fetcher._generation, image, True, "")
+
+        self.assertEqual([keys[0], keys[2]], list(fetcher._cache))
+
+    def test_preview_lookup_reuses_one_file_signature_and_pixmap(self):
+        path = self.root / "preview.jpg"
+        path.write_bytes(b"same")
+        target = QSize(80, 60)
+        fetcher = preview.PreviewPrefetcher()
+        self.addCleanup(fetcher.shutdown)
+        image = QImage(8, 8, QImage.Format.Format_RGB32)
+        image.fill(0)
+
+        with patch.object(Path, "stat", autospec=True,
+                          side_effect=Path.stat) as stat:
+            key = fetcher.key(path, target)
+            fetcher._cache[key] = image
+            first = fetcher.take(path, target, key=key)
+            self.assertEqual("", fetcher.error(path, target, key=key))
+            self.assertTrue(fetcher.request(path, target, key=key))
+            second = fetcher.take(path, target, key=key)
+
+        self.assertEqual(1, stat.call_count)
+        self.assertEqual(first.cacheKey(), second.cacheKey())
+        self.assertEqual(1, len(fetcher._pixmaps))
+
+    def test_thumbnail_peek_request_reuses_one_file_signature(self):
+        path = self.root / "thumb.jpg"
+        path.write_bytes(b"same")
+        cache = thumbs.ThumbnailCache()
+        self.addCleanup(cache.shutdown)
+        image = QImage(8, 8, QImage.Format.Format_RGB32)
+        image.fill(0)
+        pixmap = preview.QPixmap.fromImage(image)
+
+        with patch.object(Path, "stat", autospec=True,
+                          side_effect=Path.stat) as stat:
+            key = cache.key(path, 64)
+            cache._cache[key] = pixmap
+            self.assertIs(pixmap, cache.peek(path, 64, key=key))
+            self.assertIs(pixmap, cache.request(path, 64, key=key))
+
+        self.assertEqual(1, stat.call_count)
+
 
 class G06Task5Tests(TestCase):
     def setUp(self):
@@ -645,6 +704,45 @@ class G06Task5Tests(TestCase):
         path = self.root / "a.jpg"
         path.write_bytes(b"one")
         self.assertTrue(preview.PreviewPrefetcher._key(path, QSize(2800, 1000)) != preview.PreviewPrefetcher._key(path, QSize(2800, 2400)), "target height is absent from key")
+
+    def test_reapplying_the_same_theme_does_no_work(self):
+        from qingjian.ui import theme
+
+        class App:
+            def __init__(self):
+                self._style = object()
+                self._properties = {}
+                self.calls = [0, 0, 0, 0]
+
+            def style(self):
+                return self._style
+
+            def setStyle(self, value):
+                self.calls[0] += 1
+                self._style = value
+
+            def setPalette(self, _value):
+                self.calls[1] += 1
+
+            def setFont(self, _value):
+                self.calls[2] += 1
+
+            def setStyleSheet(self, _value):
+                self.calls[3] += 1
+
+            def property(self, name):
+                return self._properties.get(name)
+
+            def setProperty(self, name, value):
+                self._properties[name] = value
+
+        app = App()
+        theme.apply(app, "standard")
+        self.assertEqual([1, 1, 1, 1], app.calls)
+        theme.apply(app, "standard")
+        self.assertEqual([1, 1, 1, 1], app.calls)
+        theme.apply(app, "compact")
+        self.assertEqual([1, 2, 2, 2], app.calls)
 
 
 if importlib.util.find_spec("PySide6") is not None:

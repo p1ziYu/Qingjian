@@ -47,7 +47,10 @@ class ExifTests(TempCase):
         path = self.make_tiff()
         data = path.read_bytes()
         self.write(self.tmp / "cut.tif", data[:64])
-        exifread.read_tiff_exif(self.tmp / "cut.tif")
+        self.assertEqual(
+            {"ImageWidth": 400, "ImageLength": 300},
+            exifread.read_tiff_exif(self.tmp / "cut.tif"),
+        )
 
 
 class IsoBmffTests(TempCase):
@@ -528,6 +531,39 @@ class G09MediaTests(TempCase):
         self.assertTrue(image.isNull())
         self.assertIn('HEIC', error.upper())
         self.assertTrue('decoder' in error.lower() or '解码器' in error)
+
+    def test_rotated_jpeg_scales_in_its_display_orientation(self):
+        from PySide6.QtCore import QSize
+        from qingjian.ui.preview import decode_qimage
+
+        path = self.root / "rotated.jpg"
+        exif = Image.Exif()
+        exif[274] = 6
+        source = Image.new("RGB", (1200, 600))
+        source.paste((240, 20, 20), (0, 0, 600, 300))
+        source.paste((20, 220, 40), (600, 0, 1200, 300))
+        source.paste((20, 40, 230), (0, 300, 600, 600))
+        source.paste((230, 210, 20), (600, 300, 1200, 600))
+        source.save(path, quality=95, exif=exif)
+
+        image, error = decode_qimage(path, QSize(300, 400))
+
+        self.assertEqual("", error)
+        self.assertEqual(QSize(200, 400), image.size())
+        expected = {
+            (5, 5): (20, 40, 230),
+            (194, 5): (240, 20, 20),
+            (194, 394): (20, 220, 40),
+            (5, 394): (230, 210, 20),
+        }
+        for point, colour in expected.items():
+            with self.subTest(point=point):
+                actual = image.pixelColor(*point)
+                self.assertTrue(
+                    all(abs(got - want) <= 20
+                        for got, want in zip(actual.getRgb()[:3], colour, strict=True)),
+                    (point, actual.getRgb()[:3], colour),
+                )
 
     def test_f052_png_metadata_does_not_load_pixels(self):
         path = self.root / 'picture.png'

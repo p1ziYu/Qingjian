@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 import time
+import traceback
 import uuid
 from types import SimpleNamespace
 from unittest import mock
@@ -35,6 +36,27 @@ class QtCase(TempCase):
         super().setUp()
         from qingjian.ui.app import create_app
         self.app = create_app(["qingjian-tests"])
+        previous_hook = sys.excepthook
+        self._qt_callback_errors = []
+
+        def capture_callback_error(exc_type, value, tb):
+            self._qt_callback_errors.append((exc_type, value, tb))
+
+        sys.excepthook = capture_callback_error
+        self.addCleanup(self._finish_qt_callbacks, previous_hook)
+
+    def _finish_qt_callbacks(self, previous_hook) -> None:
+        try:
+            self.app.processEvents()
+        finally:
+            sys.excepthook = previous_hook
+        if self._qt_callback_errors:
+            details = "".join(
+                line
+                for exc_type, value, tb in self._qt_callback_errors
+                for line in traceback.format_exception(exc_type, value, tb)
+            )
+            self.fail(f"Qt callback exception(s):\n{details}")
 
     def patch(self, owner, name, value) -> None:
         original = getattr(owner, name)
@@ -54,6 +76,27 @@ class QtCase(TempCase):
         move -- lands a beat after the call that asked for it.
         """
         self.assertTrue(self.wait_until(predicate, timeout), message)
+
+
+@unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
+class QtCallbackHookTests(TempCase):
+    def test_a_qt_callback_exception_fails_the_case(self):
+        class FailingCase(QtCase):
+            def runTest(inner_self):
+                def fail():
+                    raise RuntimeError("callback exploded")
+
+                QTimer.singleShot(0, fail)
+                inner_self.app.processEvents()
+
+        previous_hook = sys.excepthook
+        result = unittest.TestResult()
+        FailingCase().run(result)
+        self.assertFalse(result.wasSuccessful())
+        details = "\n".join(text for _, text in result.errors + result.failures)
+        self.assertIn("callback exploded", details)
+        self.assertIn("Traceback", details)
+        self.assertIs(previous_hook, sys.excepthook)
 
 
 class WindowCase(QtCase):
@@ -750,6 +793,24 @@ class FilmstripDecorationTests(QtCase):
         self.app.processEvents()
         self.assertEqual(80, len(strip._decorations), "the stars were dropped")
 
+    def test_drop_with_a_known_row_does_not_search_the_queue(self):
+        from qingjian.ui.browsers import Filmstrip
+        from qingjian.ui.thumbs import ThumbnailCache
+
+        class NoIndex(list):
+            def index(self, *_args, **_kwargs):
+                raise AssertionError("known row searched with list.index")
+
+        cache = ThumbnailCache()
+        self.addCleanup(cache.shutdown)
+        strip = Filmstrip(cache)
+        self.addCleanup(strip.deleteLater)
+        strip._all = NoIndex(["a", "b", "c"])
+        strip._window = (1, 3)
+        strip.drop("b", row=1)
+        self.assertEqual(["a", "c"], strip._all)
+        self.assertEqual((1, 2), strip._window)
+
 
 @unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
 class SelectAllCostTests(QtCase):
@@ -1002,7 +1063,8 @@ class RuntimeMainWindowContractTests(WindowCase):
              mock.patch.object(self.window.preview, "show_path") as show_path:
             self.window._refresh_view()
         loading.assert_called_once()
-        foreground = [call for call in request.call_args_list if not call.kwargs]
+        foreground = [call for call in request.call_args_list
+                      if call.kwargs.get("priority", 1) != 0]
         self.assertEqual(1, len(foreground))
         self.assertEqual(current, foreground[0].args[0])
         self.assertEqual(self.window._preview_target(), foreground[0].args[1])
@@ -1014,7 +1076,7 @@ class RuntimeMainWindowContractTests(WindowCase):
              mock.patch.object(self.window.preloader, "error", return_value=""), \
              mock.patch.object(self.window.preloader, "request", return_value=True) as retry:
             self.window._preview_arrived(str(current))
-        retry.assert_called_once_with(current, self.window._preview_target())
+        retry.assert_called_once_with(current, self.window._preview_target(), key=mock.ANY)
         self.assertEqual(1, self.window._preview_retries[str(current)])
 
         ready = QImage(8, 8, QImage.Format.Format_RGB32)
@@ -1036,7 +1098,7 @@ class RuntimeMainWindowContractTests(WindowCase):
                                return_value=(True, "")) as show_path:
             self.window.preloader.arrived.emit(str(current))
             self.app.processEvents()
-        take.assert_called_once_with(current, self.window._preview_target())
+        take.assert_called_once_with(current, self.window._preview_target(), key=mock.ANY)
         show_path.assert_called_once_with(current, ready)
 
     def test_undo_and_redo_patch_from_records_without_rescanning(self):
@@ -1156,7 +1218,7 @@ class RuntimeMainWindowContractTests(WindowCase):
              mock.patch.object(self.window.preloader, "error", return_value=""), \
              mock.patch.object(self.window.preloader, "request", return_value=True) as request:
             self.window._preview_arrived(str(current))
-        request.assert_called_once_with(current, self.window._preview_target())
+        request.assert_called_once_with(current, self.window._preview_target(), key=mock.ANY)
         self.assertEqual({str(current): 1}, self.window._preview_retries)
 
     def test_finish_operation_absorbs_one_record_without_rebuilding(self):
@@ -1171,6 +1233,20 @@ class RuntimeMainWindowContractTests(WindowCase):
         absorb.assert_called_once_with(record)
         apply.assert_called_once_with(change)
         rebuild.assert_not_called()
+
+    def test_completed_jobs_reuse_normalized_binding_targets(self):
+        real_resolve = Path.resolve
+        self.window._install_binding_shortcuts()
+        with mock.patch.object(Path, "resolve", autospec=True,
+                               side_effect=real_resolve) as resolve:
+            self.window._refresh_bindings()
+            self.assertEqual(0, resolve.call_count)
+            self.settings.bindings[0].folder = str(self.tmp / "changed")
+            self.window._install_binding_shortcuts()
+            changed_calls = resolve.call_count
+            self.assertGreater(changed_calls, 0)
+            self.window._refresh_bindings()
+            self.assertEqual(changed_calls, resolve.call_count)
 
 
 class BackgroundQueueTests(WindowCase):
@@ -1779,6 +1855,20 @@ class HoldArrowTests(WindowCase):
         dialog.close()
         name = self.engine.current_path().name
         self.until(lambda: self.rendered[-1] == name, "never rendered after the dialog closed")
+
+    def test_closing_stops_a_pending_settle(self):
+        self.right()
+        self.right(repeat=True)
+        self.assertTrue(self.window._settle_timer.isActive())
+        self.assertTrue(self.window._settle_pending)
+
+        self.window.close()
+
+        self.assertFalse(self.window._settle_timer.isActive())
+        self.assertFalse(self.window._settle_pending)
+        rendered = list(self.rendered)
+        QTest.qWait(self.window._settle_timer.interval() + 20)
+        self.assertEqual(rendered, self.rendered)
 
 
 @unittest.skipUnless(HAVE_QT, "PySide6 is not installed")

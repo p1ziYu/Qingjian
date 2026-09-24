@@ -150,7 +150,6 @@ class SidecarDialog(_NoArrowButtonDialog):
         super().__init__(parent)
         self.setWindowTitle(tr("sidecar.title"))
         self.setMinimumWidth(680)
-        self.group = group
         self._checks: list[tuple[QCheckBox, Path]] = []
 
         layout = QVBoxLayout(self)

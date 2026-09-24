@@ -128,6 +128,9 @@ class ThumbnailCache(QObject):
         except OSError:
             return (str(path), edge, 0, 0)
 
+    def key(self, path: str | Path, edge: int) -> tuple:
+        return self._key(Path(path), edge)
+
     def _is_wanted(self, path: str, edge: int) -> bool:
         with self._lock:
             return (path, edge) in self._wanted
@@ -145,17 +148,17 @@ class ThumbnailCache(QObject):
             self._wanted.update((str(p), edge) for p in paths)
 
     # -- access --------------------------------------------------------
-    def peek(self, path: str | Path, edge: int) -> QPixmap | None:
-        key = self._key(Path(path), edge)
+    def peek(self, path: str | Path, edge: int, *, key: tuple | None = None) -> QPixmap | None:
+        key = key or self._key(Path(path), edge)
         pixmap = self._cache.get(key)
         if pixmap is not None:
             self._cache.move_to_end(key)
         return pixmap
 
-    def request(self, path: str | Path, edge: int) -> QPixmap | None:
+    def request(self, path: str | Path, edge: int, *, key: tuple | None = None) -> QPixmap | None:
         """Return the thumbnail now, or start producing it and return None."""
         target = Path(path)
-        key = self._key(target, edge)
+        key = key or self._key(target, edge)
         cached = self._cache.get(key)
         if cached is not None:
             self._cache.move_to_end(key)

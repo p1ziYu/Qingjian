@@ -8,8 +8,8 @@ from collections import OrderedDict
 
 from PySide6.QtCore import (QObject, QRect, QRectF, QRunnable, QSize, Qt, QThreadPool, QUrl,
                             Signal)
-from PySide6.QtGui import (QBrush, QColor, QImage, QImageReader, QMovie, QPainter, QPixmap,
-                           QTransform)
+from PySide6.QtGui import (QBrush, QColor, QImage, QImageIOHandler, QImageReader, QMovie,
+                           QPainter, QPixmap, QTransform)
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (QComboBox, QFrame, QGraphicsPixmapItem, QGraphicsRectItem,
@@ -46,9 +46,16 @@ def decode_qimage(path: str | Path, target: QSize) -> tuple[QImage, str]:
         reader = QImageReader(str(target_path))
         reader.setAutoTransform(True)
         original = reader.size()
-        if original.isValid() and (original.width() > target.width()
-                                   or original.height() > target.height()):
-            reader.setScaledSize(original.scaled(target, Qt.AspectRatioMode.KeepAspectRatio))
+        display_size = QSize(original)
+        rotated = bool(
+            reader.transformation() & QImageIOHandler.Transformation.TransformationRotate90
+        )
+        if rotated:
+            display_size.transpose()
+        if display_size.isValid() and (display_size.width() > target.width()
+                                       or display_size.height() > target.height()):
+            scaled = display_size.scaled(target, Qt.AspectRatioMode.KeepAspectRatio)
+            reader.setScaledSize(QSize(scaled.height(), scaled.width()) if rotated else scaled)
         image = reader.read()
         if not image.isNull():
             return image, ""
@@ -121,6 +128,7 @@ class PreviewPrefetcher(QObject):
     def __init__(self, depth: int = 4, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._cache: "OrderedDict[tuple, QImage]" = OrderedDict()
+        self._pixmaps: dict[tuple, QPixmap] = {}
         self._errors: dict[tuple, str] = {}
         self._pending: set[tuple] = set()
         # Interest tracks names and viewport size. Full cache keys below still
@@ -144,16 +152,25 @@ class PreviewPrefetcher(QObject):
         return (str(path), target.width(), target.height(), stat.st_size,
                 stat.st_mtime_ns)
 
-    def take(self, path: str | Path, target: QSize) -> QPixmap | None:
+    def key(self, path: str | Path, target: QSize) -> tuple:
+        return self._key(Path(path), target)
+
+    def take(self, path: str | Path, target: QSize, *, key: tuple | None = None) -> QPixmap | None:
         """A decoded neighbour, if one was ready. Interface thread only."""
-        image = self._cache.get(self._key(Path(path), target))
+        key = key or self._key(Path(path), target)
+        image = self._cache.get(key)
         if image is None or image.isNull():
             return None
-        return QPixmap.fromImage(image)
+        self._cache.move_to_end(key)
+        pixmap = self._pixmaps.get(key)
+        if pixmap is None:
+            pixmap = QPixmap.fromImage(image)
+            self._pixmaps[key] = pixmap
+        return pixmap
 
-    def error(self, path: str | Path, target: QSize) -> str:
+    def error(self, path: str | Path, target: QSize, *, key: tuple | None = None) -> str:
         """The last worker decode error for this exact file and viewport."""
-        return self._errors.get(self._key(Path(path), target), "")
+        return self._errors.get(key or self._key(Path(path), target), "")
 
     def prefetch(self, paths, target: QSize) -> None:
         for path in list(paths)[:self._depth]:
@@ -170,7 +187,8 @@ class PreviewPrefetcher(QObject):
         with self._lock:
             return generation == self._generation and key[:3] in self._wanted
 
-    def request(self, path: str | Path, target: QSize, priority: int = 1) -> bool:
+    def request(self, path: str | Path, target: QSize, priority: int = 1,
+                *, key: tuple | None = None) -> bool:
         """Decode *path* on a worker. True when it was queued or already in hand.
 
         A priority above zero jumps the neighbours already queued, which is what
@@ -179,8 +197,9 @@ class PreviewPrefetcher(QObject):
         candidate = Path(path)
         if mediatypes.is_video(candidate):
             return False
-        key = self._key(candidate, target)
+        key = key or self._key(candidate, target)
         if key in self._cache:
+            self._cache.move_to_end(key)
             return True
         if key in self._pending:
             return True
@@ -200,11 +219,13 @@ class PreviewPrefetcher(QObject):
             return
         if image is not None:
             self._cache[key] = image
+            self._pixmaps.pop(key, None)
             self._errors.pop(key, None)
         elif error:
             self._errors[key] = error
         while len(self._cache) > self._depth:
-            self._cache.popitem(last=False)
+            stale, _image = self._cache.popitem(last=False)
+            self._pixmaps.pop(stale, None)
         self.arrived.emit(key[0])
 
     def clear(self) -> None:
@@ -217,6 +238,7 @@ class PreviewPrefetcher(QObject):
             self._wanted.clear()
         self._pool.clear()
         self._cache.clear()
+        self._pixmaps.clear()
         self._errors.clear()
         self._pending.clear()
 

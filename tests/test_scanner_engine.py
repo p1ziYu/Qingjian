@@ -89,7 +89,9 @@ class ScannerTests(TempCase):
         self.assertEqual(4, len(got))
 
     def test_an_unfinished_regex_does_not_raise(self):
-        scanner.apply_filter(self.deep, scanner.FilterSpec(name_pattern="burst("))
+        self.assertEqual(
+            [], scanner.apply_filter(self.deep, scanner.FilterSpec(name_pattern="burst("))
+        )
 
     def test_date_range(self):
         got = scanner.apply_filter(self.deep, scanner.FilterSpec(
@@ -110,7 +112,10 @@ class ScannerTests(TempCase):
 
     def test_sorting_modes_do_not_raise(self):
         for mode in scanner.SORTS:
-            scanner.sort_paths(self.deep, mode, ratings={})
+            with self.subTest(mode=mode):
+                self.assertCountEqual(
+                    self.deep, scanner.sort_paths(self.deep, mode, ratings={})
+                )
 
     def test_reverse(self):
         forward = scanner.sort_paths(self.deep, "name")

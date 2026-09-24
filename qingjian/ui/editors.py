@@ -457,7 +457,7 @@ class SettingsDialog(QDialog):
 
     def _segmented(self, key: str, options, value: str) -> Segmented:
         widget = Segmented(options)
-        widget.set_value(value, quiet=True)
+        widget.set_value(value)
         self._controls[key] = widget
         return widget
 

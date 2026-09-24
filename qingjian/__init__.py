@@ -5,7 +5,7 @@ The package is split so that everything decidable without a GUI lives in
 top of it.
 """
 
-__version__ = "2.0.4"
+__version__ = "2.0.5"
 __app_name__ = "Qingjian"
 __display_name__ = "轻拣"
 __organization__ = "LocalMediaTools"

@@ -5,7 +5,7 @@
 [![Latest release](https://img.shields.io/github/v/release/p1ziYu/Qingjian?display_name=tag&sort=semver)](https://github.com/p1ziYu/Qingjian/releases)
 [![Platform](https://img.shields.io/badge/platform-Windows-0078D6)](https://github.com/p1ziYu/Qingjian)
 [![Python](https://img.shields.io/badge/Python-3.12%20%7C%203.13-3776AB)](https://www.python.org/)
-[![Status](https://img.shields.io/badge/status-tested-2EA44F)](https://github.com/p1ziYu/Qingjian/releases/tag/v2.0.4)
+[![Status](https://img.shields.io/badge/status-tested-2EA44F)](https://github.com/p1ziYu/Qingjian/releases/tag/v2.0.5)
 
 [English](#qingjian-轻拣) · [中文](#中文说明)
 
@@ -13,14 +13,14 @@
 
 Qingjian helps you turn an unsorted media folder into an organized library with a fast review loop: preview one item, press a configured key, and continue to the next item. It supports images and videos, configurable destinations, safe file transactions, duplicate review, and a complete undo/recovery workflow.
 
-Version **2.0.4** is the current tested build. The 2.0.4 maintenance release restores the tested 2.0.3 visual baseline and fixes the startup state of the Undo and “Restore previous step” actions.
+Version **2.0.5** is the current tested build. This maintenance release hardens file transactions and recovery, fixes selection, preview, queue, duplicate-review, metadata, dialog, and startup edge cases, and adds broad regression coverage.
 
 ## At a glance
 
 | | |
 | --- | --- |
 | **Product** | Qingjian / 轻拣 |
-| **Current release** | [v2.0.4](https://github.com/p1ziYu/Qingjian/releases/tag/v2.0.4) |
+| **Current release** | [v2.0.5](https://github.com/p1ziYu/Qingjian/releases/tag/v2.0.5) |
 | **Platform** | Windows 10/11 |
 | **Interface** | PySide6 desktop UI · English / 简体中文 |
 | **Media** | Photos, RAW files, videos, and sidecar metadata |
@@ -42,7 +42,7 @@ Version **2.0.4** is the current tested build. The 2.0.4 maintenance release res
 
 ## Download and run (Windows)
 
-1. Download the latest `Qingjian-2.0.4-Windows.zip` from the repository Releases page.
+1. Download the latest `Qingjian-2.0.5-Windows.zip` from the repository Releases page.
 2. Extract the archive to a local folder.
 3. Run `MediaSorter.exe` inside the extracted `MediaSorter` folder. Keep the folder together: the executable loads its libraries from beside it instead of unpacking them on every launch.
 4. Select a source folder, configure the key bindings, and start reviewing.
@@ -216,7 +216,7 @@ AI-generated suggestions were reviewed and integrated by the maintainer. The pro
 
 轻拣（Qingjian）是一款面向 Windows 的本地图片与视频快速分类工具。选择来源文件夹后，可以用 `1`–`0` 等快捷键把当前媒体移动、复制、收藏、重命名、回收或打标签，并自动进入下一项。
 
-主要功能包括：图片/视频预览、可配置按键与目标目录、路径和命名模板、同名文件 Replace/自动编号、伴随文件事务处理、查重与忽略、评分和色标、待复查队列，以及可恢复的撤销流程。2.0.4 还修复了启动时“撤销”和“恢复上一步”误亮的问题。
+主要功能包括：图片/视频预览、可配置按键与目标目录、路径和命名模板、同名文件 Replace/自动编号、伴随文件事务处理、查重与忽略、评分和色标、待复查队列，以及可恢复的撤销流程。2.0.5 加固了文件事务与恢复，并修复了选区、预览、后台队列、查重、元数据、对话框和启动流程中的边界问题。
 
 使用要点：长按 ← → 可连续翻页；Delete 直接删除、不再确认，文件移到同盘的隐藏文件夹 `.qingjian-trash`，Ctrl+Z 即可恢复；单击按键卡片执行动作，右键卡片更换目标文件夹；在“设置 → 通用”里打开资源管理器右键菜单后，可以在文件夹上右键“用轻拣打开”。发布包是一个 `MediaSorter` 文件夹，请整个解压后运行其中的 `MediaSorter.exe`。
 

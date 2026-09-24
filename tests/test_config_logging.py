@@ -1,4 +1,5 @@
 import zipfile
+import json
 
 from base import TempCase, unittest
 from qingjian.core import appdirs, config, logsetup, platform_
@@ -6,6 +7,24 @@ from qingjian.core.safestore import VERIFY_FAST
 
 
 class ConfigTests(TempCase):
+    def test_non_finite_numbers_fall_back_and_bad_settings_are_preserved(self):
+        path = self.data / "settings.json"
+        path.write_text(json.dumps({
+            "workers": float("inf"),
+            "quota": {"max_bytes": float("inf")},
+            "profiles": {"P": [{"sequence_start": float("-inf")}]},
+            "current_profile": "P",
+        }), encoding="utf-8")
+        settings = config.load(path)
+        self.assertEqual(4, settings.workers)
+        self.assertEqual(config.Settings().quota.max_bytes, settings.quota.max_bytes)
+        self.assertEqual(1, settings.bindings[0].sequence_start)
+        from unittest.mock import patch
+        with patch.object(config.Settings, "from_dict", side_effect=TypeError("bad shape")):
+            settings = config.load(path)
+        self.assertEqual(4, settings.workers)
+        self.assertTrue(path.with_suffix(".broken.json").exists())
+
     def test_defaults_are_sane(self):
         settings = config.Settings()
         settings.ensure_profile()

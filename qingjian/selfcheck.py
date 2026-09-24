@@ -12,6 +12,8 @@ temporary folder is touched.
 """
 from __future__ import annotations
 
+import faulthandler
+import functools
 import os
 import sys
 import tempfile
@@ -22,8 +24,122 @@ from pathlib import Path
 RESULTS: list[tuple[str, bool, str]] = []
 
 
+def _reject_active_modal(errors: list[str], active=None) -> None:
+    """Close an unexpected modal dialog so an unattended self-check can finish."""
+    if active is None:
+        from PySide6.QtWidgets import QApplication
+        active = QApplication.activeModalWidget
+    dialog = active()
+    if dialog is None:
+        return
+    title = dialog.windowTitle() if hasattr(dialog, "windowTitle") else ""
+    text = dialog.text() if hasattr(dialog, "text") else ""
+    description = f"unexpected modal {type(dialog).__name__}: {title!r} {text!r}"
+    if description not in errors:
+        errors.append(description)
+    if hasattr(dialog, "reject"):
+        dialog.reject()
+    else:
+        dialog.close()
+
+
+class _CallbackExceptionMonitor:
+    """Collect exceptions escaping Python callbacks in the UI package."""
+
+    def __init__(self) -> None:
+        self.errors: list[str] = []
+        self._old_hook = None
+        self._old_unraisable = None
+        self._old_trace = None
+        self._tool_id = None
+        self._wrapped: list[tuple[type, str, object]] = []
+
+    def _add_error(self, error: BaseException) -> None:
+        detail = f"{type(error).__name__}: {error}"
+        if detail not in self.errors:
+            self.errors.append(detail)
+
+    def watch_class(self, cls: type) -> None:
+        """Wrap Python Qt callbacks so binding-layer exception handling cannot hide them."""
+        for name, original in list(cls.__dict__.items()):
+            if not callable(original):
+                continue
+            if not (name.endswith("Event") or name in ("event", "eventFilter")):
+                continue
+
+            def guarded(instance, *args, __original=original, **kwargs):
+                try:
+                    return __original(instance, *args, **kwargs)
+                except BaseException as error:
+                    self._add_error(error)
+                    raise
+
+            self._wrapped.append((cls, name, original))
+            setattr(cls, name, guarded)
+
+    def _trace(self, frame, event, arg):
+        if event == "exception":
+            name = frame.f_code.co_name
+            if name.endswith("Event") or name in ("event", "eventFilter"):
+                _kind, value, _tb = arg
+                self._add_error(value)
+        return self._trace
+
+    def record(self, exc_info) -> None:
+        _kind, value, _tb = exc_info
+        self._add_error(value)
+
+    def __enter__(self):
+        self._old_hook = sys.excepthook
+
+        def hook(kind, value, tb):
+            self.record((kind, value, tb))
+
+        sys.excepthook = hook
+        self._old_unraisable = sys.unraisablehook
+
+        def unraisable(details):
+            self.record((details.exc_type, details.exc_value, details.exc_traceback))
+
+        sys.unraisablehook = unraisable
+        self._old_trace = sys.gettrace()
+        sys.settrace(self._trace)
+        monitoring = getattr(sys, "monitoring", None)
+        if monitoring is not None:
+            tool_id = monitoring.DEBUGGER_ID
+            try:
+                monitoring.use_tool_id(tool_id, "qingjian-selfcheck")
+
+                def unwind(code, _offset, exception):
+                    callback = (code.co_name.endswith("Event") or
+                                code.co_name in ("event", "eventFilter"))
+                    if callback:
+                        self._add_error(exception)
+
+                monitoring.register_callback(tool_id, monitoring.events.PY_UNWIND, unwind)
+                monitoring.set_events(tool_id, monitoring.events.PY_UNWIND)
+                self._tool_id = tool_id
+            except (ValueError, RuntimeError):
+                self._tool_id = None
+        return self
+
+    def __exit__(self, _kind, _value, _tb) -> None:
+        for cls, name, original in reversed(self._wrapped):
+            setattr(cls, name, original)
+        self._wrapped.clear()
+        sys.settrace(self._old_trace)
+        sys.unraisablehook = self._old_unraisable
+        sys.excepthook = self._old_hook
+        if self._tool_id is not None:
+            monitoring = sys.monitoring
+            monitoring.set_events(self._tool_id, 0)
+            monitoring.register_callback(self._tool_id, monitoring.events.PY_UNWIND, None)
+            monitoring.free_tool_id(self._tool_id)
+
+
 def check(name: str):
     def wrapper(function):
+        @functools.wraps(function)
         def run(*args, **kwargs):
             started = time.perf_counter()
             try:
@@ -70,6 +186,7 @@ def _make_library(root: Path) -> dict:
 def run(argv: list[str] | None = None) -> int:
     argv = argv or []
     keep = "--keep" in argv
+    RESULTS.clear()
     workspace = Path(tempfile.mkdtemp(prefix="qingjian-selfcheck-"))
     data = workspace / "data"
     data.mkdir()
@@ -77,14 +194,23 @@ def run(argv: list[str] | None = None) -> int:
     library = workspace / "library"
     print(f"workspace: {workspace}")
 
-    ok = True
-    ok &= _check_imports()
-    ok &= _check_catalogue()
-    ok &= _check_core(library, data)
-    ok &= _check_scale(workspace)
-    ok &= _check_history(workspace)
-    ok &= _check_duplicates(workspace)
-    ok &= _check_ui(library, data)
+    checks = (
+        (_check_imports, ()),
+        (_check_catalogue, ()),
+        (_check_core, (library, data)),
+        (_check_scale, (workspace,)),
+        (_check_history, (workspace,)),
+        (_check_duplicates, (workspace,)),
+        (_check_ui, (library, data)),
+    )
+    faulthandler.dump_traceback_later(240, exit=True)
+    try:
+        for function, args in checks:
+            function(*args)
+            name, passed, detail = RESULTS[-1]
+            print(f"[{'PASS' if passed else 'FAIL'}] {name}: {detail}", flush=True)
+    finally:
+        faulthandler.cancel_dump_traceback_later()
 
     print()
     width = max(len(name) for name, _, _ in RESULTS) + 2
@@ -126,6 +252,21 @@ def _check_imports() -> str:
             optional[name] = getattr(module, "__version__", "present")
         except Exception:
             optional[name] = "MISSING"
+    if getattr(sys, "frozen", False):
+        missing = [name for name in ("av", "send2trash") if optional[name] == "MISSING"]
+        from qingjian.core import video
+        if not video.available() and "av" not in missing:
+            missing.append("PyAV runtime")
+        if sys.platform == "win32":
+            from PySide6.QtCore import QLibraryInfo
+            plugins = Path(QLibraryInfo.path(QLibraryInfo.LibraryPath.PluginsPath))
+            if not (plugins / "platforms" / "qwindows.dll").is_file():
+                missing.append("platforms/qwindows.dll")
+            multimedia = plugins / "multimedia"
+            if not multimedia.is_dir() or not any(multimedia.iterdir()):
+                missing.append("multimedia plugin")
+        if missing:
+            raise AssertionError("frozen bundle missing: " + ", ".join(missing))
     return " ".join(f"{k}={v}" for k, v in optional.items())
 
 
@@ -163,8 +304,10 @@ def _check_core(library: Path, data: Path) -> str:
         moved = sorted(p.name for p in keep.rglob("*") if p.is_file())
         assert len(moved) == 3, f"sidecars did not travel: {moved}"
         engine.undo()
-        assert not any(keep.rglob("*.JPG")), "undo left files behind"
-        assert (library / "Day1" / "IMG_0001.CR2").exists(), "undo lost the raw"
+        restored = library / "Day1"
+        for suffix in ("JPG", "CR2", "XMP"):
+            assert (restored / f"IMG_0001.{suffix}").exists(), f"undo lost IMG_0001.{suffix}"
+        assert not any(path.is_file() for path in keep.rglob("*")), "undo left files behind"
         exact = engine.find_duplicates(dedupe.MODE_EXACT)
         assert len(exact) == 1, f"expected one duplicate group, got {len(exact)}"
         engine.find_duplicates(dedupe.MODE_SIMILAR)
@@ -213,6 +356,8 @@ def _check_scale(workspace: Path) -> str:
     try:
         start = time.perf_counter()
         engine.open_folder(library)
+        assert len(engine.queue_paths) == count, (
+            f"expected {count} queue rows, got {len(engine.queue_paths)}")
         opened = time.perf_counter() - start
 
         start = time.perf_counter()
@@ -229,7 +374,10 @@ def _check_scale(workspace: Path) -> str:
             current = engine.current_path()
             if current is None:
                 break
-            engine.classify(settings.bindings[0], current)
+            outcome = engine.classify(settings.bindings[0], current)
+            assert outcome.record is not None, "large-folder classify produced no record"
+            assert engine.absorb(outcome.record) is not None, (
+                "large-folder classify could not patch the queue")
         sort_ms = (time.perf_counter() - start) / 15 * 1000
 
         # Pointing a key at a folder used to re-read the whole library.
@@ -378,6 +526,9 @@ def _check_duplicates(workspace: Path) -> str:
 
         start = time.perf_counter()
         similar = dedupe.find_similar(paths, cache=cache)
+        if len(similar) < expected:
+            raise AssertionError(
+                f"expected at least {expected} similar sets, found {len(similar)}")
         cold = time.perf_counter() - start
         start = time.perf_counter()
         again = dedupe.find_similar(paths, cache=cache)
@@ -398,7 +549,8 @@ def _check_duplicates(workspace: Path) -> str:
 def _check_ui(library: Path, data: Path) -> str:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-    from qingjian.core import config
+    from qingjian.core import config, i18n
+    from qingjian.core.sidecar import PROMPT_ALWAYS
     from qingjian.core.engine import Engine
     from qingjian.ui.app import create_app
     from qingjian.ui.mainwindow import MainWindow
@@ -408,57 +560,68 @@ def _check_ui(library: Path, data: Path) -> str:
     settings.recursive = True
     settings.background_queue = False
     settings.restore_position = False
+    settings.sidecar = settings.sidecar.with_prompt(PROMPT_ALWAYS)
     settings.bindings[0].folder = str(library.parent / "Keepers2")
     settings.bindings[0].name_template = "{name}"
     engine = Engine(data, settings)
     notes = []
+    modal_errors: list[str] = []
+    i18n.translator().missing.clear()
+    from PySide6.QtCore import QTimer
+    modal_guard = QTimer()
+    modal_guard.timeout.connect(lambda: _reject_active_modal(modal_errors))
+    modal_guard.start(100)
+    callback_monitor = _CallbackExceptionMonitor()
+    callback_monitor.watch_class(MainWindow)
     try:
-        window = MainWindow(engine)
-        window.resize(1540, 940)
-        window.show()
-        app.processEvents()
-        assert not window.undo_button.isEnabled(), "undo enabled on a fresh window"
-        assert not window.redo_button.isEnabled(), "redo enabled on a fresh window"
-        notes.append("fresh undo/redo disabled")
-        window.open_folder(library)
-        app.processEvents()
-        notes.append(f"queue={len(engine.queue_paths)}")
-
-        for code in ("en", "zh"):
-            window._change_language(code)
+        with callback_monitor:
+            window = MainWindow(engine)
+            window.resize(1540, 940)
+            window.show()
             app.processEvents()
-        notes.append("language ok")
-
-        for mode in (config.VIEW_GRID, config.VIEW_SINGLE):
-            window._set_view(mode)
+            assert not window.undo_button.isEnabled(), "undo enabled on a fresh window"
+            assert not window.redo_button.isEnabled(), "redo enabled on a fresh window"
+            notes.append("fresh undo/redo disabled")
+            window.open_folder(library)
+            engine.go_to(library / "Day1" / "IMG_0002.JPG")
             app.processEvents()
-        notes.append("views ok")
+            notes.append(f"queue={len(engine.queue_paths)}")
 
-        for index in range(window.filter_combo.count()):
-            window.filter_combo.setCurrentIndex(index)
+            for code in ("en", "zh"):
+                window._change_language(code)
+                app.processEvents()
+            notes.append("language ok")
+
+            for mode in (config.VIEW_GRID, config.VIEW_SINGLE):
+                window._set_view(mode)
+                app.processEvents()
+            notes.append("views ok")
+
+            for index in range(window.filter_combo.count()):
+                window.filter_combo.setCurrentIndex(index)
+                app.processEvents()
+            window.filter_combo.setCurrentIndex(0)
+            for index in range(window.sort_combo.count()):
+                window.sort_combo.setCurrentIndex(index)
+                app.processEvents()
+            window.sort_combo.setCurrentIndex(0)
+            notes.append("filters ok")
+
+            window.step(1)
+            window.step(-1)
+            window._rate_current(3)
+            window._label_by_index(2)
             app.processEvents()
-        window.filter_combo.setCurrentIndex(0)
-        for index in range(window.sort_combo.count()):
-            window.sort_combo.setCurrentIndex(index)
-            app.processEvents()
-        window.sort_combo.setCurrentIndex(0)
-        notes.append("filters ok")
+            notes.append("tagging ok")
 
-        window.step(1)
-        window.step(-1)
-        window._rate_current(3)
-        window._label_by_index(2)
-        app.processEvents()
-        notes.append("tagging ok")
-
-        # Dialogs: build each one and close it without user input.
-        from qingjian.ui.dialogs import BackupDialog, SidecarDialog, TableDialog
-        from qingjian.ui.duplicates import DuplicatesDialog
-        from qingjian.ui.editors import BindingsDialog, SettingsDialog, TemplateEditor
-        current = engine.current_path()
-        group = engine.group_for(current)
-        built = []
-        for name, factory in (
+            # Dialogs: build each one and close it without user input.
+            from qingjian.ui.dialogs import BackupDialog, SidecarDialog, TableDialog
+            from qingjian.ui.duplicates import DuplicatesDialog
+            from qingjian.ui.editors import BindingsDialog, SettingsDialog, TemplateEditor
+            current = engine.current_path()
+            group = engine.group_for(current)
+            built = []
+            for name, factory in (
             ("settings", lambda: SettingsDialog(settings, engine, window)),
             ("bindings", lambda: BindingsDialog(settings.bindings,
                                                 window._template_samples(), window)),
@@ -469,28 +632,41 @@ def _check_ui(library: Path, data: Path) -> str:
                                               window)),
             ("duplicates", lambda: DuplicatesDialog(engine, window)),
             ("table", lambda: TableDialog("t", ["a", "b"], [["1", "2"]], parent=window)),
-        ):
-            dialog = factory()
+            ):
+                dialog = factory()
+                app.processEvents()
+                dialog.close()
+                dialog.deleteLater()
+                built.append(name)
+            notes.append("dialogs: " + ",".join(built))
+
+            original = engine.current_path()
+            window.classify_index(0)
             app.processEvents()
-            dialog.close()
-            dialog.deleteLater()
-            built.append(name)
-        notes.append("dialogs: " + ",".join(built))
+            keepers = library.parent / "Keepers2"
+            assert any(keepers.rglob("*")), "classify wrote nothing"
+            window.undo()
+            app.processEvents()
+            assert original.exists(), "interface undo lost the original"
+            assert not any(path.is_file() for path in keepers.rglob("*")), (
+                "interface undo left files behind")
+            notes.append("classify+undo ok")
 
-        window.classify_index(0)
-        app.processEvents()
-        assert any((library.parent / "Keepers2").rglob("*")), "classify wrote nothing"
-        window.undo()
-        app.processEvents()
-        notes.append("classify+undo ok")
+            shot = data / "selfcheck-window.png"
+            window.grab().save(str(shot))
+            notes.append(f"screenshot {shot.stat().st_size} bytes")
 
-        shot = data / "selfcheck-window.png"
-        window.grab().save(str(shot))
-        notes.append(f"screenshot {shot.stat().st_size} bytes")
-
-        window.close()
-        app.processEvents()
+            window.close()
+            app.processEvents()
+        if modal_errors:
+            raise AssertionError("; ".join(modal_errors))
+        if callback_monitor.errors:
+            raise AssertionError("UI callback exceptions: " + "; ".join(callback_monitor.errors))
+        if i18n.translator().missing:
+            raise AssertionError("missing translations: " +
+                                 ", ".join(sorted(i18n.translator().missing)))
     finally:
+        modal_guard.stop()
         try:
             engine.close()
         except Exception:

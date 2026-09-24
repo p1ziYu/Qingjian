@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import os
 import sys
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QLockFile, QObject, Signal
@@ -84,6 +85,18 @@ def hand_over(name: str, folder: str, timeout_ms: int = 1500) -> bool:
     return acknowledged
 
 
+def _hand_over_with_retry(name: str, folder: str, timeout: float = 4.0,
+                          interval: float = 0.15) -> bool:
+    """Wait briefly for a first instance that has its lock but not its listener."""
+    deadline = time.monotonic() + timeout
+    while True:
+        if hand_over(name, folder, timeout_ms=max(50, int(interval * 1000))):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(interval)
+
+
 class Doorbell(QObject):
     """Listens for later launches, so a folder opened from Explorer reaches this window.
 
@@ -96,7 +109,9 @@ class Doorbell(QObject):
         super().__init__(parent)
         self._server = QLocalServer(self)
         QLocalServer.removeServer(name)            # a name left behind by a crash
-        self._server.listen(name)
+        if not self._server.listen(name):
+            log.error("local hand-over listener failed for %s: %s", name,
+                      self._server.errorString())
         self._server.newConnection.connect(self._answer)
 
     def _answer(self) -> None:
@@ -150,6 +165,8 @@ def _parse(argv: list[str]) -> dict:
         elif item == "--lang" and rest:
             options["language"] = rest.pop(0)
         elif not item.startswith("-"):
+            if item.endswith('"'):
+                item = item[:-1] + "\\"
             options["folder"] = item
     return options
 
@@ -167,6 +184,9 @@ def main(argv: list[str] | None = None) -> int:
     if options["data_dir"]:
         os.environ[appdirs.ENV_VAR] = str(options["data_dir"])
 
+    if options["folder"]:
+        options["folder"] = os.path.abspath(options["folder"])
+
     app = create_app(argv)
 
     # One instance per data directory: two copies sorting the same library
@@ -177,7 +197,7 @@ def main(argv: list[str] | None = None) -> int:
     if not lock.tryLock(50):
         # Explorer's "Open with Qingjian" starts a second copy; hand the folder
         # to the first one and bow out quietly.
-        if hand_over(doorbell, str(options["folder"] or "")):
+        if _hand_over_with_retry(doorbell, str(options["folder"] or "")):
             return 0
         warning(None, __display_name__, tr("error.single_instance"))
         return 1

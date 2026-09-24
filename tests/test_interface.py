@@ -1632,6 +1632,43 @@ class PreviewAudioTests(QtCase):
 
 @unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
 class SecondLaunchTests(QtCase):
+    def test_drive_root_quote_is_repaired_before_folder_is_absolutized(self):
+        from qingjian.ui.app import _parse
+        self.assertEqual("E:\\", _parse(["MediaSorter.exe", 'E:"'])["folder"])
+
+    def test_second_launch_hands_over_an_absolute_folder(self):
+        from unittest.mock import Mock, patch
+        from qingjian.ui import app as app_module
+
+        folder = self.tmp / "relative"
+        folder.mkdir()
+
+        class BusyLock:
+            def __init__(self, _path): pass
+            def setStaleLockTime(self, _value): pass
+            def tryLock(self, _timeout): return False
+
+        handed = Mock(return_value=True)
+        old = os.getcwd()
+        os.chdir(self.tmp)
+        self.addCleanup(os.chdir, old)
+        with patch.object(app_module, "QLockFile", BusyLock), \
+             patch.object(app_module, "hand_over", handed):
+            self.assertEqual(0, app_module.main(["MediaSorter.exe", "relative"]))
+        self.assertEqual(str(folder.resolve()), handed.call_args.args[1])
+
+    def test_second_launch_retries_until_listener_is_ready(self):
+        from unittest.mock import Mock, patch
+        from qingjian.ui import app as app_module
+
+        attempt = Mock(side_effect=[False, False, True])
+        with patch.object(app_module, "hand_over", attempt), \
+             patch.object(app_module.time, "sleep") as sleep:
+            self.assertTrue(app_module._hand_over_with_retry("bell", "folder", timeout=1.0,
+                                                            interval=0.1))
+        self.assertEqual(3, attempt.call_count)
+        self.assertEqual(2, sleep.call_count)
+
     def test_a_second_launch_hands_its_folder_to_the_running_window(self):
         """The second launch is a separate process, as it is from Explorer.
 

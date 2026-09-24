@@ -429,7 +429,7 @@ class QuotaPolicy:
         def positive(key: str, default: int) -> int:
             try:
                 value = int(data.get(key, default))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 return default
             return max(0, value)
         return cls(positive("max_operations", 200),

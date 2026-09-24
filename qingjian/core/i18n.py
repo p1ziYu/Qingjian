@@ -11,6 +11,7 @@ from __future__ import annotations
 import locale
 import os
 import re
+import sys
 from typing import Callable, Iterable
 
 LANGUAGES: tuple[tuple[str, str], ...] = (("zh", "中文"), ("en", "English"))
@@ -720,13 +721,20 @@ class Translator:
                 tag = os.environ.get(name) or ""
                 if tag:
                     break
+            if not tag and sys.platform == "win32":
+                try:
+                    import ctypes
+                    langid = ctypes.windll.kernel32.GetUserDefaultUILanguage()
+                    tag = locale.windows_locale.get(langid, "")
+                except (AttributeError, OSError, TypeError, ValueError):
+                    tag = ""
             if not tag:
                 try:
                     tag = locale.getlocale()[0] or ""
                 except (ValueError, TypeError):  # pragma: no cover - platform dependent
                     tag = ""
             tag = tag.replace("-", "_").lower()
-            if tag.startswith("zh"):
+            if tag.startswith(("zh", "chinese")):
                 return "zh"
             if tag:
                 return "en"

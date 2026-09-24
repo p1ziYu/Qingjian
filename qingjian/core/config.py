@@ -63,7 +63,7 @@ class Binding:
             action = "move"
         try:
             start = max(0, int(data.get("sequence_start", 1)))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             start = 1
         return cls(key=str(data.get("key") or DEFAULT_KEYS[index % BINDING_COUNT]),
                    action=action,
@@ -168,7 +168,7 @@ class Settings:
         def number(key: str, default, low=None, high=None):
             try:
                 value = type(default)(data.get(key, default))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 return default
             if low is not None:
                 value = max(low, value)
@@ -268,7 +268,8 @@ def load(path: str | Path | None = None) -> Settings:
         return settings
     try:
         data = json.loads(target.read_text(encoding="utf-8"))
-    except (OSError, ValueError, json.JSONDecodeError) as error:
+        settings = Settings.from_dict(data)
+    except (OSError, ValueError, TypeError, OverflowError, RecursionError) as error:
         log.warning("settings unreadable (%s); keeping the file and starting fresh", error)
         try:
             target.replace(target.with_suffix(".broken.json"))
@@ -277,7 +278,7 @@ def load(path: str | Path | None = None) -> Settings:
         settings = Settings()
         settings.ensure_profile()
         return settings
-    return Settings.from_dict(data)
+    return settings
 
 
 def save(settings: Settings, path: str | Path | None = None) -> None:

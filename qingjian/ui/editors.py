@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (QComboBox, QDialog, QDoubleSpinBox, QFileDialog, 
 from ..core import config, platform_, template
 from ..core.engine import human_size
 from ..core.i18n import LANGUAGES, tr
-from ..core.logsetup import get_logger
+from ..core.logsetup import bundle_description, get_logger
 from ..core.naming import NameError_
 from ..core.safestore import QuotaPolicy, VERIFY_FAST, VERIFY_FULL
 from ..core.sidecar import (PROMPT_ALWAYS, PROMPT_EACH, PROMPT_NEVER, PROMPT_ONCE,
@@ -640,6 +640,9 @@ class SettingsDialog(QDialog):
         export = QPushButton(tr("settings.export_bundle"))
         export.clicked.connect(self._export_bundle)
         card.body.addWidget(export)
+        # The user is invited to attach this zip to a public issue, so the page
+        # lists its every member rather than summarising it in one phrase.
+        card.body.addWidget(caption(bundle_description()))
         layout.addWidget(card)
         layout.addStretch(1)
         return page

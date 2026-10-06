@@ -256,6 +256,58 @@ CATALOG: dict[str, tuple[str, str]] = {
         "Qingjian is already running — switch to that window. "
         "Only one instance may run so that two copies never touch the same files.",
     ),
+    "error.data_dir_moved": (
+        "无法在 {requested} 中写入数据，本次改用 {used} 保存设置与记录。\n"
+        "该位置可能是只读介质、只读共享，或权限不允许写入。"
+        "若要把数据放回原处，请改用可写的位置或用 --data-dir 指定文件夹。\n"
+        "注意：本次的记录与锁文件都在新位置，因此“只允许一个窗口”不再覆盖原位置——"
+        "若另一个副本能正常写入原位置，两边可能同时整理同一批照片。{note}",
+        "Data cannot be written in {requested}, so this run keeps its settings and "
+        "history in {used} instead.\nThat place may be read-only media, a read-only "
+        "share, or a folder permissions keep you out of. To put the data back where "
+        "it belongs, use a writable location or name a folder with --data-dir.\n"
+        "Note that this run's records and its lock both live in the new place, so "
+        "the one-window rule no longer covers the old one: another copy that can "
+        "write there may sort the same photos at the same time.{note}",
+    ),
+    "error.data_dir_volatile": (
+        "这个位置是系统临时目录，Windows 可能会自行清理它，"
+        "请尽快把数据复制到别处。",
+        "That place is the system temporary directory, which Windows may clean out "
+        "on its own, so copy the data somewhere else before long.",
+    ),
+    "error.data_dir_stranded": (
+        "之前有一次启动无法写入当前数据目录，那一次的记录留在了：\n{path}\n"
+        "如果缺少某些历史或设置，可以去那里找。只会提示这一次。",
+        "An earlier launch could not write to this data directory and left its "
+        "records here instead:\n{path}\nIf some history or settings seem missing, "
+        "that is where they are. You will only be told once.",
+    ),
+    "error.data_dir_unwritable": (
+        "没有可写的数据目录，轻拣无法启动。已尝试：\n{paths}\n"
+        "请用 --data-dir 指定一个可写的文件夹后重试。",
+        "Qingjian cannot start without a data directory it may write to. Tried:\n"
+        "{paths}\nStart again with --data-dir naming a folder you can write to.",
+    ),
+    "error.lock_unreachable": (
+        "无法创建或替换锁文件，轻拣无法启动：\n{path}\n"
+        "该文件可能是只读的，或权限不允许修改。并没有第二个窗口在运行，"
+        "请删除该文件或去掉它的只读属性后重试。",
+        "Qingjian cannot start: this lock file can be neither created nor replaced.\n"
+        "{path}\nIt may be read-only, or permissions may keep you out of it. No "
+        "second window is running — delete the file, or clear its read-only "
+        "attribute, and start again.",
+    ),
+    "error.lock_occupied": (
+        "锁文件的位置被别的东西占着，轻拣无法启动：\n{path}\n"
+        "这里本该是一个文件，现在却是一个文件夹——"
+        "可能是备份解压或同步工具留下的。并没有第二个窗口在运行，"
+        "请把它移走或改名后重试。",
+        "Qingjian cannot start: something else occupies the lock file's place.\n"
+        "{path}\nThat should be a file and is a folder — a backup unzipped over it, "
+        "or a sync tool's doing. No second window is running: move it aside or "
+        "rename it, and start again.",
+    ),
     "error.no_unique_name": ("无法生成不重名的文件名", "Could not build a name that is not already taken"),
     "error.name_invalid": ("文件名无效", "That filename is not valid"),
     "error.name_reserved": (
@@ -538,14 +590,43 @@ CATALOG: dict[str, tuple[str, str]] = {
     ),
     "settings.logging": ("保留运行日志", "Keep a run log"),
     "settings.logging.desc": (
-        "出错时可导出诊断包，含日志、事务记录与环境信息，不含你的媒体文件",
-        "Export a diagnostic bundle with logs, transaction records and environment — never your media",
+        "出错时可在“关于”页导出诊断包；那一页逐项列出包里有什么、没有什么",
+        "Lets you export a diagnostic bundle from the About page, which lists "
+        "item by item what the bundle does and does not contain",
     ),
     "settings.export_bundle": ("导出诊断包", "Export bundle"),
     "settings.export_failed": ("诊断包导出失败：{error}",
                                "Could not export the diagnostic bundle: {error}"),
     "settings.export_saved": ("诊断包已保存到：{path}",
                               "Diagnostic bundle saved to: {path}"),
+    # The bundle is meant to be attachable to a public bug report, so this list
+    # is built from logsetup.BUNDLE_MANIFEST: the words and the zip are one.
+    "bundle.contents": ("诊断包里只有这些，逐项列全：",
+                        "The bundle contains exactly these, item by item:"),
+    "bundle.item.environment": ("版本、Python、系统与已装组件",
+                                "version, Python, system and installed components"),
+    "bundle.item.settings": ("你的各项设置；其中的路径只留盘符、层级深度与扩展名，"
+                             "你手填的路径模板和命名模板只留层级与用到的占位符，"
+                             "方案名换成序号",
+                             "your settings, with every path reduced to its drive, "
+                             "depth and file extension, the path and name templates "
+                             "you typed reduced to their levels and the placeholder "
+                             "names in them, and each preset named by its number"),
+    "bundle.item.state": ("记录库的表结构与行数，不含其中任何一行",
+                          "the record database's tables and row counts, not one row of it"),
+    "bundle.item.journal": ("未完成事务的流水；路径同样已打码，"
+                            "文件内容的校验值换成只在包内有效的编号，时间精确到秒",
+                            "the unfinished transaction's journal, with paths masked the "
+                            "same way, each content checksum replaced by a tag that means "
+                            "nothing outside the zip, and times kept only to the second"),
+    "bundle.item.snapshots": ("还原副本的编号与大小", "the restore copies' ids and sizes"),
+    "bundle.item.logs": ("运行日志原文，其中的路径与账号名已打码",
+                         "the run log as written, with paths and the account name masked"),
+    "bundle.omits": ("不含：", "It never contains:"),
+    "bundle.omit.media": ("你的照片和视频", "your photos and videos"),
+    "bundle.omit.paths": ("任何一个完整路径、文件夹名或文件名",
+                          "any whole path, folder name or file name"),
+    "bundle.omit.account": ("你的 Windows 账号名", "your Windows account name"),
     "settings.sidecar.clear_title": ("清空伴随文件扩展名", "Clear sidecar extensions"),
     "settings.sidecar.clear_confirm": (
         "清空后，这类伴随文件将不再随照片移动。仍要保存吗？",

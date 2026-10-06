@@ -201,6 +201,8 @@ The core layer does not import Qt. The UI calls the engine layer instead of mani
 
 Bug reports and focused pull requests are welcome. Please include the Windows version, Python version (for source builds), reproduction steps, and the output of `python main.py --selfcheck`. Never attach personal media or application data directories; use synthetic files when possible.
 
+**Settings → About → Export bundle** writes `qingjian-diagnostics.zip`, which is meant to be attachable to a public issue. The About page lists every member of that zip item by item, and the list is generated from the same manifest the zip is built from. It carries the version and environment, your settings, the record database's table shapes and row counts, the unfinished transaction journal, the restore-copy index, and the run log. Before anything is written, every absolute path is replaced by its shape — drive, number of levels, file extension, and a tag that is stable only inside that one zip — and the Windows account name is replaced as well. The settings and the journal are masked field by field rather than by pattern, because the strings people type are not shaped like paths: a path or name template keeps only its levels and the placeholder names in it, each preset is named by its number, and a journal's content checksums become tags that mean nothing outside the zip. So no file name, folder name, or whole path leaves the machine. Open the zip and read it before you attach it.
+
 ## AI-assisted development disclosure
 
 This project was developed with human direction, review, and testing, with assistance from multiple AI tools:
@@ -218,7 +220,7 @@ AI-generated suggestions were reviewed and integrated by the maintainer. The pro
 
 主要功能包括：图片/视频预览、可配置按键与目标目录、路径和命名模板、同名文件 Replace/自动编号、伴随文件事务处理、查重与忽略、评分和色标、待复查队列，以及可恢复的撤销流程。2.0.5 加固了文件事务与恢复，并修复了选区、预览、后台队列、查重、元数据、对话框和启动流程中的边界问题。
 
-使用要点：长按 ← → 可连续翻页；Delete 直接删除、不再确认，文件移到同盘的隐藏文件夹 `.qingjian-trash`，Ctrl+Z 即可恢复；单击按键卡片执行动作，右键卡片更换目标文件夹；在“设置 → 通用”里打开资源管理器右键菜单后，可以在文件夹上右键“用轻拣打开”。发布包是一个 `MediaSorter` 文件夹，请整个解压后运行其中的 `MediaSorter.exe`。
+使用要点：长按 ← → 可连续翻页；Delete 直接删除、不再确认，文件移到同盘的隐藏文件夹 `.qingjian-trash`，Ctrl+Z 即可恢复；单击按键卡片执行动作，右键卡片更换目标文件夹；在“设置 → 通用”里打开资源管理器右键菜单后，可以在文件夹上右键“用轻拣打开”。发布包是一个 `MediaSorter` 文件夹，请整个解压后运行其中的 `MediaSorter.exe`。“设置 → 关于”里的“导出诊断包”可以公开附在 issue 里：那一页逐项列出压缩包里的每一个文件，写入前所有绝对路径只保留盘符、层级深度和扩展名，Windows 账号名也会被替换；设置和事务流水按字段打码，而不是靠匹配猜测，所以你手填的路径模板和命名模板只留层级与用到的占位符，方案名换成序号，文件内容的校验值换成只在包内有效的编号。因此文件名、文件夹名和完整路径都不会离开本机。
 
 本项目使用 AI 辅助开发：OpenAI Codex 负责当前版本的实现、测试和打包；Anthropic Claude 参与早期版本迭代；xAI Grok 提供 UI 评审建议；Impeccable、`frontend-design`、`web-design-guidelines`、`react-best-practices`、`shadcn` 和 `ui-ux-pro-max` 提供界面设计参考。所有改动均经过维护者审核和本地测试。
 

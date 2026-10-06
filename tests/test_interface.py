@@ -21,7 +21,8 @@ from base import ROOT, TempCase, unittest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 try:
-    from PySide6.QtCore import QEvent, QPoint, QPointF, Qt, QTimer
+    from PySide6.QtCore import (QEvent, QLockFile, QPoint, QPointF, QSysInfo, Qt,
+                                QTimer)
     from PySide6.QtGui import QContextMenuEvent, QKeyEvent, QMouseEvent
     from PySide6.QtTest import QTest
     from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
@@ -2015,9 +2016,376 @@ class PreviewAudioTests(QtCase):
 
 @unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
 class SecondLaunchTests(QtCase):
+    def setUp(self):
+        super().setUp()
+        from qingjian.core import i18n
+        self.said: list[str] = []
+        self.addCleanup(i18n.set_language, i18n.get_language())
+
+    def _remember(self, _parent, _title, text, *_args, **_kwargs):
+        """Stand in for a modal box, which would stop the test dead."""
+        self.said.append(text)
+        return None
+
+    def _close_windows(self) -> None:
+        for widget in QApplication.topLevelWidgets():
+            if widget.__class__.__name__ == "MainWindow":
+                widget.close()                      # closeEvent releases the engine
+                widget.deleteLater()
+        self.app.processEvents()
+
+    def _hold_the_real_lock(self) -> None:
+        """Hold the very lock file a launch competes for, from another process.
+
+        A real second copy, not a stand-in: the lock file then carries a live
+        process, which is the one case where "already running" is the truth.
+        """
+        from qingjian.core import appdirs
+        script = self.write(self.tmp / "holder.py", (
+            "import os, sys, time\n"
+            "os.environ['QT_QPA_PLATFORM'] = 'offscreen'\n"
+            "from PySide6.QtCore import QCoreApplication, QLockFile\n"
+            "app = QCoreApplication([])\n"
+            "lock = QLockFile(sys.argv[1])\n"
+            "lock.setStaleLockTime(0)\n"
+            "print(lock.tryLock(500), flush=True)\n"
+            "time.sleep(120)\n").encode("utf-8"))
+        child = subprocess.Popen([sys.executable, str(script), str(appdirs.lock_path())],
+                                 stdout=subprocess.PIPE, text=True,
+                                 env=dict(os.environ, PYTHONPATH=str(ROOT)))
+        self.addCleanup(child.stdout.close)         # cleanups run in reverse
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        self.assertEqual("True", child.stdout.readline().strip())
+
     def test_drive_root_quote_is_repaired_before_folder_is_absolutized(self):
         from qingjian.ui.app import _parse
         self.assertEqual("E:\\", _parse(["MediaSorter.exe", 'E:"'])["folder"])
+
+    def test_an_unwritable_data_directory_does_not_claim_a_copy_is_running(self):
+        """No lock file can be made there, so there is no window to switch to.
+
+        A portable copy on a read-only stick, an install under
+        ``C:\\Program Files`` started by a standard user, an application-data
+        folder a company policy denies: every launch used to spend four
+        seconds hunting for a copy that does not exist and then send its user
+        to find a window that was never there.
+        """
+        from unittest.mock import Mock, patch
+        from qingjian.core import appdirs, i18n
+        from qingjian.ui import app as app_module
+
+        denied = self.plain_launch(self.deny_writes(self.tmp / "program files"))
+        spare = self.tmp / "spare"
+        used = appdirs._relocated(spare, denied)
+        used.mkdir(parents=True)
+        self.write(used / "settings.json", b'{"restore_position": false}')
+        handed = Mock(return_value=True)
+        self.addCleanup(self._close_windows)
+        with patch.object(QApplication, "exec", lambda _self: 0), \
+             patch.object(appdirs, "fallback_roots", lambda: [spare]), \
+             patch.object(app_module, "_hand_over_with_retry", handed), \
+             patch.object(app_module, "warning", self._remember), \
+             patch.object(app_module, "critical", self._remember):
+            self.assertEqual(0, app_module.main(["MediaSorter.exe", "--lang", "en"]))
+        self.assertEqual(0, handed.call_count)
+        self.assertEqual(1, len(self.said))
+        self.assertNotIn("already running", self.said[0])
+        self.assertIn(str(denied), self.said[0])
+        self.assertIn(str(used), self.said[0])
+        self.assertTrue((used / "store").is_dir())      # the data really went there
+        self.assertEqual([], self.tree(denied))
+        # Mutual exclusion is keyed to the directory the data lives in, and
+        # that directory just moved, so the one-window rule no longer covers
+        # the place the user pointed at. Said out loud rather than left to be
+        # discovered by two copies sorting one folder.
+        self.assertIn(i18n.Translator("en").tr("error.data_dir_moved", requested="R",
+                                               used="U", note="").splitlines()[-1],
+                      self.said[0])
+        # And the warning reached the log, which is what a bundle carries: it
+        # used to be written before logging was configured, so in the frozen
+        # build -- whose console is hidden -- it went nowhere at all.
+        self.assertIn("will not hold data",
+                      (used / "logs" / "qingjian.log").read_text(encoding="utf-8"))
+
+    def test_a_data_directory_that_cannot_be_made_is_reported_not_a_silent_exit(self):
+        """``--data-dir`` under a read-only location, where mkdir itself fails.
+
+        The frozen build hides its console, so an OSError escaping here is a
+        double-click that does nothing at all.
+        """
+        from unittest.mock import patch
+        from qingjian.core import appdirs
+        from qingjian.ui import app as app_module
+
+        blocked = self.write(self.tmp / "not-a-folder.txt") / "data"
+
+        def never(*_args, **_kwargs):
+            """``--data-dir`` is explicit intent: no fallback may be consulted,
+            least of all the per-user library the first one names."""
+            raise AssertionError("--data-dir was quietly swapped for somewhere else")
+
+        with patch.object(appdirs, "fallback_roots", never), \
+             patch.object(appdirs, "_platform_data_root", never), \
+             patch.object(app_module, "warning", self._remember), \
+             patch.object(app_module, "critical", self._remember):
+            self.assertEqual(1, app_module.main(
+                ["MediaSorter.exe", "--data-dir", str(blocked), "--lang", "en"]))
+        self.assertEqual(1, len(self.said))
+        self.assertIn(str(blocked), self.said[0])
+        self.assertNotIn("already running", self.said[0])
+
+    def test_a_lock_another_copy_really_holds_is_still_handed_the_folder(self):
+        from unittest.mock import Mock, patch
+        from qingjian.ui import app as app_module
+
+        self._hold_the_real_lock()
+        handed = Mock(return_value=True)
+        with patch.object(app_module, "_hand_over_with_retry", handed), \
+             patch.object(app_module, "warning", self._remember), \
+             patch.object(app_module, "critical", self._remember):
+            self.assertEqual(0, app_module.main(["MediaSorter.exe", "--lang", "en"]))
+        self.assertEqual([], self.said)
+        self.assertEqual(1, handed.call_count)
+
+    def test_a_copy_that_does_not_answer_still_reports_one_is_running(self):
+        """And in the language the user chose, which this message never was."""
+        from unittest.mock import Mock, patch
+        from qingjian.core import i18n
+        from qingjian.ui import app as app_module
+
+        self._hold_the_real_lock()
+        with patch.object(app_module, "_hand_over_with_retry", Mock(return_value=False)), \
+             patch.object(app_module, "warning", self._remember), \
+             patch.object(app_module, "critical", self._remember):
+            self.assertEqual(1, app_module.main(["MediaSorter.exe", "--lang", "en"]))
+        self.assertEqual([i18n.Translator("en").tr("error.single_instance")], self.said)
+
+    def test_a_read_only_lock_file_left_behind_is_repaired(self):
+        """A portable folder copied off read-only media brings one with it.
+
+        The process it names is long gone, so Qt rules the lock stale, but it
+        may not delete a read-only file -- and reports the same
+        ``LockFailedError`` as a lock a live copy holds. Taken at face value
+        that bricks a perfectly good install for good.
+        """
+        import stat
+        from qingjian.core import appdirs
+        from qingjian.ui import app as app_module
+
+        path = appdirs.lock_path()
+        first = QLockFile(str(path))
+        first.setStaleLockTime(0)
+        self.assertTrue(first.tryLock(50))
+        lines = path.read_bytes().split(b"\n")
+        first.unlock()
+        lines[0], lines[1] = b"999999", b"nothing-like-this"   # a pid long gone
+        path.write_bytes(b"\n".join(lines))
+        os.chmod(path, stat.S_IREAD)
+
+        def let_it_go() -> None:
+            if path.exists():                   # it is gone once the lock is taken
+                os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+
+        self.addCleanup(let_it_go)
+
+        plain = QLockFile(str(path))
+        plain.setStaleLockTime(0)
+        self.assertFalse(plain.tryLock(50))                    # what Qt alone does
+        self.assertEqual(QLockFile.LockError.LockFailedError, plain.error())
+
+        lock = QLockFile(str(path))
+        lock.setStaleLockTime(0)
+        self.assertTrue(app_module._take_lock(lock, path))
+        lock.unlock()
+
+    @unittest.skipUnless(sys.platform == "win32", "an ACL on one file is a Windows case")
+    def test_a_lock_file_this_account_may_not_replace_is_explained(self):
+        """Windows decides deletion by the file's permissions, not the folder's.
+
+        A leftover lock file carrying an ACL from the share it was copied off
+        sits in a perfectly writable directory, reads back as the very same
+        ``LockFailedError`` as a live copy, and ``os.access`` says yes to it.
+        """
+        from unittest.mock import Mock, patch
+        from qingjian.core import appdirs, i18n
+        from qingjian.ui import app as app_module
+
+        path = appdirs.lock_path()
+        first = QLockFile(str(path))
+        first.setStaleLockTime(0)
+        self.assertTrue(first.tryLock(50))
+        lines = path.read_bytes().split(b"\n")
+        first.unlock()
+        lines[0], lines[1] = b"999999", b"nothing-like-this"      # a pid long gone
+        self.write(path, b"\n".join(lines))
+        self.deny_writes(path)
+
+        handed = Mock(return_value=True)
+        with patch.object(app_module, "_hand_over_with_retry", handed), \
+             patch.object(app_module, "warning", self._remember), \
+             patch.object(app_module, "critical", self._remember):
+            self.assertEqual(1, app_module.main(["MediaSorter.exe", "--lang", "en"]))
+        self.assertEqual(0, handed.call_count)                    # nobody to hand to
+        self.assertEqual([i18n.Translator("en").tr("error.lock_unreachable",
+                                                   path=str(path))], self.said)
+
+    def _stale_lock(self, machine_id: bytes = b"") -> "Path":
+        """A lock file naming an owner that is gone.
+
+        Written by Qt and then edited, so every field has the shape Qt expects.
+        Passing *machine_id* leaves Qt refusing to call it stale at all, which
+        is what happens whenever the file outlives the machine id it was
+        written with -- a restored backup, a cloned disk, a share.
+        """
+        from qingjian.core import appdirs
+        path = appdirs.lock_path()
+        first = QLockFile(str(path))
+        first.setStaleLockTime(0)
+        self.assertTrue(first.tryLock(50))
+        lines = path.read_bytes().split(b"\n")
+        first.unlock()
+        lines[0], lines[1] = b"999999", b"nothing-like-this"       # a pid long gone
+        if machine_id:
+            lines[3] = machine_id
+        self.write(path, b"\n".join(lines))
+        return path
+
+    def test_a_stale_lock_qt_will_not_reclaim_is_cleared_rather_than_bricking(self):
+        """``setStaleLockTime(0)`` turns off Qt's age rule on purpose, and Qt
+        applies its pid rule only to a lock written under this machine's own
+        id, so a file that outlived that id stays put and every later launch is
+        told a window is open that cannot be. Nothing ever cleared it, so the
+        install stayed bricked. Asking the operation -- rename it out of the
+        way -- answers what no permission question can."""
+        from unittest.mock import Mock, patch
+        from qingjian.ui import app as app_module
+
+        path = self._stale_lock(machine_id=b"not-this-machine")
+        plain = QLockFile(str(path))
+        plain.setStaleLockTime(0)
+        self.assertFalse(plain.tryLock(50))                       # what Qt alone does
+        self.assertEqual(QLockFile.LockError.LockFailedError, plain.error())
+
+        lock = QLockFile(str(path))
+        lock.setStaleLockTime(0)
+        self.assertFalse(app_module._lock_is_held(lock, path))
+        self.assertTrue(app_module._take_lock(lock, path))
+        lock.unlock()
+
+        self.addCleanup(self._close_windows)
+        handed = Mock(return_value=True)
+        # `exec` rather than a queued `app.quit()`: calling quit with no loop of
+        # its own running leaves `quitNow` set on the thread, and every later
+        # `QDialog.exec` in the process then returns at once without showing
+        # anything -- which silently guts whichever test runs next.
+        with patch.object(QApplication, "exec", lambda _self: 0), \
+             patch.object(app_module, "_hand_over_with_retry", handed), \
+             patch.object(app_module, "warning", self._remember), \
+             patch.object(app_module, "critical", self._remember):
+            self.assertEqual(0, app_module.main(["MediaSorter.exe", "--lang", "en"]))
+        self.assertEqual([], self.said)                 # it simply starts
+        self.assertEqual(0, handed.call_count)
+
+    def test_a_live_copy_is_handed_the_folder_even_where_a_probe_was_left_behind(self):
+        """The old classifier asked the directory whether it still took files,
+        and answered with the start-up's own leftover probe: the probe name
+        held nothing but the pid, so the second call in one process hit its own
+        file and said the folder was unusable. A running copy was then reported
+        as "no second window is running", and the folder was dropped."""
+        from unittest.mock import Mock, patch
+        from qingjian.core import appdirs
+        from qingjian.ui import app as app_module
+
+        self._hold_the_real_lock()
+        leftover = self.data / f"{appdirs.PROBE_PREFIX}{os.getpid()}"
+        leftover.touch()
+        handed = Mock(return_value=True)
+        with patch.object(app_module, "_hand_over_with_retry", handed), \
+             patch.object(app_module, "warning", self._remember), \
+             patch.object(app_module, "critical", self._remember):
+            self.assertEqual(0, app_module.main(["MediaSorter.exe", "--lang", "en"]))
+        self.assertEqual([], self.said)
+        self.assertEqual(1, handed.call_count)
+
+    def test_something_else_occupying_the_lock_name_is_said_so(self):
+        """A bad unzip of a backup, a sync-client conflict or a robocopy of the
+        data folder leaves a *directory* called qingjian.lock. Qt reports the
+        same ``LockFailedError``, permissions are all in order, and the launch
+        used to spend four seconds hunting for a window and then blame one."""
+        from unittest.mock import Mock, patch
+        from qingjian.core import appdirs, i18n
+        from qingjian.ui import app as app_module
+
+        path = appdirs.lock_path()
+        path.mkdir()
+        self.addCleanup(lambda: path.is_dir() and path.rmdir())
+        handed = Mock(return_value=True)
+        with patch.object(app_module, "_hand_over_with_retry", handed), \
+             patch.object(app_module, "warning", self._remember), \
+             patch.object(app_module, "critical", self._remember):
+            self.assertEqual(1, app_module.main(["MediaSorter.exe", "--lang", "en"]))
+        self.assertEqual(0, handed.call_count)
+        self.assertEqual([i18n.Translator("en").tr("error.lock_occupied",
+                                                   path=str(path))], self.said)
+        self.assertTrue(path.is_dir())              # and it is never renamed away
+
+    def test_a_lock_out_of_reach_is_logged_where_a_bundle_can_carry_it(self):
+        """The one fact that explains such a session used to be written before
+        logging was configured, so in the frozen build -- whose console is
+        hidden -- it reached nothing at all."""
+        from unittest.mock import Mock, patch
+        from qingjian.ui import app as app_module
+
+        path = self._stale_lock()
+        self.deny_writes(path)
+        with patch.object(app_module, "_hand_over_with_retry", Mock(return_value=False)), \
+             patch.object(app_module, "hand_over", Mock(return_value=False)), \
+             patch.object(app_module, "warning", self._remember), \
+             patch.object(app_module, "critical", self._remember):
+            self.assertEqual(1, app_module.main(["MediaSorter.exe", "--lang", "en"]))
+        written = (self.data / "logs" / "qingjian.log").read_text(encoding="utf-8")
+        self.assertIn("error.lock_unreachable", written)
+
+    def test_a_data_directory_the_engine_cannot_use_is_explained_not_quoted(self):
+        """A folder may take a file and still refuse a sub-directory or a
+        deletion, so the engine can fail where the probe passed. Showing the
+        raw ``[WinError 5] Access is denied: '...'`` as the whole message is
+        neither translated nor advice, and it names a path in a dialog."""
+        from unittest.mock import patch
+        from qingjian.core import i18n
+        from qingjian.ui import app as app_module
+
+        refused = OSError(13, "Access is denied", str(self.data / "logs"))
+        with patch.object(app_module, "Engine", side_effect=refused), \
+             patch.object(app_module, "warning", self._remember), \
+             patch.object(app_module, "critical", self._remember):
+            self.assertEqual(1, app_module.main(["MediaSorter.exe", "--lang", "en"]))
+        self.assertEqual([i18n.Translator("en").tr("error.data_dir_unwritable",
+                                                   paths=str(self.data))], self.said)
+
+    def test_the_doorbell_name_is_never_written_into_the_log(self):
+        """It is an unsalted digest of the data directory's whole path, every
+        part of which is fixed and public except the account name, so a bundle
+        carrying it hands over the one thing every other mask takes out."""
+        from qingjian.core import logsetup
+        from qingjian.ui import app as app_module
+
+        from unittest.mock import patch
+        from PySide6.QtNetwork import QLocalServer
+
+        logsetup.configure(True, 3, directory=self.data / "logs")
+        name = app_module.doorbell_name(self.data)
+        with patch.object(QLocalServer, "listen", lambda self, _name: False):
+            bell = app_module.Doorbell(name)
+        self.addCleanup(bell.close)
+        written = (self.data / "logs" / "qingjian.log").read_text(encoding="utf-8")
+        self.assertIn("local hand-over listener failed", written)
+        self.assertNotIn(name, written)
+        # Redaction could not have saved it: the name holds no separator, so it
+        # does not look like a path, and it cannot be salted either because the
+        # two copies have to arrive at the same name. Not logging it is the fix.
+        self.assertIn(name, logsetup.redact_text(f"listener failed for {name}: in use"))
 
     def test_second_launch_hands_over_an_absolute_folder(self):
         from unittest.mock import Mock, patch
@@ -2027,9 +2395,12 @@ class SecondLaunchTests(QtCase):
         folder.mkdir()
 
         class BusyLock:
+            """A lock a live copy holds: this very process, which is running."""
             def __init__(self, _path): pass
             def setStaleLockTime(self, _value): pass
             def tryLock(self, _timeout): return False
+            def error(self): return QLockFile.LockError.LockFailedError
+            def getLockInfo(self): return os.getpid(), QSysInfo.machineHostName(), "test"
 
         handed = Mock(return_value=True)
         old = os.getcwd()
@@ -2324,6 +2695,24 @@ class G12DialogTests(WindowCase):
             dialog._export_bundle()
         export.assert_called_once_with(str(destination))
         information.assert_called_once()
+
+    def test_the_about_page_spells_out_what_the_bundle_contains(self):
+        """The only promise the user gets must be the manifest, word for word."""
+        from PySide6.QtWidgets import QLabel
+        from qingjian.core import config, logsetup
+        from qingjian.ui import editors
+
+        class StubEngine:
+            @staticmethod
+            def backup_usage():
+                return 0
+
+        engine = StubEngine()
+        engine.data_dir = self.data
+        dialog = editors.SettingsDialog(config.Settings(), engine)
+        self.addCleanup(dialog.deleteLater)
+        texts = [label.text() for label in dialog.findChildren(QLabel)]
+        self.assertIn(logsetup.bundle_description(), texts)
 
     def test_prompt_helpers_localize_standard_buttons(self):
         from PySide6.QtWidgets import QPushButton

@@ -3,17 +3,19 @@ from __future__ import annotations
 
 import hashlib
 import os
+import platform
+import stat
 import sys
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QLockFile, QObject, Signal
+from PySide6.QtCore import QLockFile, QObject, QSysInfo, Signal
 from PySide6.QtGui import QFontDatabase
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication
 
 from .. import __app_name__, __display_name__, __organization__, __version__
-from ..core import appdirs, config
+from ..core import appdirs, config, logsetup
 from ..core.engine import Engine
 from ..core.i18n import set_language, tr
 from ..core.logsetup import get_logger
@@ -21,6 +23,16 @@ from . import icons, theme
 from .prompts import critical, warning
 
 log = get_logger("app")
+
+#: Qt's way of saying the lock file could not be created at all. Read once,
+#: here, so that a test standing in for QLockFile cannot change its meaning.
+_LOCK_DENIED = (QLockFile.LockError.PermissionError, QLockFile.LockError.UnknownError)
+
+#: Every spelling of this machine's name, folded, because Qt writes the lock's
+#: host name in whatever case the system hands it and compares it in another.
+_THIS_MACHINE = frozenset(name.casefold() for name in
+                          (QSysInfo.machineHostName(), platform.node(),
+                           os.environ.get("COMPUTERNAME", "")) if name)
 
 
 def create_app(argv: list[str] | None = None) -> QApplication:
@@ -97,6 +109,143 @@ def _hand_over_with_retry(name: str, folder: str, timeout: float = 4.0,
         time.sleep(interval)
 
 
+def _clear_read_only(path: Path) -> bool:
+    """Drop a read-only attribute from *path*.
+
+    False when there was none to drop or it would not come off, so that the
+    caller does not retry for nothing. A portable folder copied off a CD or a
+    read-only share brings its leftover lock file along with the attribute
+    set; the process that file names is long gone, so Qt rules the lock stale,
+    but it may not delete a read-only file.
+    """
+    try:
+        if not path.exists() or os.access(path, os.W_OK):
+            return False
+        os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+    except OSError:
+        return False
+    return True
+
+
+def _process_alive(pid: int) -> bool:
+    """Whether a process with this id is running on this machine.
+
+    ``os.kill(pid, 0)`` must not be used on Windows: CPython implements it
+    with ``TerminateProcess``, so asking would kill the very copy we are
+    asking about. An access-denied answer still means the process exists.
+    """
+    if pid <= 0:
+        return False
+    if sys.platform != "win32":
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:                     # someone else's: still running
+            return True
+        except OSError:                             # pragma: no cover - unexpected
+            return True
+        return True
+    import ctypes
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(0x1000, False, int(pid))  # QUERY_LIMITED_INFORMATION
+        if not handle:
+            return ctypes.get_last_error() == 5     # access denied: it is there
+        code = ctypes.c_ulong(0)
+        read = kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+        kernel32.CloseHandle(handle)
+        return not read or code.value == 259        # STILL_ACTIVE
+    except (AttributeError, OSError, ValueError):    # pragma: no cover - no kernel32
+        return True
+
+
+def _lock_is_held(lock: QLockFile, path: Path) -> bool:
+    """True when a process that is still running wrote this lock file.
+
+    This is the question Qt's error code cannot answer: ``LockFailedError``
+    means both "a live copy holds it" and "it is stale and I could not delete
+    it". Permissions cannot answer it either -- deleting a file needs the
+    DELETE right, which is not the one ``os.chmod`` asks about, so a folder
+    that refuses one may well allow the other, in both directions. The lock
+    file itself names its owner, so the owner is asked. Anything that cannot
+    be read is treated as held: a lock we do not understand is never cleared.
+    """
+    if path.exists() and not path.is_file():
+        return False                                # not a lock file at all
+    try:
+        pid, host, _app = lock.getLockInfo()
+    except (AttributeError, TypeError, ValueError):  # pragma: no cover - older Qt
+        return True
+    if not pid:
+        return False                                # unreadable or half-written
+    if host and host.casefold() not in _THIS_MACHINE:
+        return True                                 # another machine on a share
+    return _process_alive(int(pid))
+
+
+def _clear_stale_lock(path: Path) -> bool:
+    """Move a lock file whose owner is gone out of the way, and delete it.
+
+    Asks the operation instead of asking about permissions: renaming needs
+    exactly the right that deleting needs, so it either works or says so. On
+    Windows it also cannot touch a lock a live copy holds -- that file is open
+    without delete sharing, so ``os.replace`` fails with a sharing violation.
+    """
+    if not path.is_file():
+        return False
+    for leftover in path.parent.glob(f"{path.name}.stale-*"):
+        try:                                        # one an earlier run could not delete
+            leftover.unlink()
+        except OSError:
+            continue
+    spare = path.with_name(f"{path.name}.stale-{os.getpid()}")
+    try:
+        os.replace(path, spare)
+    except OSError:
+        return False
+    try:
+        spare.unlink()
+    except OSError:                                 # out of the way is enough
+        pass
+    return True
+
+
+def _take_lock(lock: QLockFile, path: Path) -> bool:
+    """Take the single-instance lock, repairing the obstacles we can.
+
+    Neither repair can steal a lock a live copy holds: clearing the read-only
+    attribute still leaves the owner alive, and a stale lock is only cleared
+    once its owner has been asked for and found gone.
+    """
+    if lock.tryLock(50):
+        return True
+    if _clear_read_only(path) and lock.tryLock(50):
+        return True
+    if not _lock_is_held(lock, path) and _clear_stale_lock(path):
+        return lock.tryLock(50)
+    return False
+
+
+def _lock_problem(lock: QLockFile, path: Path) -> str:
+    """The message key for a lock that could not be taken, or ``""``.
+
+    Empty means a copy really is running and should be handed the folder.
+    Saying "already running" for anything else sends the user looking for a
+    window that does not exist, and the condition never clears by itself.
+    """
+    if path.exists() and not path.is_file():
+        # A bad unzip of a backup, a sync-client conflict, a robocopy of the
+        # data folder: nothing in the product would ever remove this, and
+        # every launch would blame a window that cannot exist.
+        return "error.lock_occupied"
+    if lock.error() in _LOCK_DENIED:
+        return "error.lock_unreachable"
+    if _lock_is_held(lock, path):
+        return ""
+    return "error.lock_unreachable"
+
+
 class Doorbell(QObject):
     """Listens for later launches, so a folder opened from Explorer reaches this window.
 
@@ -110,8 +259,14 @@ class Doorbell(QObject):
         self._server = QLocalServer(self)
         QLocalServer.removeServer(name)            # a name left behind by a crash
         if not self._server.listen(name):
-            log.error("local hand-over listener failed for %s: %s", name,
-                      self._server.errorString())
+            # The name itself is never logged. It is an unsalted digest of the
+            # data directory's whole path, every part of which is fixed and
+            # public except the account name, so one log line carrying it
+            # would hand a bundle's reader the one thing every other mask in
+            # it takes out -- and it cannot be salted, because both copies
+            # have to arrive at the same name. What a failure here needs is
+            # Qt's reason, not the name.
+            log.error("local hand-over listener failed: %s", self._server.errorString())
         self._server.newConnection.connect(self._answer)
 
     def _answer(self) -> None:
@@ -182,12 +337,51 @@ def main(argv: list[str] | None = None) -> int:
 
     app = create_app(argv)
 
+    # The data directory decides where the lock file goes, so it is settled
+    # first -- and without raising: the frozen build hides its console, so an
+    # OSError escaping here is a double-click that does nothing at all.
+    try:
+        data_root, refused = appdirs.usable_data_dir()
+    except appdirs.DataDirUnusable as error:
+        set_language(options["language"])           # before anything the user reads
+        critical(None, __display_name__, tr(
+            "error.data_dir_unwritable",
+            paths="\n".join(str(path) for path in error.paths)))
+        return 1
+    os.environ[appdirs.ENV_VAR] = str(data_root)
+
+    # Loaded before the lock is taken, because every message below this line
+    # has to come out in the user's own language.
+    settings = config.load()
+    if options["language"]:
+        settings.language = options["language"]
+    set_language(settings.language)
+
+    # And the log is opened before any of it, because the frozen build hides
+    # its console: a start-up event logged before this line reaches nothing but
+    # `logging.lastResort`, so the one fact that explains such a session would
+    # be missing from the very bundle the user is asked to attach. `configure`
+    # is safe to call twice and the engine calls it again below.
+    logsetup.configure(settings.logging_enabled, settings.log_days,
+                       directory=data_root / "logs")
+
     # One instance per data directory: two copies sorting the same library
     # would race on the journal.
-    lock = QLockFile(str(appdirs.lock_path()))
+    lock_file = appdirs.lock_path()
+    lock = QLockFile(str(lock_file))
     lock.setStaleLockTime(0)
-    doorbell = doorbell_name(appdirs.data_dir())
-    if not lock.tryLock(50):
+    doorbell = doorbell_name(data_root)
+    if not _take_lock(lock, lock_file):
+        problem = _lock_problem(lock, lock_file)
+        if problem:
+            log.error("%s: %s (Qt error %s)", problem, lock_file, lock.error())
+            # One quick ring even so: being told nobody is running while a copy
+            # is would cost the user the folder they opened, so the verdict is
+            # never the last word.
+            if hand_over(doorbell, str(options["folder"] or ""), timeout_ms=300):
+                return 0
+            critical(None, __display_name__, tr(problem, path=str(lock_file)))
+            return 1
         # Explorer's "Open with Qingjian" starts a second copy; hand the folder
         # to the first one and bow out quietly.
         if _hand_over_with_retry(doorbell, str(options["folder"] or "")):
@@ -195,14 +389,38 @@ def main(argv: list[str] | None = None) -> int:
         warning(None, __display_name__, tr("error.single_instance"))
         return 1
 
-    settings = config.load()
-    if options["language"]:
-        settings.language = options["language"]
-    set_language(settings.language)
+    if refused is not None:
+        # Said out loud, naming both places: data must never end up somewhere
+        # its owner cannot find it. Said here rather than earlier so that a
+        # second copy handing over a folder stays silent.
+        log.warning("data directory %s will not hold data; using %s", refused, data_root)
+        note = tr("error.data_dir_volatile") if appdirs.is_volatile(data_root) else ""
+        warning(None, __display_name__,
+                tr("error.data_dir_moved", requested=str(refused),
+                   used=str(data_root), note=("\n" + note if note else "")))
+    else:
+        # The run before this one may have been refused this very directory and
+        # written a whole second library elsewhere. Nothing used to mention it
+        # again, so that work was stranded where nobody would look.
+        stranded = appdirs.stranded_data(data_root)
+        if stranded is not None:
+            log.warning("earlier data left behind in %s", stranded)
+            warning(None, __display_name__,
+                    tr("error.data_dir_stranded", path=str(stranded)))
+
     theme.apply(app, settings.density)
 
     try:
-        engine = Engine(appdirs.data_dir(), settings)
+        engine = Engine(data_root, settings)
+    except OSError:
+        # A folder that took the write probe can still refuse a sub-directory
+        # or a deletion, and a raw "[WinError 5] Access is denied: ..." in a
+        # box is neither translated nor advice.
+        log.exception("engine failed to start")
+        critical(None, __display_name__,
+                 tr("error.data_dir_unwritable", paths=str(data_root)))
+        lock.unlock()
+        return 1
     except Exception as error:                      # pragma: no cover - startup failure
         log.exception("engine failed to start")
         critical(None, __display_name__, str(error))

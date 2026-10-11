@@ -580,12 +580,24 @@ class CoarseMtimeTests(TempCase):
         engine.open_folder(root / "lib")
         engine.classify(config.Binding(key="1", action=action, folder=str(usb)), photo)
         engine.undo()
+        self.engine = engine
         return photo, usb / "IMG_5.JPG"
 
     def test_undoing_a_move_to_a_coarse_mtime_volume(self):
         photo, copy = self.sort_and_undo("move")
         self.assertTrue(photo.is_file(), "the photo did not come back")
         self.assertFalse(copy.exists())
+
+    def test_redoing_it_expects_the_clock_the_undo_brought_back(self):
+        """The copy back carries the card's rounded mtime; redo must not call that a change."""
+        photo, copy = self.sort_and_undo("move")
+        self.engine.redo()
+        self.assertTrue(copy.is_file(), "redo was refused")
+        self.assertFalse(photo.exists())
+        self.engine.undo()
+        self.assertTrue(photo.is_file())
+        self.assertFalse(copy.exists())
+        self.assertFalse(self.engine.has_pending())
 
     def test_undoing_a_favourite_to_a_coarse_mtime_volume(self):
         photo, copy = self.sort_and_undo("favorite")

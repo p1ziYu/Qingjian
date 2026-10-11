@@ -419,7 +419,11 @@ class Planner:
     def plan_undo(self, record: Record) -> Outcome:
         steps = list(record.payload.get("inverse") or [])
         delta = empty_delta()
-        delta["records_move"].append({"id": record.id, "to": "redo"})
+        # The step lists travel with the move: a copy back across volumes learns
+        # what the far clock kept, and the redo after it has to expect that.
+        delta["records_move"].append({"id": record.id, "to": "redo",
+                                      "forward": record.payload.get("forward") or [],
+                                      "inverse": record.payload.get("inverse") or []})
         self._reverse_side_effects(record, delta, undo=True)
         if not steps:
             return Outcome(record=record, delta=delta)
@@ -431,7 +435,9 @@ class Planner:
     def plan_redo(self, record: Record) -> Outcome:
         steps = list(record.payload.get("forward") or [])
         delta = empty_delta()
-        delta["records_move"].append({"id": record.id, "to": "history"})
+        delta["records_move"].append({"id": record.id, "to": "history",
+                                      "forward": record.payload.get("forward") or [],
+                                      "inverse": record.payload.get("inverse") or []})
         self._reverse_side_effects(record, delta, undo=False)
         if not steps:
             return Outcome(record=record, delta=delta)

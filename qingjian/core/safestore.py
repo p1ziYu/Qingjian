@@ -892,14 +892,24 @@ class SafeStore:
         copies, so both are written. A record may carry fewer steps than the journal
         does, so each list pair is lined up against its own forward, and only once
         the step at *index* is confirmed to be the step that just ran.
+
+        A record that undo or redo moves between stacks carries its lists in the
+        move, because the redo after a copy back from such a volume has to expect
+        the clock that copy got, not the one the photo had before it ever left.
         """
         landed = step.get("result")
         if not landed:
             return
         pairs = [(payload.get("forward") or [], payload.get("inverse") or [])]
-        for record in (payload.get("state") or {}).get("records_add") or []:
+        state = payload.get("state") or {}
+        for record in state.get("records_add") or []:
             body = record.get("payload") or {}
             pairs.append((body.get("forward") or [], body.get("inverse") or []))
+        for move in state.get("records_move") or []:
+            # Undo runs a record's inverse and redo its forward. Both pairings are
+            # offered; the step check below keeps only the one this run is.
+            forward, inverse = move.get("forward") or [], move.get("inverse") or []
+            pairs += [(forward, inverse), (inverse, forward)]
         for forward, inverse in pairs:
             if len(forward) <= index:
                 continue

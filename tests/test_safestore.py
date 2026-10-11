@@ -482,6 +482,21 @@ class SyncInverseTests(StoreCase):
         self.assertEqual(first["result"], body["inverse"][0]["src_id"],
                          "undoing this record still expects the clock the plan guessed")
 
+    def test_a_record_moved_by_a_replayed_undo_learns_what_landed(self):
+        """Undo runs the record's inverse; read back from the journal it holds copies."""
+        there = step_move(self.src / "a.JPG", self.dst / "a.JPG", {"size": 111, "mtime_ns": 11})
+        record = {"forward": [there], "inverse": SafeStore.invert([there])}
+        journal = json.loads(json.dumps({
+            "forward": record["inverse"], "inverse": record["forward"],
+            "state": {"records_move": [{"id": "rec", "to": "redo", **record}]}}))
+        back = journal["forward"][0]
+        back["result"] = {"size": 111, "mtime_ns": 8_000_000_000}
+        SafeStore._sync_inverse(journal, 0, back)
+        moved = journal["state"]["records_move"][0]
+        self.assertEqual(back["result"], moved["forward"][0]["src_id"],
+                         "redoing this record still expects the clock it had before the undo")
+        self.assertEqual(back["result"], moved["inverse"][0]["result"])
+
     def test_a_record_holding_another_step_is_left_alone(self):
         other = step_move(self.src / "b.JPG", self.dst / "b.JPG", {"size": 222, "mtime_ns": 22})
         payload, first, body = self.build([other])

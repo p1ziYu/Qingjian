@@ -458,6 +458,11 @@ class Planner:
         master = str(group.master)
         record.from_review = (self.state.is_queued(root, master)
                               if from_review is None else from_review)
+        if action == "rename" and record.from_review and self.state.is_queued(
+                root, str(record.destination)):
+            # A rename that replaced a file waiting for review: undo brings that
+            # file back, and it has to come back to review with it.
+            record.payload["replaced_in_review"] = True
         delta["records_clear_stack"].append(STACK_REDO)
         delta["records_add"].append(record.to_dict())
         # Any decision about a file takes it out of the review queue.
@@ -489,7 +494,7 @@ class Planner:
                 delta["reviews_add"].append([root, master])
             else:
                 delta["reviews_remove"].append([root, master])
-            if record.action == "rename":
+            if record.action == "rename" and not record.payload.get("replaced_in_review"):
                 delta["reviews_remove" if undo else "reviews_add"].append(
                     [root, record.destination])
         if record.action == "rename":

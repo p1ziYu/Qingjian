@@ -860,6 +860,22 @@ class FileListTests(TempCase):
         self.assertEqual([str(renamed)], self.engine.state.review_queue(root))
 
 
+    def test_undoing_a_rename_that_replaced_a_file_in_review_keeps_both_there(self):
+        """Undo took the new name off the review list, and that is the very name
+        the replaced file comes back under: it left review for the main queue."""
+        from qingjian.core import ops
+        first, second = self.src / "A.JPG", self.src / "B.JPG"
+        root = str(self.engine.source_root)
+        self.engine.send_to_review([first, second], self.engine.source_root)
+        self.engine.set_review_mode(True)
+        self.engine.rename(second.name, first, resolver=lambda _a, _b: ops.CONFLICT_REPLACE)
+        self.assertEqual([str(second)], self.engine.state.review_queue(root))
+        self.engine.undo()
+        self.assertEqual({str(first), str(second)}, set(self.engine.state.review_queue(root)))
+        self.engine.redo()
+        self.assertEqual([str(second)], self.engine.state.review_queue(root))
+
+
 class SystemFolderTests(TempCase):
     """Opening a whole drive must not list what the system keeps on it."""
 

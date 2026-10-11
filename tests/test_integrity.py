@@ -629,6 +629,14 @@ class CoarseMtimeTests(TempCase):
         root = self.tmp / action
         usb = root / "usb"
         photo = self.write(root / "lib" / "IMG_5.JPG", b"f" * 3000)
+        engine = self.coarse_card(root, usb)
+        engine.classify(config.Binding(key="1", action=action, folder=str(usb)), photo)
+        engine.undo()
+        self.engine = engine
+        return photo, usb / "IMG_5.JPG"
+
+    def coarse_card(self, root, usb):
+        """An engine over root/lib whose *usb* keeps a two-second clock."""
         real_utime = os.utime
 
         def rounded(path, *args, ns=None, **kwargs):
@@ -649,10 +657,7 @@ class CoarseMtimeTests(TempCase):
         engine = Engine(data_dir=root / "app", settings=settings)
         self.addCleanup(engine.close)
         engine.open_folder(root / "lib")
-        engine.classify(config.Binding(key="1", action=action, folder=str(usb)), photo)
-        engine.undo()
-        self.engine = engine
-        return photo, usb / "IMG_5.JPG"
+        return engine
 
     def test_undoing_a_move_to_a_coarse_mtime_volume(self):
         photo, copy = self.sort_and_undo("move")
@@ -669,6 +674,36 @@ class CoarseMtimeTests(TempCase):
         self.assertTrue(photo.is_file())
         self.assertFalse(copy.exists())
         self.assertFalse(self.engine.has_pending())
+
+    def test_a_move_killed_once_it_landed_on_the_card_recovers(self):
+        """The journal guesses the photo lands with its own time, and the card
+        kept a rounded one: killed after the move had landed, the run could
+        never be recovered, nor its undo after it."""
+        root = self.tmp / "killed"
+        usb = root / "usb"
+        photo = self.write(root / "lib" / "IMG_5.JPG", b"f" * 3000)
+        os.utime(photo, ns=(1_700_000_000_123_456_789,) * 2)
+        engine = self.coarse_card(root, usb)
+        first: list[bytes] = []
+        real_atomic = safestore.atomic_json
+
+        def remember(path, value):
+            real_atomic(path, value)
+            if not first and Path(path) == engine.store.journal_path:
+                first.append(Path(path).read_bytes())
+
+        safestore.atomic_json = remember
+        self.addCleanup(setattr, safestore, "atomic_json", real_atomic)
+        engine.classify(config.Binding(key="1", action="move", folder=str(usb)), photo)
+        safestore.atomic_json = real_atomic
+        engine.store.journal_path.write_bytes(first[0])         # what a kill there leaves
+        engine.recover()
+        self.assertFalse(engine.has_pending())
+        self.assertTrue((usb / "IMG_5.JPG").is_file())
+        self.assertFalse(photo.exists())
+        engine.undo()
+        self.assertTrue(photo.is_file())
+        self.assertFalse((usb / "IMG_5.JPG").exists())
 
     def test_undoing_a_favourite_to_a_coarse_mtime_volume(self):
         photo, copy = self.sort_and_undo("favorite")

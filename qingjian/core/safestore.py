@@ -307,6 +307,30 @@ def _fast_matches(info, expected: dict | None) -> bool:
     return True
 
 
+#: The coarsest clock a volume keeps: FAT rounds a modification time to two seconds.
+_COARSEST_CLOCK_NS = 2_000_000_000
+
+
+def _rounded_landing(path: str | Path, expected: dict | None) -> dict | None:
+    """What *path* holds, if it is *expected* but for a clock that rounded its time.
+
+    A move is planned to land with its source's identity, and so it does,
+    except on a card whose clock keeps two seconds or ten milliseconds: there
+    a run killed after the move landed could never be recovered, because the
+    file it left never matched the plan's guess. Size has to agree exactly, and
+    a known hash still has to match.
+    """
+    if not expected or expected.get("size") is None or expected.get("mtime_ns") is None:
+        return None
+    info = _stat_or_none(path)
+    if (info is None or info.st_size != expected["size"]
+            or abs(info.st_mtime_ns - expected["mtime_ns"]) > _COARSEST_CLOCK_NS):
+        return None
+    if expected.get("hash") and fingerprint(path) != expected["hash"]:
+        return None
+    return dict(expected, size=info.st_size, mtime_ns=info.st_mtime_ns)
+
+
 def identity_matches(path: str | Path, expected: dict | None, verify: str = VERIFY_FULL,
                      progress: Progress = _NOOP_PROGRESS, cancel: Cancel = _NEVER) -> bool:
     """Does *path* currently hold the content described by *expected*?"""
@@ -830,9 +854,11 @@ class SafeStore:
         info = stat_of or _stat_or_none
         kind, dst, result = step["kind"], Path(step["dst"]), step.get("result")
         if kind == MOVE:
-            return (_fast_matches(info(dst), result or step.get("src_id"))
-                    and (info(step["src"]) is None
-                         or self._landed_later(Path(step["src"]), later)))
+            expected = result or step.get("src_id")
+            emptied = (info(step["src"]) is None
+                       or self._landed_later(Path(step["src"]), later))
+            return emptied and (_fast_matches(info(dst), expected)
+                                or _rounded_landing(dst, expected) is not None)
         if kind == COPY:
             return _fast_matches(info(dst), result or step.get("src_id"))
         if kind == WRITE:
@@ -978,7 +1004,10 @@ class SafeStore:
             if step["kind"] == WRITE:
                 restored = step.get("result") or {}
                 return bool(restored.get("hash")) and identity_matches(dst, restored, VERIFY_FULL)
-            if not identity_matches(dst, step.get("result") or step.get("src_id"), VERIFY_FAST):
+            expected = step.get("result") or step.get("src_id")
+            if not identity_matches(dst, expected, VERIFY_FAST) and not (
+                    step["kind"] == MOVE and not Path(step["src"]).exists()
+                    and _rounded_landing(dst, expected) is not None):
                 return False
             return step["kind"] != MOVE or self._moved_or_copied(step)
         return False
@@ -1024,6 +1053,12 @@ class SafeStore:
             if dst.parent.name == TRASH_DIR and src.parent.name != TRASH_DIR:
                 self._prepare_trash_folder(dst.parent)
             done_at_dst = identity_matches(dst, result, VERIFY_FAST)
+            if not done_at_dst:
+                landed = _rounded_landing(dst, result)
+                if landed is not None and (not src.exists() or self._landed_later(src, later)):
+                    # What the far clock kept, so the inverse expects it too.
+                    step["result"] = result = landed
+                    done_at_dst = True
             # Undoing a Replace moves the photo back and then restores the file it
             # replaced at the very path it left: what stands there on a replay is
             # that file, not a source the move failed to remove. Asked only once

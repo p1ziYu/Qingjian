@@ -331,8 +331,10 @@ def _clear_read_only(path: Path) -> None:
     makes files of its own -- and then failed every save after it.
     """
     try:
-        mode = path.stat().st_mode
-        if not mode & stat.S_IWRITE:
+        mode = path.lstat().st_mode
+        # A link is replaced, not written through: making the file it points
+        # at writable would change a file this program no longer touches.
+        if not stat.S_ISLNK(mode) and not mode & stat.S_IWRITE:
             os.chmod(path, mode | stat.S_IWRITE)
     except OSError:
         pass

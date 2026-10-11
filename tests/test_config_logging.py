@@ -111,6 +111,22 @@ class ConfigTests(TempCase):
             config.save(settings, path)
         self.assertEqual(9, config.load(path).workers)
 
+    def test_a_settings_link_leaves_the_file_it_points_at_alone(self):
+        """The link is what a save replaces; the file behind it is not ours to
+        make writable."""
+        import stat
+        target = self.data / "elsewhere.json"
+        target.write_text("{}", encoding="utf-8")
+        os.chmod(target, stat.S_IREAD)
+        self.addCleanup(os.chmod, target, stat.S_IREAD | stat.S_IWRITE)
+        link = self.data / "settings.json"
+        try:
+            link.symlink_to(target)
+        except (OSError, NotImplementedError):
+            self.skipTest("symbolic links cannot be made here")
+        config._clear_read_only(link)
+        self.assertFalse(target.stat().st_mode & stat.S_IWRITE)
+
     @unittest.skipUnless(os.name == "nt", "the read-only attribute is a Windows rule")
     def test_a_read_only_settings_file_is_replaced_on_windows(self):
         import stat

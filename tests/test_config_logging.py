@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import zipfile
 import json
 from pathlib import Path
@@ -620,6 +621,7 @@ class DiagnosticBundleTests(TempCase):
 
 
 class PlatformTests(TempCase):
+    @unittest.skipUnless(sys.platform == "win32", "the recycle-bin queries are Windows APIs")
     def test_recycle_policy_percent_can_be_stricter_than_volume_limit(self):
         import ctypes
         from types import SimpleNamespace
@@ -645,6 +647,7 @@ class PlatformTests(TempCase):
             policy.return_value = None
             self.assertFalse(platform_.can_recycle(self.tmp / "photo.jpg", 1))
 
+    @unittest.skipUnless(sys.platform == "win32", "the recycle-bin queries are Windows APIs")
     def test_recycle_policy_registry_states_fail_closed(self):
         import winreg
         from unittest.mock import Mock, patch
@@ -667,6 +670,7 @@ class PlatformTests(TempCase):
                  (5, winreg.REG_DWORD))):
             self.assertEqual((5, False), platform_._recycle_policy())
 
+    @unittest.skipUnless(sys.platform == "win32", "the recycle-bin queries are Windows APIs")
     def test_can_recycle_checks_fixed_volume_query_and_actual_capacity(self):
         import ctypes
         from types import SimpleNamespace
@@ -702,6 +706,7 @@ class PlatformTests(TempCase):
             shell.SHQueryRecycleBinW.return_value = 0
             self.assertFalse(platform_.can_recycle(self.tmp / "photo.jpg", 1))
 
+    @unittest.skipUnless(sys.platform == "win32", "the recycle-bin queries are Windows APIs")
     def test_recycle_limit_reads_current_user_volume_setting(self):
         import ctypes
         import winreg

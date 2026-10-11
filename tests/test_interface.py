@@ -130,7 +130,14 @@ class WindowCase(QtCase):
         self.app.processEvents()
 
     def close_window(self) -> None:
-        self.window.close()
+        from qingjian.ui import mainwindow, prompts
+        # A failure notice left by a case that already failed would wait for a
+        # click offscreen and hang every case after it. Cases that expect one
+        # stub `warning` themselves; only the real box is kept out here.
+        with mock.patch.object(mainwindow, "warning", mainwindow.warning
+                               if mainwindow.warning is not prompts.warning
+                               else lambda *a, **k: QMessageBox.StandardButton.Ok):
+            self.window.close()
         # Delete it as well: a closed window keeps its shortcuts, and the next
         # case's Ctrl+Z then went to the window this case left behind.
         self.window.deleteLater()
@@ -366,6 +373,7 @@ class DuplicateRootTests(TempCase):
 
 
 class RecycleTests(WindowCase):
+    @unittest.skipUnless(sys.platform == "win32", "the recycle-bin queries are Windows APIs")
     def test_background_delete_keeps_reclaim_and_volume_checks_off_ui_thread(self):
         import ctypes
         import threading
@@ -2188,6 +2196,13 @@ class SecondLaunchTests(QtCase):
                 os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
 
         self.addCleanup(let_it_go)
+        try:
+            with open(path, "ab"):
+                pass
+        except OSError:
+            pass
+        else:
+            self.skipTest(f"this account can still write in {path}")
 
         plain = QLockFile(str(path))
         plain.setStaleLockTime(0)

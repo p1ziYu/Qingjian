@@ -255,6 +255,26 @@ class RecoverStartupTests(WindowCase):
             self.window.recover_pending()
         self.assertEqual(self.engine.source_root, startup)
 
+    def leave_a_failed_recovery(self, choice: str) -> Path:
+        from qingjian.ui.mainwindow import MainWindow
+        RecoverExitTests.silence_warnings(self)
+        RecoverExitTests.stuck_journal(self)
+        startup = self.tmp / "start"
+        startup.mkdir()
+        self.window.startup_folder = startup
+        self.engine.source_root = None
+        self.patch(MainWindow, "_ask_recover_exit", lambda _self, _message, _rollback: choice)
+        self.window.recover_pending()
+        self.assertFalse(self.engine.has_pending())
+        return startup
+
+    def test_rolling_back_a_failed_recovery_opens_the_startup_folder(self):
+        """Only a recovery that finished opened the folder; a way out left the counter empty."""
+        self.assertEqual(self.leave_a_failed_recovery("rollback"), self.engine.source_root)
+
+    def test_keeping_the_files_after_a_failed_recovery_opens_the_startup_folder(self):
+        self.assertEqual(self.leave_a_failed_recovery("keep"), self.engine.source_root)
+
 
 class ProgressHandoverTests(WindowCase):
     def test_new_handover_during_scan_replaces_old_request(self):
@@ -2026,6 +2046,29 @@ class BindingCardTests(QtCase):
         self.assertEqual([3], self.asked)
 
 
+class PresetTests(WindowCase):
+    def test_deleting_the_preset_in_use_forgets_its_conflict_answers(self):
+        """Switching presets forgot an "always replace" answer; deleting one kept it."""
+        from PySide6.QtWidgets import QMenu
+        from qingjian.core import config, ops
+        from qingjian.ui import mainwindow
+        self.settings.profiles["Trip"] = [config.Binding(**binding.to_dict())
+                                          for binding in self.settings.bindings]
+        self.window._refresh_presets()
+        self.window.preset_combo.setCurrentText("Trip")
+        self.window._conflict_defaults[str(self.keep.resolve())] = ops.CONFLICT_REPLACE
+
+        class Deleting(QMenu):
+            def exec(self, *_args):
+                return self.actions()[2]
+
+        self.patch(mainwindow, "QMenu", Deleting)
+        self.patch(mainwindow, "ask", lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes)
+        self.window._preset_menu()
+        self.assertNotIn("Trip", self.settings.profiles)
+        self.assertEqual({}, self.window._conflict_defaults)
+
+
 class ReservedKeyTests(WindowCase):
     def test_the_key_editor_refuses_a_key_the_window_already_uses(self):
         from qingjian.core import config
@@ -3342,6 +3385,42 @@ class G03WindowTests(WindowCase):
              mock.patch.object(self.window, "_report") as report:
             self.window.rename_current()
         report.assert_called_once()
+
+    def test_keeping_the_offered_name_renames_nothing_and_asks_nothing(self):
+        """Enter on the name as offered asked whether to replace the file with itself."""
+        from qingjian.ui.mainwindow import ConflictDialog
+        current = self.engine.current_path()
+        with mock.patch("qingjian.ui.mainwindow.get_text", return_value=(current.name, True)), \
+             mock.patch.object(ConflictDialog, "ask") as ask, \
+             mock.patch.object(self.engine, "rename") as rename, \
+             mock.patch.object(self.window, "_report") as report:
+            self.window.rename_current()
+        ask.assert_not_called()
+        rename.assert_not_called()
+        report.assert_not_called()
+        self.assertTrue(current.exists())
+
+    def test_a_change_of_case_is_not_a_conflict_with_the_file_itself(self):
+        """On Windows the new spelling already exists, because it is the same file.
+
+        A second hard link stands in for that here: the same file under the
+        new spelling. The rename goes on as one, and the engine has its say.
+        """
+        from qingjian.ui.mainwindow import ConflictDialog
+        current = self.engine.current_path()
+        respelled = current.with_name(current.stem.lower() + current.suffix)
+        try:
+            os.link(current, respelled)
+        except OSError:
+            self.skipTest("this file system cannot give a file a second spelling")
+        reported: list = []
+        with mock.patch("qingjian.ui.mainwindow.get_text", return_value=(respelled.name, True)), \
+             mock.patch.object(ConflictDialog, "ask") as ask, \
+             mock.patch.object(self.window, "_report", reported.append):
+            self.window.rename_current()
+        ask.assert_not_called()
+        self.assertEqual(["error.name_case_only"], [getattr(error, "key", "")
+                                                    for error in reported])
 
 
 class G03EditorTests(QtCase):

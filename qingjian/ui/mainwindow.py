@@ -1526,6 +1526,7 @@ class MainWindow(QMainWindow):
                     == QMessageBox.StandardButton.Yes:
                 self.settings.profiles.pop(self.settings.current_profile, None)
                 self.settings.current_profile = next(iter(self.settings.profiles))
+                self._conflict_defaults.clear()     # as on any switch of preset
                 self.engine.save_settings()
                 self._refresh_presets()
                 self._install_binding_shortcuts()
@@ -2070,9 +2071,15 @@ class MainWindow(QMainWindow):
         try:
             new_name = naming.ensure_suffix(name.strip(), path.suffix)
             naming.validate_filename(new_name)
+            if new_name == path.name:
+                return          # Enter on the name as offered asked to replace it with itself
             target = path.with_name(new_name)
             decision = ""
-            if target.exists():
+            # A change of case only: on Windows the new spelling "exists"
+            # because it is this very file, which is no conflict to ask about.
+            respelled = (new_name.casefold() == path.name.casefold() and target.exists()
+                         and self.engine.planner._same_path(path, target, True))
+            if target.exists() and not respelled:
                 decision, _remember = ConflictDialog.ask(self, path, target)
                 if decision in (ops.CONFLICT_CANCEL, ops.CONFLICT_SKIP):
                     return
@@ -2296,6 +2303,10 @@ class MainWindow(QMainWindow):
         self.recover_button.setVisible(self.engine.has_pending())
         if choice and self.engine.source_root:
             self.rescan()
+        elif choice and not self.engine.has_pending():
+            # At startup nothing is open yet: the folder held back for the
+            # recovery is opened now, as after one that finished.
+            self._open_initial_folder()
 
     def _ask_recover_exit(self, message: str, can_rollback: bool) -> str:
         box = QMessageBox(QMessageBox.Icon.Warning, tr("error.title"),

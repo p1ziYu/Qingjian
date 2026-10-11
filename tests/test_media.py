@@ -1044,3 +1044,36 @@ class TransientReadTests(TempCase):
         """Scored as zero it was cached as blurry until the file next changed."""
         junk = self.write(self.tmp / "junk.jpg", b"nope" * 3000)
         self.assertIsNone(imaging.quality_score(junk))
+
+
+class MetadataReadingTests(TempCase):
+    def test_exposures_between_a_third_and_one_second_read_as_decimals(self):
+        """0.8 s is not 1/1, and neither 0.4 s nor 0.6 s is 1/2."""
+        cases = {(8, 10): "0.8s", (4, 10): "0.4s", (6, 10): "0.6s", (3, 10): "0.3s",
+                 (1, 2): "1/2", (1, 3): "1/3", (1, 4): "1/4", (10, 600): "1/60",
+                 (1, 250): "1/250", (13, 10): "1.3s", (2, 1): "2s"}
+        for value, expected in cases.items():
+            with self.subTest(value=value):
+                self.assertEqual(expected, metadata.format_shutter(value))
+
+    def test_a_capture_date_before_1970_still_sorts_by_that_date(self):
+        """On Windows a naive datetime before 1970 has no timestamp(): it raises.
+        A scanned 1965 negative then sorted by the day it was scanned."""
+        real = metadata.datetime
+
+        class WindowsDatetime(real):
+            def timestamp(self):
+                if self.tzinfo is None and self.year < 1970:
+                    raise OSError(22, "Invalid argument")
+                return super().timestamp()
+
+        path = self.tmp / "scan_1965.jpg"
+        exif = Image.Exif()
+        exif.get_ifd(0x8769)[0x9003] = "1965:07:04 12:00:00"
+        Image.new("RGB", (64, 64)).save(path, exif=exif)
+        with patch.object(metadata, "datetime", WindowsDatetime):
+            quick = metadata.capture_only(path)
+            full = metadata.capture_time(path)
+        self.assertIsNotNone(quick)
+        self.assertLess(quick, 0)
+        self.assertEqual(quick, full)

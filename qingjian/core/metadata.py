@@ -82,7 +82,12 @@ def format_shutter(value) -> str:
     seconds = num / den
     if seconds >= 1:
         return f"{seconds:g}s"
-    return f"1/{round(den / max(1, num))}"
+    reciprocal = den / max(1, num)
+    # From a third of a second up, cameras show tenths: 0.8 s is not 1/1, and
+    # neither 0.4 s nor 0.6 s is 1/2. A true fraction such as 1/3 still reads 1/3.
+    if seconds >= 0.3 and abs(reciprocal - round(reciprocal)) > 0.01 * reciprocal:
+        return f"{round(seconds, 1):g}s"
+    return f"1/{round(reciprocal)}"
 
 
 def format_focal(value) -> str:
@@ -183,11 +188,20 @@ class MediaInfo:
             return datetime(1970, 1, 1) + timedelta(seconds=self.mtime or 0)
 
     def timestamp(self) -> float:
-        when = self.when()
-        try:
-            return when.timestamp()
-        except (OSError, OverflowError, ValueError):
-            return (when - datetime(1970, 1, 1)).total_seconds()
+        return _epoch(self.when())
+
+
+def _epoch(when: datetime) -> float:
+    """Seconds since 1970 for *when*, dates before 1970 included.
+
+    On Windows a naive datetime before 1970 raises from ``timestamp()``.
+    Counting from the epoch directly keeps a scanned 1965 negative in date
+    order instead of sorting it by the day it was scanned.
+    """
+    try:
+        return when.timestamp()
+    except (OSError, OverflowError, ValueError):
+        return (when - datetime(1970, 1, 1)).total_seconds()
 
 
 def _transient(error: BaseException) -> bool:
@@ -408,7 +422,7 @@ def capture_only(path: str | Path) -> float | None:
                 for source_tags in (inner, exif):
                     parsed = _parse_datetime(str(source_tags.get(tag) or ""))
                     if parsed:
-                        return parsed.timestamp()
+                        return _epoch(parsed)
     except Exception:                     # noqa: BLE001 - any unreadable file
         return None
     try:
@@ -428,11 +442,7 @@ def capture_time(path: str | Path, *, strict: bool = False) -> float | None:
     info = read(path)
     if strict and info.transient:
         return None
-    when = info.captured or datetime.fromtimestamp(info.mtime)
-    try:
-        return when.timestamp()
-    except (OverflowError, OSError, ValueError):
-        return info.mtime
+    return info.timestamp()
 
 
 def clear_cache() -> None:

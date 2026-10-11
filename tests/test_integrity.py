@@ -23,7 +23,7 @@ from unittest import mock
 from base import ROOT, TempCase, unittest
 from qingjian.core import config, ops, safestore
 from qingjian.core.engine import Engine
-from qingjian.core.safestore import TransactionError
+from qingjian.core.safestore import VERIFY_FAST, TransactionError
 
 PACKAGE = ROOT / "qingjian"
 
@@ -775,6 +775,45 @@ class CoarseMtimeTests(TempCase):
         self.assertFalse(engine.has_pending())
         self.assertEqual(b"o" * 3000, (usb / "IMG_5.JPG").read_bytes())
         self.assertEqual(b"f" * 3000, photo.read_bytes())
+
+    def test_a_replace_undone_from_a_data_folder_on_a_stick_can_be_redone(self):
+        """Portable mode on a FAT stick: the restore copy of the replaced file
+        keeps a rounded time, and so does the file undo writes back from it.
+        Redo deletes that file again and expected the time it had before:
+        it was refused as changed, every time."""
+        root = self.tmp / "portable"
+        stick = root / "app"
+        photo = self.write(root / "lib" / "IMG_5.JPG", b"f" * 3000)
+        keep = root / "keep"
+        older = self.write(keep / "IMG_5.JPG", b"o" * 2000)
+        os.utime(older, ns=(1_600_000_000_123_456_789,) * 2)
+        real_utime = os.utime
+
+        def rounded(path, *args, ns=None, **kwargs):
+            if ns is not None and str(stick) in str(path):
+                ns = tuple((value // 2_000_000_000) * 2_000_000_000 for value in ns)
+            if ns is None:
+                return real_utime(path, *args, **kwargs)
+            return real_utime(path, *args, ns=ns, **kwargs)
+
+        os.utime = rounded
+        self.addCleanup(setattr, os, "utime", real_utime)
+        settings = config.Settings()
+        settings.logging_enabled = False
+        settings.verification = VERIFY_FAST
+        engine = Engine(data_dir=stick, settings=settings)
+        self.addCleanup(engine.close)
+        engine.open_folder(root / "lib")
+        engine.classify(config.Binding(key="1", action="move", folder=str(keep)), photo,
+                        resolver=lambda _a, _b: ops.CONFLICT_REPLACE)
+        engine.undo()
+        self.assertEqual(b"o" * 2000, older.read_bytes())
+        engine.redo()
+        self.assertEqual(b"f" * 3000, older.read_bytes())
+        self.assertFalse(photo.exists())
+        engine.undo()
+        self.assertEqual(b"o" * 2000, older.read_bytes())
+        self.assertFalse(engine.has_pending())
 
     def test_undoing_a_favourite_to_a_coarse_mtime_volume(self):
         photo, copy = self.sort_and_undo("favorite")

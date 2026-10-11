@@ -331,6 +331,14 @@ def _rounded_landing(path: str | Path, expected: dict | None) -> dict | None:
     return dict(expected, size=info.st_size, mtime_ns=info.st_mtime_ns)
 
 
+def _landed_as(path: str | Path, expected: dict) -> dict | None:
+    """*expected*, with the size and time *path* holds now."""
+    info = _stat_or_none(path)
+    if info is None:
+        return None
+    return dict(expected, size=info.st_size, mtime_ns=info.st_mtime_ns)
+
+
 def identity_matches(path: str | Path, expected: dict | None, verify: str = VERIFY_FULL,
                      progress: Progress = _NOOP_PROGRESS, cancel: Cancel = _NEVER) -> bool:
     """Does *path* currently hold the content described by *expected*?"""
@@ -722,6 +730,10 @@ class SafeStore:
                 if landed is not None:
                     step["result"] = landed
                     self._sync_inverse(payload, index, step)
+            elif (step["kind"] == WRITE and (step.get("result") or {}).get("hash")
+                    and identity_matches(step["dst"], step["result"], VERIFY_FULL)):
+                step["landed"] = _landed_as(step["dst"], step["result"])
+                self._sync_inverse(payload, index, step)
             if self._step_done(step, verify, forward[index + 1:]):
                 done = index + 1
                 continue
@@ -888,7 +900,7 @@ class SafeStore:
                 self._touched = False
                 if self._run_step(step, verify, stage, progress, steps[index + 1:]):
                     mutated = True
-                if step["kind"] in (MOVE, COPY):
+                if step["kind"] in (MOVE, COPY, WRITE):
                     self._sync_inverse(payload, index, step)
         except BaseException as error:
             mutated = mutated or self._touched
@@ -962,7 +974,10 @@ class SafeStore:
         move, because the redo after a copy back from such a volume has to expect
         the clock that copy got, not the one the photo had before it ever left.
         """
-        landed = step.get("result")
+        # A restore keeps its expected content in ``result`` and what it landed
+        # beside it: the clock of the drive the restore copy sits on may have
+        # rounded the time, and redo deletes that file again.
+        landed = step.get("landed") if step["kind"] == WRITE else step.get("result")
         if not landed:
             return
         pairs = [(payload.get("forward") or [], payload.get("inverse") or [])]
@@ -982,13 +997,13 @@ class SafeStore:
             if any(twin.get(field) != step.get(field) for field in ("kind", "src", "dst")):
                 continue                    # this list describes some other step
             if twin is not step:
-                twin["result"] = dict(landed)
+                twin["landed" if step["kind"] == WRITE else "result"] = dict(landed)
             if len(inverse) != len(forward):
                 continue
             mirror = inverse[len(inverse) - 1 - index]
             if step["kind"] == MOVE and mirror.get("kind") == MOVE:
                 mirror["src_id"] = dict(landed)
-            elif step["kind"] == COPY and mirror.get("kind") == UNLINK:
+            elif step["kind"] in (COPY, WRITE) and mirror.get("kind") == UNLINK:
                 mirror["expect"] = dict(landed)
 
     def _landed_later(self, dst: Path, later: Sequence[dict],
@@ -1158,6 +1173,7 @@ class SafeStore:
             snapshot = step.get("snapshot") or {}
             source = Path(snapshot.get("file", ""))
             if result and identity_matches(dst, result, verify):
+                step["landed"] = _landed_as(dst, result)
                 return False
             if not source.is_file():
                 raise TransactionError("error.snapshot_missing", str(source), path=str(source))
@@ -1166,7 +1182,7 @@ class SafeStore:
             if dst.exists() and not identity_matches(dst, step.get("expect"), verify):
                 raise TransactionError("error.changed_midway", str(dst), path=str(dst))
             dst.parent.mkdir(parents=True, exist_ok=True)
-            self._staged_copy(source, dst, stage, verify, progress)
+            step["landed"] = self._staged_copy(source, dst, stage, verify, progress)
             self._touched = True
             return True
 

@@ -1235,6 +1235,25 @@ class PreviewDecodeTests(TempCase):
                 self.assertEqual(want, metadata.read(path).orientation)
                 upright = imaging.thumbnail(path, (320, 320)).size == (100, 60)
                 self.assertEqual(want in (1, 2, 3, 4), upright)
+        # Further from the end than one read reaches, and with an earlier
+        # eXIf in front of the pixels: a decode takes the last in the file.
+        cases = {
+            "far.png": (chunk(b"eXIf", exif(6)) + chunk(b"tEXt", b"Note\0" + b"x" * 90_000), 6),
+            "trailer.png": (chunk(b"eXIf", exif(6)), 6),
+        }
+        for name, (extra, want) in cases.items():
+            with self.subTest(name=name):
+                trailer = b"\0" * 70_000 if name == "trailer.png" else b""
+                path = self.write(self.tmp / name, head + extra + tail + trailer)
+                metadata.clear_cache()
+                self.assertEqual(want, metadata.read(path).orientation)
+        both = self.tmp / "both.png"
+        Image.new("RGB", (100, 60), "blue").save(both, exif=exif(1))
+        data = both.read_bytes()
+        both = self.write(both, data[:-12] + chunk(b"eXIf", exif(6)) + data[-12:])
+        metadata.clear_cache()
+        self.assertEqual(6, metadata.read(both).orientation)
+        self.assertEqual((60, 100), imaging.thumbnail(both, (320, 320)).size)
         dated = self.tmp / "dated.png"
         taken = datetime(2001, 2, 3, 4, 5, 6)
         self.assertEqual(taken, metadata.read(dated).captured)

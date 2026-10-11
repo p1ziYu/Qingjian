@@ -258,24 +258,71 @@ _PNG_TAIL = 64 * 1024
 _PNG_TEXT = (b"eXIf", b"iTXt", b"zTXt", b"tEXt")
 
 
-def _png_tail(path: Path, Image) -> tuple[object | None, int]:
-    """The eXIf block and XMP orientation a PNG keeps after its pixels.
+def _png_metadata(path: Path, image, Image) -> tuple[object | None, int]:
+    """A PNG's eXIf block and XMP orientation as Pillow sees them once decoded.
 
     Pillow reads a PNG's chunks only up to the image data when it opens one,
     and asking it for the rest decodes the whole picture. A camera app may
     write eXIf after the data, and an editor may keep the orientation in XMP
     alone; the thumbnail, which Pillow decodes anyway, turned such a PNG and
-    the preview did not. Those chunks sit just before the end, so one read of
-    the file's last few kilobytes finds them: each is told from stray bytes by
-    its checksum, and, as when Pillow decodes, the last of each kind wins.
+    the preview did not. Decoded, the last eXIf and the last XMP in the file
+    are the ones that count: those after the data are found here, and those
+    in front of it are what Pillow read on opening.
     """
-    with open(path, "rb") as stream:
+    late_exif, late_xmp = _png_tail(path)
+    exif = late_exif if late_exif is not None else image.info.get("exif")
+    xmp = late_xmp if late_xmp is not None else image.info.get("XML:com.adobe.xmp")
+    block = None
+    if exif is not None:
+        block = Image.Exif()
+        block.load(exif)
+    match = _XMP_ORIENTATION.search(xmp) if isinstance(xmp, str) else None
+    return block, int(match.group(2)) if match else 0
+
+
+def _png_tail(path: Path) -> tuple[bytes | None, str | None]:
+    """The last eXIf body and XMP packet among a PNG's chunks after its pixels.
+
+    They sit just before the end, so one read of the file's last few kilobytes
+    finds them, each told from stray bytes by its checksum; only when that
+    window does not reach back to the image data are the headers walked.
+    """
+    with open(path, "rb", buffering=0) as stream:
         if stream.read(8) != b"\x89PNG\r\n\x1a\n":
-            return None, 0
+            return None, None
         size = stream.seek(0, 2)
         start = max(8, size - _PNG_TAIL)
         stream.seek(start)
         tail = stream.read()
+        if start == 8 or _tail_holds_the_rest(tail):
+            found = _chunks_in(tail)
+        else:
+            # Large metadata after the pixels, or bytes after the end: the
+            # window does not reach back to the image data, so the chunk
+            # headers are walked instead -- a few bytes read per chunk.
+            found = _walk_chunks(stream)
+    exif: bytes | None = None
+    xmp: str | None = None
+    for _at, kind, body in sorted(found):
+        if kind == b"eXIf":
+            exif = body
+        elif (text := _png_text(kind, body)) is not None:
+            xmp = text
+    return exif, xmp
+
+
+#: An IEND chunk as every PNG ends: no data, and the checksum of its name.
+_IEND = b"\x00\x00\x00\x00IEND\xaeB`\x82"
+
+
+def _tail_holds_the_rest(tail: bytes) -> bool:
+    """Does *tail* run from inside the image data to the file's own end?"""
+    idat = tail.rfind(b"IDAT")
+    return idat >= 4 and tail.endswith(_IEND) and tail.rfind(_IEND) > idat
+
+
+def _chunks_in(tail: bytes) -> list[tuple[int, bytes, bytes]]:
+    """The metadata chunks in *tail*, each told from stray bytes by its checksum."""
     found: list[tuple[int, bytes, bytes]] = []
     for kind in _PNG_TEXT:
         at = tail.find(kind, 4)
@@ -287,18 +334,26 @@ def _png_tail(path: Path, Image) -> tuple[object | None, int]:
                     and zlib.crc32(kind + body) == struct.unpack(">I", check)[0]):
                 found.append((at, kind, body))
             at = tail.find(kind, at + 1)
-    exif, xmp = None, ""
-    for _at, kind, body in sorted(found):
-        if kind == b"eXIf":
-            exif = body
-        elif (text := _png_text(kind, body)) is not None:
-            xmp = text
-    block = None
-    if exif is not None:
-        block = Image.Exif()
-        block.load(exif)
-    match = _XMP_ORIENTATION.search(xmp) if xmp else None
-    return block, int(match.group(2)) if match else 0
+    return found
+
+
+def _walk_chunks(stream) -> list[tuple[int, bytes, bytes]]:
+    """The metadata chunks of the whole file, by walking its chunk headers."""
+    found: list[tuple[int, bytes, bytes]] = []
+    stream.seek(8)
+    for order in range(200_000):
+        header = stream.read(8)
+        if len(header) < 8:
+            break
+        length, kind = struct.unpack(">I4s", header)
+        if kind == b"IEND":
+            break
+        if kind in _PNG_TEXT and length <= 1 << 24:
+            found.append((order, kind, stream.read(length)))
+            stream.seek(4, 1)
+        else:
+            stream.seek(length + 4, 1)
+    return found
 
 
 def _png_text(kind: bytes, body: bytes) -> str | None:
@@ -340,15 +395,11 @@ def _read_image(info: MediaInfo) -> None:
             info.fmt = image.format or ""
             info.frames = getattr(image, "n_frames", 1)
             try:
-                if image.format != "PNG" or "exif" in image.info:
+                if image.format != "PNG":
                     tags = _exif_tags(image.getexif(), ExifTags)
                 else:
-                    late, turned = _png_tail(info.path, Image)
-                    tags = _exif_tags(late, ExifTags) if late is not None else {}
-                    early = image.info.get("XML:com.adobe.xmp")
-                    if not turned and isinstance(early, str):
-                        found = _XMP_ORIENTATION.search(early)
-                        turned = int(found.group(2)) if found else 0
+                    block, turned = _png_metadata(info.path, image, Image)
+                    tags = _exif_tags(block, ExifTags) if block is not None else {}
             except OSError as error:
                 # Locked or offline just now: not a fact about the file.
                 info.transient = _transient(error)
@@ -500,10 +551,10 @@ def capture_only(path: str | Path) -> float | None:
         return None
     try:
         with Image.open(source) as image:
-            if image.format == "PNG" and "exif" not in image.info:
-                # The full reader takes a date from eXIf after the pixels, so
-                # date sorting does too, or the two orders disagreed.
-                exif, _turned = _png_tail(source, Image)
+            if image.format == "PNG":
+                # The date the full reader takes, from wherever the eXIf sits,
+                # or the date sort and everything else disagreed.
+                exif, _turned = _png_metadata(source, image, Image)
                 if exif is None:
                     return source.stat().st_mtime
             else:

@@ -1001,9 +1001,13 @@ class SafeStore:
             if len(inverse) != len(forward):
                 continue
             mirror = inverse[len(inverse) - 1 - index]
-            if step["kind"] == MOVE and mirror.get("kind") == MOVE:
+            # Lined up by position, so the path has to agree as well: a mirror
+            # that undoes some other step must never be taught this one's file.
+            if (step["kind"] == MOVE and mirror.get("kind") == MOVE
+                    and _path_key(mirror.get("src", "")) == _path_key(step["dst"])):
                 mirror["src_id"] = dict(landed)
-            elif step["kind"] in (COPY, WRITE) and mirror.get("kind") == UNLINK:
+            elif (step["kind"] in (COPY, WRITE) and mirror.get("kind") == UNLINK
+                    and _path_key(mirror.get("dst", "")) == _path_key(step["dst"])):
                 mirror["expect"] = dict(landed)
 
     def _landed_later(self, dst: Path, later: Sequence[dict],

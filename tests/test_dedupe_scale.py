@@ -540,12 +540,58 @@ class GroupingTests(TempCase):
                              return_value={"sharpness": 50.0, "blown": 0.0, "crushed": 0.0}):
             groups = dedupe.find_similar(paths, 0.92)
         self.assertTrue(groups)
+        sets = [{m.path for m in g.members} for g in groups]
+        self.assertEqual(sum(len(found) for found in sets), len(set().union(*sets)),
+                         "a frame was offered in two groups")
+        self.assertFalse(any({paths[0], paths[5]} <= found for found in sets),
+                         "the pan was chained end to end")
+        self.assertTrue(any({paths[1], paths[2], paths[3]} <= found for found in sets))
         for group in groups:
             for member in group.members:
-                self.assertGreaterEqual(member.similarity, 0.92,
+                # Within the threshold of the keeper, or of a frame that is:
+                # one step, never a chain.
+                self.assertGreaterEqual(member.similarity, 1 - 2 * 5 / 64,
                                         f"{member.path.name} vs {group.keep().path.name}")
-        self.assertIn({paths[1], paths[2], paths[3]},
-                      [{m.path for m in g.members} for g in groups])
+
+    @staticmethod
+    def shot(name: str, phash: int, width: int) -> "dedupe.Candidate":
+        return dedupe.Candidate(path=Path(f"/p/{name}"), size=width * 1000, width=width,
+                                height=width * 2 // 3, sharpness=50.0, phash=phash)
+
+    def test_a_copy_of_a_copy_is_still_found(self):
+        """The web export of an edited copy is two bits from the copy and eight
+        from the original. Grown round the original, the group took the copy,
+        and the export near-matched nothing left: it was in no group at all."""
+        original = 0x0123456789ABCDEF
+        edited = original ^ 0b111111
+        export = edited ^ (0b11 << 20)
+        groups = dedupe._around_keepers([self.shot("O.jpg", original, 6000),
+                                         self.shot("E.jpg", edited, 3000),
+                                         self.shot("W.jpg", export, 1200)], 7)
+        self.assertEqual([["O.jpg", "E.jpg", "W.jpg"]],
+                         [[c.path.name for c in group] for group in groups])
+
+    def test_a_long_timelapse_is_cut_quickly_and_can_be_stopped(self):
+        """Grown one keeper at a time in Python, ten thousand frames of a chain
+        took seconds after the bar said done, and Cancel did nothing there."""
+        import random
+        rng = random.Random(1)
+        value, frames = rng.getrandbits(64), []
+        for index in range(10_000):
+            frames.append(self.shot(f"t{index:05d}.jpg", value, 1000))
+            for _flip in range(2):              # each frame two bits from the last
+                value ^= 1 << rng.randrange(64)
+        started = time.monotonic()
+        dedupe._around_keepers(frames, 5)
+        self.assertLess(time.monotonic() - started, 5.0)
+        calls = []
+
+        def cancel():
+            calls.append(1)
+            return len(calls) > 3
+
+        with self.assertRaises(dedupe.Cancelled):
+            dedupe._around_keepers(frames, 5, cancel)
 
 
 class G10DialogLifetimeTests(unittest.TestCase):

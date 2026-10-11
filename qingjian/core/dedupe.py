@@ -19,6 +19,8 @@ from math import floor
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
+import numpy as np
+
 from . import imaging, metadata
 from .work import mapped as _mapped
 from .safestore import Cancelled, fingerprint, sample_digest
@@ -301,14 +303,15 @@ def find_similar(paths: Sequence[Path], threshold: float = 0.92, cache=None,
             if ignored:
                 candidates = [c for c in candidates
                               if identity_key(c.path, c.digest or "") not in ignored]
-            for chosen in _around_keepers(candidates, distance):
+            for chosen in _around_keepers(candidates, distance, cancel):
                 groups.append(_ranked_group(MODE_SIMILAR, chosen))
     progress("", 100)
     groups.sort(key=lambda g: -g.reclaimable_bytes())
     return groups
 
 
-def _around_keepers(candidates: list[Candidate], max_distance: int) -> list[list[Candidate]]:
+def _around_keepers(candidates: list[Candidate], max_distance: int,
+                    cancel: Cancel = _never) -> list[list[Candidate]]:
     """Cut a cluster of near matches into groups that each match their keeper.
 
     Near-match is not transitive. In a slow pan every frame is close to the
@@ -316,18 +319,55 @@ def _around_keepers(candidates: list[Candidate], max_distance: int) -> list[list
     the group offered to delete frames that looked nothing like the one it
     kept. Each group here is grown round the best frame left, which is the one
     it will keep, and takes only the frames within the threshold of it.
+
+    A frame whose every near match went to a group round another keeper -- the
+    web copy of an edited copy of an original -- would then be in no group at
+    all, though it is plainly a near-copy. It joins the group of its nearest
+    match: one step from a member, never a chain.
+
+    The distances are taken a keeper against the whole cluster at a time, and
+    the keepers in one ranking, so a timelapse of ten thousand frames costs a
+    fraction of a second rather than several seconds after the bar says done.
     """
-    remaining = list(candidates)
-    out: list[list[Candidate]] = []
-    while len(remaining) > 1:
-        keeper = remaining[_best_index(remaining)]
-        close = [c for c in remaining if c is keeper
-                 or imaging.hamming(keeper.phash or 0, c.phash or 0) <= max_distance]
-        if len(close) > 1:
-            out.append(close)
-        taken = {id(c) for c in close}
-        remaining = [c for c in remaining if id(c) not in taken]
-    return out
+    count = len(candidates)
+    if count < 2:
+        return []
+    order = sorted(range(count), reverse=True,
+                   key=lambda i: (candidates[i].pixels, candidates[i].sharpness,
+                                  candidates[i].size, -len(str(candidates[i].path))))
+    values = np.array([c.phash or 0 for c in candidates], dtype=np.uint64)
+    left = np.ones(count, dtype=bool)
+    home = np.full(count, -1)
+    groups: list[list[int]] = []
+    for index in order:
+        if not left[index]:
+            continue
+        if cancel():
+            raise Cancelled("cancelled")
+        members = np.flatnonzero(left & (_bits(values ^ values[index]) <= max_distance))
+        left[members] = False
+        if len(members) > 1:
+            home[members] = len(groups)
+            groups.append(members.tolist())
+    grouped = home >= 0
+    for index in np.flatnonzero(~grouped):
+        distances = np.where(grouped, _bits(values ^ values[index]), max_distance + 1)
+        nearest = int(np.argmin(distances))
+        if distances[nearest] <= max_distance:
+            groups[home[nearest]].append(int(index))
+    return [[candidates[i] for i in sorted(members)] for members in groups]
+
+
+#: Set bits in each byte value, for counting them where numpy cannot.
+_BYTE_BITS = np.array([bin(value).count("1") for value in range(256)], dtype=np.uint8)
+
+
+def _bits(values: np.ndarray) -> np.ndarray:
+    """Set bits in each of *values*, a uint64 array."""
+    counter = getattr(np, "bitwise_count", None)        # numpy 2 and later
+    if counter is not None:
+        return counter(values).astype(np.int64)
+    return _BYTE_BITS[values.view(np.uint8)].reshape(-1, 8).sum(axis=1, dtype=np.int64)
 
 
 def _digest_for_ignore(path: Path, cache, ignored: set[str], cancel: Cancel,

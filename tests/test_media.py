@@ -1077,3 +1077,141 @@ class MetadataReadingTests(TempCase):
         self.assertIsNotNone(quick)
         self.assertLess(quick, 0)
         self.assertEqual(quick, full)
+
+
+from PySide6.QtCore import Qt
+from PySide6.QtTest import QTest
+from PIL import ImageOps
+
+from qingjian.ui import thumbs
+
+
+def _settle(rounds=6):
+    for _ in range(rounds):
+        APP.processEvents()
+        QTest.qWait(15)
+
+
+class PreviewDecodeTests(TempCase):
+    def corners(self, size, colour_at):
+        width, height = size
+        points = {"top-left": (3, 3), "top-right": (width - 4, 3),
+                  "bottom-left": (3, height - 4), "bottom-right": (width - 4, height - 4)}
+        return {name for name, point in points.items()
+                if colour_at(point)[2] > 150 and colour_at(point)[0] < 100}
+
+    def test_png_and_webp_orientation_matches_the_thumbnail(self):
+        """Qt applies EXIF orientation to JPEG and TIFF but not to PNG or WebP,
+        so those turned on screen when a held arrow key was let go."""
+        source = Image.new("RGB", (400, 200), (200, 10, 10))
+        source.paste((0, 0, 255), (0, 0, 100, 50))
+        cases = [("PNG", "png", o) for o in range(1, 9)]
+        cases += [("WEBP", "webp", o) for o in range(1, 9)]
+        cases += [("TIFF", "tif", 6), ("JPEG", "jpg", 6), ("JPEG", "jpg", 8)]
+        for fmt, ext, orientation in cases:
+            with self.subTest(format=fmt, orientation=orientation):
+                exif = Image.Exif()
+                exif[0x112] = orientation
+                path = self.tmp / f"o{orientation}.{ext}"
+                options = {"lossless": True} if fmt == "WEBP" else {}
+                source.save(path, fmt, exif=exif.tobytes(), **options)
+                with Image.open(path) as opened:
+                    expected = ImageOps.exif_transpose(opened).convert("RGB")
+                image, error = preview.decode_qimage(path, QSize(1400, 1000))
+                self.assertEqual("", error)
+                self.assertEqual(expected.size, (image.width(), image.height()))
+                self.assertEqual(
+                    self.corners(expected.size, expected.getpixel),
+                    self.corners(expected.size,
+                                 lambda point: image.pixelColor(*point).getRgb()[:3]))
+
+    def test_a_16_bit_greyscale_thumbnail_is_scaled_not_clipped(self):
+        """Pillow clips wide greyscale into eight bits, so a 16-bit scan's
+        thumbnail came out almost white while the preview was right."""
+        values = np.tile(np.linspace(0, 65535, 600), (40, 1)).astype(np.uint16)
+        for ext in ("png", "tif"):
+            with self.subTest(format=ext):
+                path = self.tmp / f"grey16.{ext}"
+                Image.fromarray(values).save(path)
+                image = thumbs.pil_to_qimage(imaging.thumbnail(path, (200, 200)))
+                samples = [image.pixelColor(x, 5).red() for x in (0, 50, 100, 150, 199)]
+                for got, want in zip(samples, (0, 64, 128, 192, 255), strict=True):
+                    self.assertLessEqual(abs(got - want), 3, samples)
+
+    def test_an_animation_is_fitted_to_the_pane_it_is_shown_in(self):
+        """The animation used to be scaled while its page was still hidden: the
+        first GIF always came out 640x480, and one opened after the window was
+        resized kept the old size and was cropped."""
+        frames = [Image.new("RGB", (400, 300), colour)
+                  for colour in ((255, 0, 0), (0, 255, 0), (0, 0, 255))]
+        gif = self.tmp / "anim.gif"
+        frames[0].save(gif, save_all=True, append_images=frames[1:], duration=100, loop=0)
+        still = self.tmp / "still.jpg"
+        Image.new("RGB", (400, 300)).save(still)
+        pane = preview.MediaPreview()
+        self.addCleanup(pane.close)
+        self.addCleanup(pane.release)
+        pane.resize(1000, 700)
+        pane.show()
+        _settle()
+
+        def assert_fitted():
+            fitted = QSize(400, 300).scaled(pane.animated.size(),
+                                            Qt.AspectRatioMode.KeepAspectRatio)
+            self.assertEqual(fitted, pane._movie.scaledSize())
+
+        for size in (QSize(1000, 700), QSize(1400, 900), QSize(700, 450)):
+            with self.subTest(size=size):
+                pane.show_path(still)
+                _settle()
+                pane.resize(size)
+                _settle()
+                pane.show_path(gif)
+                _settle()
+                assert_fitted()
+        pane.resize(900, 640)
+        _settle()
+        assert_fitted()
+
+    def test_a_file_that_changes_while_it_is_decoded_does_not_stay_on_reading(self):
+        """A sync client or an import still writing the file changes it under
+        the decode. The stale picture is rightly thrown away, but nothing was
+        reported either, so the window showed "Reading…" for good."""
+        path = self.tmp / "growing.png"
+        Image.new("RGB", (300, 200), (1, 2, 3)).save(path)
+        real = preview.decode_qimage
+        writes = []
+
+        def decode_while_written(source, target):
+            result = real(source, target)
+            if not writes:
+                writes.append(source)
+                with open(source, "ab") as stream:
+                    stream.write(b"\0")
+            return result
+
+        fetcher = preview.PreviewPrefetcher()
+        self.addCleanup(fetcher.shutdown)
+        target = QSize(1400, 1000)
+        # The window as it stands, waiting on the placeholder for this file.
+        window = MagicMock()
+        window.engine.current_path.return_value = path
+        window.preview.EMPTY = 0
+        window.preview.stack.currentIndex.return_value = 0
+        window.preview.show_path.return_value = (True, "")
+        window._preview_target.return_value = target
+        window.preloader = fetcher
+        window._preview_retries = {}
+        fetcher.arrived.connect(lambda name: MainWindow._preview_arrived(window, name))
+        with patch.object(preview, "decode_qimage", decode_while_written):
+            fetcher.set_wanted([path], target)
+            fetcher.request(path, target)
+            deadline = time.monotonic() + 3
+            while not window.preview.show_path.called and time.monotonic() < deadline:
+                QTest.qWait(10)
+        self.assertEqual([path], writes)
+        window.preview.show_empty.assert_not_called()
+        self.assertTrue(window.preview.show_path.called, "left on the placeholder")
+        shown, pixmap = window.preview.show_path.call_args.args
+        self.assertEqual(path, shown)
+        self.assertFalse(pixmap.isNull())

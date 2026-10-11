@@ -15,6 +15,7 @@ import threading
 from collections import OrderedDict
 from pathlib import Path
 
+import numpy as np
 from PySide6.QtCore import QObject, QRunnable, QSize, Qt, QThreadPool, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPixmap
 
@@ -30,6 +31,14 @@ MAX_WORKERS = max(2, min(4, (os.cpu_count() or 4) // 2))
 
 def pil_to_qimage(image) -> QImage:
     """Convert a Pillow image without going through a temporary file."""
+    if image.mode.startswith("I;16") or image.mode == "I":
+        # Pillow clips wide greyscale into eight bits rather than scaling it,
+        # which turned a 16-bit scan's thumbnail almost white. Scale it the way
+        # Qt does for the full preview, so the two agree.
+        from PIL import Image  # noqa: PLC0415 - already loaded: *image* is one
+
+        values = np.clip(np.asarray(image, dtype=np.float64), 0, 65535)
+        image = Image.fromarray(np.rint(values / 257).astype(np.uint8))
     converted = image.convert("RGBA")
     data = converted.tobytes("raw", "RGBA")
     result = QImage(data, converted.width, converted.height,

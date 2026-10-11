@@ -530,7 +530,9 @@ class G06Task4Tests(TestCase):
             fetcher._pool.waitForDone(3000)
             APP.processEvents()
         self.assertEqual({}, fetcher._cache)
-        self.assertEqual([], arrived)
+        # The old picture is not filed, but the window is still told, so it asks
+        # again for the file as it is now: silence left it on "Reading…".
+        self.assertEqual([str(path)], arrived)
         self.assertEqual(set(), fetcher._pending)
 
     def test_f089_replaced_path_skips_queued_old_version(self):

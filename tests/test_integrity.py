@@ -705,6 +705,47 @@ class CoarseMtimeTests(TempCase):
         self.assertTrue(photo.is_file())
         self.assertFalse((usb / "IMG_5.JPG").exists())
 
+    def held_replace_on_the_card(self):
+        """A Replace onto the card whose copy landed while a viewer held the source."""
+        root = self.tmp / "held"
+        usb = root / "usb"
+        photo = self.write(root / "lib" / "IMG_5.JPG", b"f" * 3000)
+        os.utime(photo, ns=(1_700_000_000_123_456_789,) * 2)
+        self.write(usb / "IMG_5.JPG", b"old" * 700)
+        engine = self.coarse_card(root, usb)
+        real = safestore._unlink_source
+        held: list = []
+
+        def locked_once(src, landed=None):
+            if not held:
+                held.append(src)
+                raise PermissionError(13, "used by another process")
+            return real(src, landed)
+
+        safestore._unlink_source = locked_once
+        self.addCleanup(setattr, safestore, "_unlink_source", real)
+        with self.assertRaises(TransactionError):
+            engine.classify(config.Binding(key="1", action="move", folder=str(usb)), photo,
+                            resolver=lambda _a, _b: ops.CONFLICT_REPLACE)
+        self.assertTrue(engine.has_pending())
+        return engine, photo, usb / "IMG_5.JPG"
+
+    def test_a_held_replace_on_the_card_rolls_back_to_the_file_it_replaced(self):
+        """The run stopped before it taught the inverse the card's rounded time,
+        so rolling back refused to move the copy off the card."""
+        engine, photo, target = self.held_replace_on_the_card()
+        engine.abandon_pending(rollback=True)
+        self.assertFalse(engine.has_pending())
+        self.assertEqual(b"f" * 3000, photo.read_bytes())
+        self.assertEqual(b"old" * 700, target.read_bytes())
+
+    def test_a_held_replace_on_the_card_can_be_finished(self):
+        engine, photo, target = self.held_replace_on_the_card()
+        engine.recover()
+        self.assertFalse(engine.has_pending())
+        self.assertFalse(photo.exists())
+        self.assertEqual(b"f" * 3000, target.read_bytes())
+
     def test_undoing_a_favourite_to_a_coarse_mtime_volume(self):
         photo, copy = self.sort_and_undo("favorite")
         self.assertTrue(photo.is_file())

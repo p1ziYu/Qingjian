@@ -714,6 +714,16 @@ class SafeStore:
         inverse = list(payload.get("inverse") or [])
         done = 0
         for index, step in enumerate(forward):
+            if step["kind"] == MOVE:
+                # The inverse has to expect what landed, or it refuses to move it
+                # back: a card's clock may have rounded it, and a run stopped
+                # before the source was deleted never taught the inverse at all.
+                expected = step.get("result") or step.get("src_id")
+                landed = (expected if identity_matches(Path(step["dst"]), expected, VERIFY_FAST)
+                          else _rounded_landing(step["dst"], expected))
+                if landed is not None:
+                    step["result"] = landed
+                    self._sync_inverse(payload, index, step)
             if self._step_done(step, verify, forward[index + 1:]):
                 done = index + 1
                 continue
@@ -1006,8 +1016,7 @@ class SafeStore:
                 return bool(restored.get("hash")) and identity_matches(dst, restored, VERIFY_FULL)
             expected = step.get("result") or step.get("src_id")
             if not identity_matches(dst, expected, VERIFY_FAST) and not (
-                    step["kind"] == MOVE and not Path(step["src"]).exists()
-                    and _rounded_landing(dst, expected) is not None):
+                    step["kind"] == MOVE and _rounded_landing(dst, expected) is not None):
                 return False
             return step["kind"] != MOVE or self._moved_or_copied(step)
         return False
@@ -1017,10 +1026,10 @@ class SafeStore:
 
         A move that copies -- across volumes, or on one with the fast path off --
         can land its copy and then fail to delete the source: a viewer holds it
-        open, or the run is killed. Its ``result`` is written only once the copy
-        is in place, so a run that has not reached it yet never passes for one
-        that did, and the copy has to prove it holds the source's bytes. Taken
-        for not having run, a Replace that stopped there could neither be
+        open, or the run is killed. The copy has to prove it holds the source's
+        bytes; a target that held those very bytes before the run began is the
+        same file for every purpose, so taking it for the copy changes nothing.
+        Taken for not having run, a Replace that stopped there could neither be
         finished nor rolled back, and rolling it back discarded the only copy
         of the file it replaced.
         """
@@ -1055,8 +1064,9 @@ class SafeStore:
             done_at_dst = identity_matches(dst, result, VERIFY_FAST)
             if not done_at_dst:
                 landed = _rounded_landing(dst, result)
-                if landed is not None and (not src.exists() or self._landed_later(src, later)):
-                    # What the far clock kept, so the inverse expects it too.
+                if landed is not None:
+                    # What the far clock kept, so the inverse expects it too. A
+                    # source still there has to prove the copy below, as ever.
                     step["result"] = result = landed
                     done_at_dst = True
             # Undoing a Replace moves the photo back and then restores the file it

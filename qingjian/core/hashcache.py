@@ -35,6 +35,11 @@ CREATE TABLE IF NOT EXISTS cache_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL
 
 FIELDS = ("sha256", "phash", "sharpness", "blown", "crushed", "captured")
 
+#: What an SQLite INTEGER holds. A modification time after 2262, or before
+#: 1678 -- NTFS records both -- does not fit once counted in nanoseconds, and
+#: writing one raised an error that stopped a date-sorted folder from opening.
+_INT64 = range(-2**63, 2**63)
+
 
 class HashCache:
     """Thread-safe key/value store. Losing it costs time, never correctness."""
@@ -200,8 +205,8 @@ class HashCache:
             row = dict(self._memory.get(key) or {})
             row.update(clean)
             self._memory[key] = row
-            if self._db is None:
-                return
+            if self._db is None or key[1] not in _INT64 or key[2] not in _INT64:
+                return                      # such a file is remembered for this run only
             try:
                 self._db.execute(
                     "INSERT INTO entries(path,size,mtime_ns,sha256,phash,sharpness,"

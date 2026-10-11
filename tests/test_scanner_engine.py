@@ -908,6 +908,41 @@ class SystemFolderTests(TempCase):
             self.assertTrue(engine._belongs(root / kept.relative_to(self.root), root, []))
 
 
+class FarDateTests(TempCase):
+    """SQLite integers are 64 bits; a nanosecond timestamp after 2262 is not."""
+
+    def test_the_cache_keeps_such_a_row_in_memory(self):
+        from qingjian.core.hashcache import HashCache
+        cache = HashCache(self.data / "hashes.db")
+        self.addCleanup(cache.close)
+        for key in (("late.jpg", 10, 2**63 + 5), ("early.jpg", 10, -2**63 - 5)):
+            with self.subTest(key=key):
+                cache.put_by_key(key, captured=1.0)
+                self.assertEqual(1.0, cache.get_by_key(key, "captured"))
+
+    def test_one_odd_file_does_not_stop_a_folder_opening(self):
+        """Sorting by date cached the capture time, and the write raised.
+
+        Opening the folder failed outright, every time, for one file.
+        """
+        src = self.tmp / "src"
+        for name in "ABC":
+            photo(src / f"{name}.JPG")
+        late = src / "B.JPG"
+        try:
+            os.utime(late, (9.3e9, 9.3e9))
+        except (OverflowError, OSError, ValueError):
+            self.skipTest("this filesystem cannot hold a date after 2262")
+        if late.stat().st_mtime_ns < 2**63:
+            self.skipTest("this filesystem clamps dates after 2262")
+        settings = config.Settings()
+        settings.sort_mode = "date"
+        engine = Engine(self.data, settings)
+        self.addCleanup(engine.close)
+        engine.open_folder(src)
+        self.assertEqual(3, len(engine.queue_paths))
+
+
 class RescanTests(TempCase):
     def test_a_cancelled_rescan_leaves_the_lists_as_they_were(self):
         """Cancelling while the queue was rebuilt kept the new file list.

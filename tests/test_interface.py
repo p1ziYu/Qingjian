@@ -2448,13 +2448,42 @@ class SecondLaunchTests(QtCase):
         from unittest.mock import Mock, patch
         from qingjian.ui import app as app_module
 
-        attempt = Mock(side_effect=[False, False, True])
+        attempt = Mock(side_effect=[None, None, True])          # None: nobody answered
         with patch.object(app_module, "hand_over", attempt), \
              patch.object(app_module.time, "sleep") as sleep:
             self.assertTrue(app_module._hand_over_with_retry("bell", "folder", timeout=1.0,
                                                             interval=0.1))
         self.assertEqual(3, attempt.call_count)
         self.assertEqual(2, sleep.call_count)
+
+    def test_a_folder_handed_to_a_busy_copy_is_handed_over_once(self):
+        """Each attempt used to wait 150 ms for the answer and then write the
+        folder again, so a copy whose window was busy for a second -- a first
+        paint, a large folder, a slow disk -- opened it four times over."""
+        from qingjian.ui import app as app_module
+        name = f"qingjian-test-{uuid.uuid4().hex}"
+        script = self.write(self.tmp / "busy_copy.py", (
+            "import sys, time\n"
+            "from PySide6.QtCore import QCoreApplication, QTimer\n"
+            "app = QCoreApplication([])\n"
+            "from qingjian.ui.app import Doorbell\n"
+            "bell = Doorbell(sys.argv[1])\n"
+            "arrived = []\n"
+            "bell.arrived.connect(arrived.append)\n"
+            "print('listening', flush=True)\n"
+            "time.sleep(1.0)\n"
+            "QTimer.singleShot(1500, app.quit)\n"
+            "app.exec()\n"
+            "print(len(arrived), flush=True)\n").encode("utf-8"))
+        child = subprocess.Popen([sys.executable, str(script), name],
+                                 stdout=subprocess.PIPE, text=True,
+                                 env=dict(os.environ, PYTHONPATH=str(ROOT)))
+        self.addCleanup(child.stdout.close)
+        self.addCleanup(child.kill)
+        self.assertEqual("listening", child.stdout.readline().strip())
+        self.assertTrue(app_module._hand_over_with_retry(name, r"D:\Photos\Trip"))
+        self.assertTrue(self.wait_until(lambda: child.poll() is not None, timeout=30))
+        self.assertEqual("1", child.stdout.read().strip())
 
     def test_a_second_launch_hands_its_folder_to_the_running_window(self):
         """The second launch is a separate process, as it is from Explorer.

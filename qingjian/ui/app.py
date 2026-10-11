@@ -79,8 +79,15 @@ def doorbell_name(data_dir: Path) -> str:
     return "qingjian-" + hashlib.sha1(key).hexdigest()[:16]
 
 
-def hand_over(name: str, folder: str, timeout_ms: int = 1500) -> bool:
-    """Give *folder* to the copy already running. False when nothing answers.
+def hand_over(name: str, folder: str, timeout_ms: int = 1500,
+              answer_ms: int | None = None) -> bool | None:
+    """Give *folder* to the copy already running.
+
+    True once that copy acknowledges it; ``None`` when nothing answers the
+    door at all; False when the folder went out but no acknowledgement came
+    back within *answer_ms* (*timeout_ms* unless given). Only ``None`` is
+    worth ringing again for: a copy that has the folder opens it however long
+    it takes to say so.
 
     Waits for that copy to acknowledge before hanging up. A local socket closed
     straight after writing loses its message before the other side reads it,
@@ -89,21 +96,32 @@ def hand_over(name: str, folder: str, timeout_ms: int = 1500) -> bool:
     socket = QLocalSocket()
     socket.connectToServer(name)
     if not socket.waitForConnected(timeout_ms):
-        return False
+        return None
     socket.write(folder.encode("utf-8") + b"\n")
     socket.flush()
-    acknowledged = socket.waitForReadyRead(timeout_ms) and bytes(socket.readAll()).startswith(b"ok")
+    wait = timeout_ms if answer_ms is None else answer_ms
+    acknowledged = socket.waitForReadyRead(wait) and bytes(socket.readAll()).startswith(b"ok")
     socket.disconnectFromServer()
     return acknowledged
 
 
 def _hand_over_with_retry(name: str, folder: str, timeout: float = 4.0,
                           interval: float = 0.15) -> bool:
-    """Wait briefly for a first instance that has its lock but not its listener."""
+    """Wait briefly for a first instance that has its lock but not its listener.
+
+    Only reaching it is retried. Once the folder is written, what is left of
+    the time goes to waiting for the answer: each attempt used to give up on
+    it after 150 ms and write the folder again, so a copy busy for a second
+    opened it four times, and one busy for five was handed it fourteen times
+    and still reported as not answering.
+    """
     deadline = time.monotonic() + timeout
     while True:
-        if hand_over(name, folder, timeout_ms=max(50, int(interval * 1000))):
-            return True
+        left = int((deadline - time.monotonic()) * 1000)
+        answered = hand_over(name, folder, timeout_ms=max(50, int(interval * 1000)),
+                             answer_ms=max(1500, left))
+        if answered is not None:
+            return answered
         if time.monotonic() >= deadline:
             return False
         time.sleep(interval)

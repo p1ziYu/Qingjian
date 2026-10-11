@@ -1413,7 +1413,7 @@ class MainWindow(QMainWindow):
         self._show_listing()
 
     def _show_listing(self) -> None:
-        """Put the list controls back on the settings, without coming back in here."""
+        """Show the list settings in force on their controls, holding their signals."""
         controls = (self.filter_combo, self.sort_combo, self.reverse_button,
                     self.recursive_check)
         for control in controls:
@@ -2072,14 +2072,15 @@ class MainWindow(QMainWindow):
             new_name = naming.ensure_suffix(name.strip(), path.suffix)
             naming.validate_filename(new_name)
             if new_name == path.name:
-                return          # Enter on the name as offered asked to replace it with itself
+                return          # unchanged; it used to offer to replace the file with itself
             target = path.with_name(new_name)
             decision = ""
             # A change of case only: on Windows the new spelling "exists"
             # because it is this very file, which is no conflict to ask about.
-            respelled = (new_name.casefold() == path.name.casefold() and target.exists()
+            exists = target.exists()
+            respelled = (exists and new_name.casefold() == path.name.casefold()
                          and self.engine.planner._same_path(path, target, True))
-            if target.exists() and not respelled:
+            if exists and not respelled:
                 decision, _remember = ConflictDialog.ask(self, path, target)
                 if decision in (ops.CONFLICT_CANCEL, ops.CONFLICT_SKIP):
                     return
@@ -2537,8 +2538,9 @@ class MainWindow(QMainWindow):
                 QApplication.activeModalWidget() is not None or
                 QApplication.activePopupWidget() is not None):
             # Something else holds the window. Only some prompts looked for a
-            # parked hand-over when they closed, so it fired at an unrelated
-            # moment much later; asking again shortly opens it right after.
+            # parked hand-over once they closed, so after the others it fired
+            # at some unrelated moment much later. Asking again shortly opens
+            # it as soon as whatever is in the way has gone.
             self._schedule_open_pending(100)
             return
         target = self._pending_open

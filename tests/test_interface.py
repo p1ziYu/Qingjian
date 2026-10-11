@@ -736,6 +736,86 @@ class GridTargetTests(WindowCase):
         self.assertTrue(all(path.exists() for path in queue))
         self.assertEqual(tr("status.nothing_chosen"), self.window.status_label.text())
 
+    def test_the_stars_and_sticker_show_and_mark_the_selected_tile(self):
+        """They showed the hidden cursor's marks, and a click toggled against those.
+
+        Three stars on the first photograph, then star three clicked on an
+        unrated tile, took that tile to no stars at all.
+        """
+        queue = list(self.engine.queue_paths)
+        self.window._rate_current(3)            # the first photograph, in the single view
+        self.engine.tag([queue[4]], label="red")
+        self.to_grid()
+        self.window.grid.setCurrentItem(self.window.grid._rows[str(queue[4])])
+        self.app.processEvents()
+        self.assertEqual((0, "red"), (self.window.rating.value(), self.window.labels.value()))
+        self.window.rating._stars[2].click()
+        self.app.processEvents()
+        self.assertEqual((3, "red"), self.engine.state.tag(str(queue[4])))
+        self.assertEqual((3, ""), self.engine.state.tag(str(queue[0])))
+
+    def test_ctrl_i_describes_the_selected_tile(self):
+        from qingjian.core.i18n import tr
+        queue = list(self.engine.queue_paths)
+        asked: list = []
+        self.patch(self.engine, "info_rows", lambda path: asked.append(Path(path)) or [])
+        self.patch(self.window, "_run_dialog", lambda dialog: dialog.deleteLater())
+        self.to_grid([queue[5]])
+        self.window.show_info()
+        self.assertEqual([queue[5]], asked)
+        self.window.grid.clearSelection()
+        self.app.processEvents()
+        self.window.show_info()
+        self.assertEqual([queue[5]], asked, "described a photo nobody chose")
+        self.assertEqual(tr("status.nothing_chosen"), self.window.status_label.text())
+
+    def conflict_on_the_first_of(self, chosen, decision) -> list:
+        from qingjian.ui import mainwindow
+        self.keep.mkdir()
+        (self.keep / chosen[0].name).write_bytes(b"already there")
+        asked: list = []
+        self.patch(mainwindow.ConflictDialog, "ask",
+                   lambda _parent, source, _target: asked.append(source) or (decision, False))
+        self.to_grid(chosen)
+        self.window.classify_index(0)
+        self.app.processEvents()
+        return asked
+
+    def test_cancel_in_the_conflict_prompt_stops_the_whole_selection(self):
+        """Cancel and "skip this one" both only passed over the file asked about."""
+        from qingjian.core import ops
+        queue = list(self.engine.queue_paths)
+        asked = self.conflict_on_the_first_of(queue[:4], ops.CONFLICT_CANCEL)
+        self.assertEqual([queue[0]], asked)
+        self.assertTrue(all(path.exists() for path in queue[:4]), "filed after Cancel")
+
+    def test_skip_in_the_conflict_prompt_files_the_rest(self):
+        from qingjian.core import ops
+        queue = list(self.engine.queue_paths)
+        self.conflict_on_the_first_of(queue[:4], ops.CONFLICT_SKIP)
+        self.assertEqual([True, False, False, False], [path.exists() for path in queue[:4]])
+
+    def test_cancel_in_the_sidecar_prompt_stops_the_whole_selection(self):
+        from qingjian.core.sidecar import PROMPT_EACH
+        from qingjian.ui import mainwindow
+        from qingjian.ui.dialogs import SidecarDialog
+        asked: list = []
+
+        class Cancelling(SidecarDialog):
+            def exec(self):
+                asked.append(self)
+                return QDialog.DialogCode.Rejected
+
+        self.patch(mainwindow, "SidecarDialog", Cancelling)
+        self.settings.sidecar = self.settings.sidecar.with_prompt(PROMPT_EACH)
+        queue = list(self.engine.queue_paths)
+        for path in queue[:3]:
+            self.write(path.with_suffix(".CR2"), b"raw")
+        self.to_grid(queue[:3])
+        self.window.classify_index(0)
+        self.assertEqual(1, len(asked))
+        self.assertTrue(all(path.exists() for path in queue[:3]), "filed after Cancel")
+
 
 @unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
 class GridSelectionTests(WindowCase):
@@ -773,6 +853,18 @@ class GridSelectionTests(WindowCase):
         self.assertFalse(self.window.grid_selected.isVisible(),
                          "the label still counts files that are gone")
         self.assertEqual([], self.window._targets())
+
+    def test_clicking_the_view_already_shown_stays_on_the_photo(self):
+        """The single-view button, clicked again, went back to where the grid was left."""
+        from qingjian.core import config
+        self.window._toggle_view()
+        self.window._toggle_view()
+        for _ in range(5):
+            self.window.step(1)
+        shown = self.engine.current_path()
+        self.window.view_switch._buttons[config.VIEW_SINGLE].click()
+        self.app.processEvents()
+        self.assertEqual(shown, self.engine.current_path())
 
 
 @unittest.skipUnless(HAVE_QT, "PySide6 is not installed")

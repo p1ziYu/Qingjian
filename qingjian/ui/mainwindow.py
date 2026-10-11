@@ -1122,6 +1122,22 @@ class MainWindow(QMainWindow):
         self.grid_selected.setText(tr("side.bulk_subtitle", count=count) if count > 1
                                    else tr("grid.selected", count=count))
         self.grid_selected.setVisible(bool(count))
+        if self.view_mode == config.VIEW_GRID:
+            self._show_tags()
+
+    def _show_tags(self) -> None:
+        """The stars and sticker show the marks of what clicking them would change.
+
+        In the grid that is the selection. They used to show the hidden
+        cursor's marks there, and a click toggles against what is shown: star
+        three on an unrated tile cleared it when the cursor had three stars.
+        Several chosen at once show none, so a click sets them all alike.
+        """
+        targets = self._targets()
+        rating, label = (self.engine.state.tag(str(targets[0])) if len(targets) == 1
+                         else (0, ""))
+        self.rating.set_value(rating)
+        self.labels.set_value(label)
 
     def _refresh_view(self, scroll_strip: bool = True) -> None:
         # A full render supersedes whatever a held arrow key left pending.
@@ -1198,9 +1214,7 @@ class MainWindow(QMainWindow):
         else:
             self.sidecar_badge.setVisible(False)
 
-        rating, label = self.engine.state.tag(str(path))
-        self.rating.set_value(rating)
-        self.labels.set_value(label)
+        self._show_tags()
         if scroll_strip and self.view_mode == config.VIEW_SINGLE:
             self.filmstrip.follow(self.engine.index)
         self._update_actions()
@@ -1313,10 +1327,14 @@ class MainWindow(QMainWindow):
             current = self.engine.current_path()
             if current is not None:
                 self.grid.show_path(current)
+            self._show_tags()
             self.grid.setFocus()
 
     def _change_view(self, mode: str) -> None:
-        self._set_view(mode)
+        # The switch reports a click on the view already showing as well, and
+        # going through `_set_view` again jumped to where the grid was left.
+        if mode != self.view_mode:
+            self._set_view(mode)
 
     def _toggle_view(self) -> None:
         if self._blocked():
@@ -1576,7 +1594,10 @@ class MainWindow(QMainWindow):
         flight = self._take_off() if len(targets) == 1 else None
         filed = False
         for path in targets:
-            filed = self._classify_one(binding, Path(path)) or filed
+            started = self._classify_one(binding, Path(path))
+            if started is None:
+                break               # Cancel in a prompt is for the whole selection
+            filed = started or filed
         if filed:
             self._bag(index, flight)
 
@@ -1672,8 +1693,12 @@ class MainWindow(QMainWindow):
         current = self.engine.current_path()
         return [current] if current is not None else []
 
-    def _classify_one(self, binding: config.Binding, path: Path) -> bool:
-        """File one item. True when an operation was started for it."""
+    def _classify_one(self, binding: config.Binding, path: Path) -> bool | None:
+        """File one item. True when an operation was started for it.
+
+        None when the user cancelled a prompt, which stops the rest of a grid
+        selection; False when only this item was passed over.
+        """
         group = self.engine._operation_group(self.engine.group_for(path))
         rules = self.settings.sidecar
         if group.sidecars and rules.enabled and binding.action in ("move", "copy", "favorite"):
@@ -1684,7 +1709,7 @@ class MainWindow(QMainWindow):
                                        remember=rules.prompt == PROMPT_ONCE)
                 accepted = self._run_dialog(dialog) == QDialog.DialogCode.Accepted
                 if not accepted:
-                    return False
+                    return None
                 chosen = set(dialog.chosen())
                 group.members = [m for m in group.members if m.path in chosen]
                 if dialog.remembered():
@@ -1728,7 +1753,7 @@ class MainWindow(QMainWindow):
                 else:
                     decision, remember = ConflictDialog.ask(self, conflict_source, conflict_target)
                     if decision == ops.CONFLICT_CANCEL:
-                        return False
+                        return None
                     if remember:
                         self._conflict_defaults[folder_key] = decision
                 if decision == ops.CONFLICT_SKIP:
@@ -2268,6 +2293,15 @@ class MainWindow(QMainWindow):
         if self._blocked():
             return
         path = self.engine.current_path()
+        if self.view_mode == config.VIEW_GRID:
+            # As with the keys, the hidden cursor is nobody's choice here. Of
+            # several chosen tiles, the one the grid's own cursor is on.
+            chosen = self.grid.selected_paths()
+            if not chosen:
+                self.status(tr("status.nothing_chosen"), "warning")
+                return
+            focused = self.grid.current_path()
+            path = Path(focused if focused in chosen else chosen[0])
         if path is None:
             return
         rows = [[label, value] for label, value in self.engine.info_rows(path)]

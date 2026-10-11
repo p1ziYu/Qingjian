@@ -511,6 +511,18 @@ class DeleteAndReplaceTests(StoreCase):
         self.assertEqual(b"old content", target.read_bytes())
         self.assertEqual(b"new content", source.read_bytes())
 
+    def test_a_copy_over_a_file_of_the_same_size_and_time_still_lands(self):
+        """A copy leaves its source, so a matching target is no sign that it already ran."""
+        stamp = 1_700_000_000_000_000_000
+        source = self.file("a.bin", b"new content")
+        target = self.write(self.dst / "a.bin", b"old content")
+        for path in (source, target):
+            os.utime(path, ns=(stamp, stamp))
+        unlink = step_unlink(target, identity(target, VERIFY_FAST))
+        unlink["snapshot"] = self.store.snapshot(target)
+        self.store.run(Plan(forward=[unlink, step_copy(source, target, identity(source, VERIFY_FAST))]))
+        self.assertEqual(b"new content", target.read_bytes())
+
 
 class VerificationTests(StoreCase):
     def test_fast_mode_uses_size_and_mtime(self):

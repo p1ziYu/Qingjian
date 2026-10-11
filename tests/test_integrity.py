@@ -296,6 +296,160 @@ class ReplaceRecoveryTests(TempCase):
         self.assertFalse(engine.has_pending())
 
 
+class ReplaceReplayTests(TempCase):
+    """A Replace, or its undo, stopped part-way must still finish or reverse.
+
+    Replaying runs every step again from the top, so each one has to see that a
+    later step already put its own file at the path it is about to judge.
+    """
+
+    STAMP = 1_700_000_000_000_000_000
+
+    def engine_over(self, source: Path, settings: config.Settings | None = None) -> Engine:
+        settings = settings or config.Settings()
+        settings.logging_enabled = False
+        settings.source_folder = str(source)
+        engine = Engine(data_dir=self.tmp / "app", settings=settings)
+        self.addCleanup(engine.close)
+        engine.open_folder(source)
+        return engine
+
+    def commit_fails(self, engine: Engine, action) -> None:
+        """Run *action* while the state commit is refused, as on a full disk."""
+        real_apply = engine.state.apply
+
+        def failing(delta):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        engine.state.apply = failing
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                action()
+        finally:
+            engine.state.apply = real_apply
+        self.assertTrue(engine.has_pending())
+
+    def hold_second_rename(self) -> None:
+        """Another program holds the file the second rename from now on wants, once."""
+        real = safestore._retry_sharing
+        renames = []
+
+        def retry(operation, *args):
+            if operation is os.replace:
+                renames.append(args[0])
+                if len(renames) == 2:
+                    error = PermissionError(13, "used by another process")
+                    error.winerror = 32
+                    raise error
+            return real(operation, *args)
+
+        safestore._retry_sharing = retry
+        self.addCleanup(setattr, safestore, "_retry_sharing", real)
+
+    def move_replacing(self, engine: Engine, photo: Path, keep: Path, action: str = "move"):
+        return engine.classify(config.Binding(key="1", action=action, folder=str(keep)), photo,
+                               resolver=lambda a, b: ops.CONFLICT_REPLACE)
+
+    def test_recovering_keeps_a_photo_as_large_and_as_old_as_the_one_it_replaced(self):
+        """The replaced file's size and mtime describe the new one too: the delete must not rerun."""
+        card, keep = self.tmp / "card", self.tmp / "keep"
+        new = self.write(card / "DSC_0001.NEF", b"NEW-SHOT" * 1000)
+        old = self.write(keep / "DSC_0001.NEF", b"OLD-SHOT" * 1000)
+        for path in (new, old):
+            os.utime(path, ns=(self.STAMP, self.STAMP))
+        engine = self.engine_over(card)
+        self.commit_fails(engine, lambda: self.move_replacing(engine, new, keep))
+        engine.recover()
+        self.assertEqual(b"NEW-SHOT" * 1000, old.read_bytes(), "the photo moved in was deleted")
+        self.assertFalse(new.exists())
+        self.assertFalse(engine.has_pending())
+        engine.undo()
+        self.assertEqual(b"NEW-SHOT" * 1000, new.read_bytes())
+        self.assertEqual(b"OLD-SHOT" * 1000, old.read_bytes())
+
+    def test_recovering_a_group_stopped_at_its_last_member_keeps_the_first(self):
+        card, keep = self.tmp / "card", self.tmp / "keep"
+        for name, size in (("IMG_1.JPG", 500), ("IMG_1.CR2", 900)):
+            self.write(card / name, b"NEW!" * size)
+            self.write(keep / name, b"OLD!" * size)
+        for path in [*card.iterdir(), *keep.iterdir()]:
+            os.utime(path, ns=(self.STAMP, self.STAMP))
+        engine = self.engine_over(card)
+        self.hold_second_rename()
+        with self.assertRaises(TransactionError):
+            self.move_replacing(engine, card / "IMG_1.JPG", keep)
+        self.assertTrue(engine.has_pending())
+        engine.recover()
+        self.assertFalse(engine.has_pending())
+        self.assertEqual([], self.tree(card))
+        for name, size in (("IMG_1.JPG", 500), ("IMG_1.CR2", 900)):
+            self.assertEqual(b"NEW!" * size, (keep / name).read_bytes(),
+                             "a member that had already arrived was deleted")
+
+    def undo_whose_commit_fails(self, action: str = "move"):
+        card, keep = self.tmp / "card", self.tmp / "keep"
+        new = self.write(card / "IMG_1.JPG", b"NEW!" * 500)
+        old = self.write(keep / "IMG_1.JPG", b"OLD!" * 700)
+        engine = self.engine_over(card)
+        self.move_replacing(engine, new, keep, action)
+        self.commit_fails(engine, engine.undo)
+        return engine, new, old
+
+    def test_an_undo_of_a_replace_whose_commit_failed_recovers(self):
+        """The photo went back, then the replaced file came back where the photo had been."""
+        engine, new, old = self.undo_whose_commit_fails()
+        engine.recover()
+        self.assertEqual(b"NEW!" * 500, new.read_bytes())
+        self.assertEqual(b"OLD!" * 700, old.read_bytes())
+        self.assertFalse(engine.has_pending())
+        self.assertTrue(engine.can_redo())
+
+    def test_an_undo_of_a_replace_whose_commit_failed_can_be_rolled_back(self):
+        engine, new, old = self.undo_whose_commit_fails()
+        engine.abandon_pending(rollback=True)
+        self.assertFalse(engine.has_pending())
+        self.assertFalse(new.exists())
+        self.assertEqual(b"NEW!" * 500, old.read_bytes(), "the rollback did not restore the move")
+        engine.undo()
+        self.assertEqual(b"NEW!" * 500, new.read_bytes())
+        self.assertEqual(b"OLD!" * 700, old.read_bytes())
+
+    def test_an_undo_of_a_copy_that_replaced_recovers(self):
+        engine, new, old = self.undo_whose_commit_fails("copy")
+        engine.recover()
+        self.assertEqual(b"NEW!" * 500, new.read_bytes())
+        self.assertEqual(b"OLD!" * 700, old.read_bytes())
+        self.assertFalse(engine.has_pending())
+
+    def test_rolling_back_that_undo_leaves_what_the_record_says(self):
+        """The copy is still on record, so its file has to be the one in place."""
+        engine, new, old = self.undo_whose_commit_fails("copy")
+        engine.abandon_pending(rollback=True)
+        self.assertFalse(engine.has_pending())
+        self.assertEqual(b"NEW!" * 500, old.read_bytes(), "the restored file outlived the rollback")
+        engine.undo()
+        self.assertEqual(b"OLD!" * 700, old.read_bytes())
+        self.assertEqual(b"NEW!" * 500, new.read_bytes())
+
+    def test_an_undo_stopped_between_members_recovers(self):
+        """A viewer held the second member open while the group went back."""
+        card, keep = self.tmp / "card", self.tmp / "keep"
+        for name in ("IMG_1.JPG", "IMG_1.CR2"):
+            self.write(card / name, b"NEW!" * 500)
+            self.write(keep / name, b"OLD!" * 700)
+        engine = self.engine_over(card)
+        self.move_replacing(engine, card / "IMG_1.JPG", keep)
+        self.hold_second_rename()
+        with self.assertRaises(TransactionError):
+            engine.undo()
+        self.assertTrue(engine.has_pending())
+        engine.recover()
+        self.assertFalse(engine.has_pending())
+        for name in ("IMG_1.JPG", "IMG_1.CR2"):
+            self.assertEqual(b"NEW!" * 500, (card / name).read_bytes())
+            self.assertEqual(b"OLD!" * 700, (keep / name).read_bytes())
+
+
 @unittest.skipUnless(sys.platform == "win32", "read-only only blocks deletion on Windows")
 class ReadOnlySourceTests(TempCase):
     """A camera-protected photo must still move to another disk (F-011, F-117)."""

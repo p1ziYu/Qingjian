@@ -794,12 +794,15 @@ class SafeStore:
         """Is this step already in effect? Stat only, except WRITE, which uses *verify*.
 
         *stat_of* lets a caller that checks many steps share one stat per path.
+        A path a *later* step refilled counts as emptied; proving a WRITE there
+        reads it, but only a rollback passes *later*, never the precheck.
         """
         info = stat_of or _stat_or_none
         kind, dst, result = step["kind"], Path(step["dst"]), step.get("result")
         if kind == MOVE:
             return (_fast_matches(info(dst), result or step.get("src_id"))
-                    and info(step["src"]) is None)
+                    and (info(step["src"]) is None
+                         or self._landed_later(Path(step["src"]), later)))
         if kind == COPY:
             return _fast_matches(info(dst), result or step.get("src_id"))
         if kind == WRITE:
@@ -914,17 +917,28 @@ class SafeStore:
                 mirror["expect"] = dict(landed)
 
     @staticmethod
-    def _landed_later(dst: Path, later: Sequence[dict]) -> bool:
+    def _landed_later(dst: Path, later: Sequence[dict],
+                      kinds: Sequence[str] = (MOVE, COPY, WRITE)) -> bool:
         """Did a later step already put its own file at *dst*?
 
         An UNLINK followed by a MOVE onto the same path leaves no trace of itself
         once the move has landed. Looking forward costs nothing; a per-step done
         marker in the journal would cost one fsync on every move.
+
+        The first later step aimed at *dst* answers; one not in *kinds* answers no.
+        Undoing a Replace ends in a WRITE from the restore copy, whose hash is
+        known, so the file it restored is proved by content -- a size alone would
+        take any file of that size for it.
         """
         key = _path_key(dst)
         for step in later:
-            if step["kind"] not in (MOVE, COPY) or _path_key(step["dst"]) != key:
+            if step["kind"] not in (MOVE, COPY, WRITE) or _path_key(step["dst"]) != key:
                 continue
+            if step["kind"] not in kinds:
+                return False
+            if step["kind"] == WRITE:
+                restored = step.get("result") or {}
+                return bool(restored.get("hash")) and identity_matches(dst, restored, VERIFY_FULL)
             if not identity_matches(dst, step.get("result") or step.get("src_id"), VERIFY_FAST):
                 return False
             return step["kind"] != MOVE or not Path(step["src"]).exists()
@@ -946,7 +960,11 @@ class SafeStore:
             if dst.parent.name == TRASH_DIR and src.parent.name != TRASH_DIR:
                 self._prepare_trash_folder(dst.parent)
             done_at_dst = identity_matches(dst, result, VERIFY_FAST)
-            if done_at_dst and not src.exists():
+            # Undoing a Replace moves the photo back and then restores the file it
+            # replaced at the very path it left: what stands there on a replay is
+            # that file, not a source the move failed to remove. Asked only once
+            # the target is in place, so a normal run never hashes its source.
+            if done_at_dst and (not src.exists() or self._landed_later(src, later)):
                 # An impostor of the same size and mtime is not "already restored".
                 if result and result.get("hash") and fingerprint(dst) != result["hash"]:
                     raise TransactionError("error.changed_midway", str(dst), path=str(dst))
@@ -1017,6 +1035,12 @@ class SafeStore:
 
         if kind == UNLINK:
             if not dst.exists():
+                return False
+            # Asked before *expect*: a photo that replaced one of the same size and
+            # mtime matches it too, and deleting it again on replay deletes the only
+            # copy. A move proves it landed by its source being gone; a copy leaves
+            # its source, so it can only answer below, once *expect* has failed.
+            if self._landed_later(dst, later, (MOVE,)):
                 return False
             if not identity_matches(dst, step.get("expect"), verify):
                 if self._landed_later(dst, later):

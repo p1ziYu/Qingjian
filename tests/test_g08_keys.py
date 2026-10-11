@@ -199,3 +199,31 @@ class G08EditorTests(QtCase):
                 self.assertEqual(shown, dialog._control("language", Segmented).value())
                 dialog._save()
                 self.assertEqual(shown, dialog.result_settings().language)
+
+    def test_saving_with_the_folder_menu_on_repairs_an_entry_another_copy_left(self):
+        """A portable folder that moved leaves Explorer's entry starting a
+        program that is gone. The switch read it as on, and saving with it on
+        never wrote the entry again; and the command never carried the
+        ``--data-dir`` this copy was started with."""
+        from types import SimpleNamespace
+        from test_config_logging import FakeRegistry
+        from qingjian.core import platform_
+        from qingjian.ui.editors import SettingsDialog
+        from qingjian.ui.widgets import Switch
+        registry = FakeRegistry()
+        self.patch(platform_, "IS_WINDOWS", True)
+        self.patch(platform_, "_registry", lambda _registry=None: registry)
+        platform_.set_folder_menu(True, "Open with Qingjian", [r"F:\Gone\MediaSorter.exe"])
+        engine = SimpleNamespace(data_dir=self.data, backup_usage=lambda: 0)
+        dialog = SettingsDialog(config.Settings(), engine)
+        self.addCleanup(dialog.deleteLater)
+        switch = dialog._control("folder_menu", Switch)
+        self.assertFalse(switch.isChecked())                # not this copy's menu
+        switch.setChecked(True)
+        dialog._save()
+        written = registry.keys[platform_.FOLDER_MENU_KEYS[0][0] + "\\command"][""]
+        self.assertIn(f'"--data-dir" "{self.data}"', written)
+        self.assertNotIn("Gone", written)
+        again = SettingsDialog(config.Settings(), engine)
+        self.addCleanup(again.deleteLater)
+        self.assertTrue(again._control("folder_menu", Switch).isChecked())

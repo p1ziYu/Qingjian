@@ -384,6 +384,17 @@ class AppDirsTests(TempCase):
             self.assertEqual((self.data, None), appdirs.usable_data_dir())
             self.assertIsNone(appdirs.stranded_data(self.data))
 
+    def test_a_launch_from_explorer_is_told_the_data_directory_only_when_it_needs_one(self):
+        """A plain launch finds the per-user directory, or the area it was moved
+        aside to, by itself; anything else came from ``--data-dir``."""
+        from unittest.mock import patch
+        default = self.plain_launch(self.tmp / "appdata")
+        spare = self.tmp / "spare"
+        with patch.object(appdirs, "fallback_roots", lambda: [spare]):
+            self.assertIsNone(appdirs.launch_data_dir(default))
+            self.assertIsNone(appdirs.launch_data_dir(appdirs._relocated(spare, default)))
+            self.assertEqual(self.data, appdirs.launch_data_dir(self.data))
+
     def test_the_temporary_directory_is_marked_as_one_the_system_may_empty(self):
         import tempfile
         self.assertTrue(appdirs.is_volatile(Path(tempfile.gettempdir()) / "qingjian-data"))
@@ -939,6 +950,45 @@ class PlatformTests(TempCase):
         self.assertFalse(platform_.folder_menu_installed(registry=registry))
         platform_.set_folder_menu(False, registry=registry)     # a second removal is harmless
 
+    def test_the_folder_menu_reaches_the_library_this_copy_was_started_on(self):
+        """Explorer knows nothing of the command line this copy was started
+        with, so a folder opened from the menu by someone using ``--data-dir``
+        started a second window on another library."""
+        registry = FakeRegistry()
+        command = platform_.launch_command(True, r"C:\Apps\MediaSorter.exe", "main.py",
+                                           r"E:\Q Data")
+        self.assertEqual([r"C:\Apps\MediaSorter.exe", "--data-dir", r"E:\Q Data"], command)
+        platform_.set_folder_menu(True, "Open with Qingjian", command, registry=registry)
+        self.assertEqual('"C:\\Apps\\MediaSorter.exe" "--data-dir" "E:\\Q Data" "%1"',
+                         registry.keys[self.SHELL + r"\command"][""])
+        self.assertEqual(r"C:\Apps\MediaSorter.exe", registry.keys[self.SHELL]["Icon"])
+        self.assertEqual([r"C:\Apps\MediaSorter.exe"],
+                         platform_.launch_command(True, r"C:\Apps\MediaSorter.exe", "main.py"))
+
+    def test_a_folder_menu_part_is_quoted_the_way_windows_reads_it_back(self):
+        """A data directory at the root of a drive ends in a backslash, which
+        would otherwise escape the closing quote and swallow the folder after it."""
+        import subprocess
+        for part in (r"E:\Q Data", "E:\\Q Data\\", r"C:\Program Files\Qingjian\Q.exe"):
+            with self.subTest(part=part):
+                self.assertEqual(subprocess.list2cmdline([part]), platform_.command_line([part]))
+        self.assertEqual('"E:\\\\" "%1"', platform_.command_line(["E:\\", "%1"]))
+
+    def test_a_folder_menu_left_by_another_copy_does_not_read_as_on(self):
+        """A portable folder that moved leaves an entry starting a program
+        that is gone. Reading it as on kept the switch claiming a menu that did
+        not work, and saving with the switch on never wrote it again."""
+        registry = FakeRegistry()
+        gone = [r"F:\Portable\MediaSorter.exe"]
+        platform_.set_folder_menu(True, "Open with Qingjian", gone, registry=registry)
+        self.assertTrue(platform_.folder_menu_installed(registry=registry))     # it is there
+        self.assertFalse(platform_.folder_menu_installed([r"D:\Moved\MediaSorter.exe"],
+                                                         registry=registry))
+        self.assertFalse(platform_.folder_menu_installed([*gone, "--data-dir", r"E:\QData"],
+                                                         registry=registry))
+        self.assertTrue(platform_.folder_menu_installed(gone, registry=registry))
+        self.assertTrue(platform_.folder_menu_installed([gone[0].upper()], registry=registry))
+
     def test_a_source_checkout_launches_without_a_console_window(self):
         folder = self.tmp / "python"
         self.write(folder / "python.exe", b"")
@@ -974,6 +1024,11 @@ class FakeRegistry:
 
     def SetValueEx(self, key, name, reserved, kind, value):  # noqa: N802 - winreg naming
         self.keys[key][name] = value
+
+    def QueryValueEx(self, key, name):          # noqa: N802 - winreg naming
+        if name not in self.keys[key]:
+            raise FileNotFoundError(name)
+        return self.keys[key][name], self.REG_SZ
 
     def CloseKey(self, key):                    # noqa: N802 - winreg naming
         pass

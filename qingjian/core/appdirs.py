@@ -339,6 +339,23 @@ def stranded_data(active: Path) -> Path | None:
     return None
 
 
+def launch_data_dir(active: Path) -> Path | None:
+    """The ``--data-dir`` a launch from outside needs to arrive at *active*.
+
+    None when a launch with no arguments gets there by itself: the portable
+    or per-user directory, or the area a refused one moved aside to. Anything
+    else came from ``--data-dir`` or ``QINGJIAN_DATA_DIR``, which Explorer's
+    "Open with Qingjian" does not pass on.
+    """
+    active = Path(active)
+    try:
+        default = portable_dir() or _platform_data_root()
+    except (OSError, RuntimeError, KeyError):       # no home directory at all
+        return active
+    unaided = [default] + [_relocated(root, default) for root in fallback_roots()]
+    return None if active in unaided else active
+
+
 def subdir(name: str, create: bool = True) -> Path:
     path = data_dir(create=create) / name
     if create:

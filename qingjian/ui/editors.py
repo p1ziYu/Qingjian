@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (QComboBox, QDialog, QDoubleSpinBox, QFileDialog, 
                                QListWidgetItem, QMessageBox, QPushButton, QScrollArea,
                                QSpinBox, QStackedWidget, QVBoxLayout, QWidget)
 
-from ..core import config, platform_, template
+from ..core import appdirs, config, platform_, template
 from ..core.engine import human_size
 from ..core.i18n import LANGUAGES, tr
 from ..core.logsetup import bundle_description, get_logger
@@ -513,14 +513,25 @@ class SettingsDialog(QDialog):
                             self.settings.default_view)))
         if platform_.IS_WINDOWS:
             # The registry is the setting: read it rather than keep a copy that
-            # could disagree with what Explorer actually shows.
-            self._folder_menu_was = platform_.folder_menu_installed()
+            # could disagree with what Explorer actually shows. On means it
+            # opens folders here, in this copy on this library, so an entry a
+            # moved portable folder left behind reads as off, and turning it
+            # on writes it afresh.
+            self._folder_menu_command = self._open_with_command()
+            self._folder_menu_was = platform_.folder_menu_installed(self._folder_menu_command)
             card.add_row(SettingRow(
                 tr("settings.folder_menu"), tr("settings.folder_menu.desc"),
                 self._switch("folder_menu", self._folder_menu_was)))
         layout.addWidget(card)
         layout.addStretch(1)
         return page
+
+    def _open_with_command(self) -> list[str]:
+        """What Explorer runs to open a folder in this copy, on this library."""
+        script = Path(__file__).resolve().parents[2] / "main.py"
+        data = appdirs.launch_data_dir(self.engine.data_dir) if self.engine is not None else None
+        return platform_.launch_command(getattr(sys, "frozen", False), sys.executable,
+                                        str(script), data)
 
     def _page_sidecar(self) -> QWidget:
         page, layout = self._page()
@@ -719,11 +730,9 @@ class SettingsDialog(QDialog):
 
         menu = self._controls.get("folder_menu")
         if isinstance(menu, Switch) and menu.isChecked() != self._folder_menu_was:
-            script = Path(__file__).resolve().parents[2] / "main.py"
-            command = platform_.launch_command(getattr(sys, "frozen", False), sys.executable,
-                                               str(script))
             try:
-                platform_.set_folder_menu(menu.isChecked(), tr("app.open_with"), command)
+                platform_.set_folder_menu(menu.isChecked(), tr("app.open_with"),
+                                          self._folder_menu_command)
             except OSError as error:
                 warning(self, tr("error.title"), str(error))
         self.accept()

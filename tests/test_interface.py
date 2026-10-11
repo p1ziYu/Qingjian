@@ -766,15 +766,16 @@ class GridProbeTests(QtCase):
         view.show()
         view.set_paths([str(self.tmp / f"img{i:05d}.jpg") for i in range(1000)])
         self.app.processEvents()
-        QTest.qWait(150)
-        self.app.processEvents()
-        cell = view.gridSize()
-        port = view.viewport()
-        columns = max(1, port.width() // cell.width())
-        rows = port.height() // cell.height()
-        on_screen = columns * rows
-        start, end = view.visible_rows()
-        self.assertGreaterEqual(end, on_screen - 1, f"visible_rows() = {(start, end)}")
+
+        def cells() -> int:
+            cell, port = view.gridSize(), view.viewport()
+            return max(1, port.width() // cell.width()) * (port.height() // cell.height())
+
+        # Qt lays a batched list out over several event turns, 400 items at a
+        # time; under full-suite load 150 ms was sometimes only the first batch.
+        self.until(lambda: view.visible_rows()[1] >= cells() - 1,
+                   f"visible_rows() stopped short of {cells()} cells", timeout=5)
+        on_screen = cells()
         last = view.paths()[on_screen - 1]
         # Qt fills a batched list over several event turns. Under full-suite
         # load the viewport can grow after the first 60 ms thumbnail request.

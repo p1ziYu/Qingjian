@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFil
                                QVBoxLayout, QWidget)
 
 from .. import __display_name__
-from ..core import config, metadata, naming, ops, platform_, scanner
+from ..core import config, mediatypes, metadata, naming, ops, platform_, scanner
 from ..core.imaging import decodes_slowly
 from ..core.engine import Engine, human_size
 from ..core.i18n import LANGUAGE_CODES, get_language, set_language, tr
@@ -1287,8 +1287,12 @@ class MainWindow(QMainWindow):
         if identity is None or identity != self._shown[1]:
             return False
         page = preview.stack.currentIndex()
-        if page == preview.VIDEO:
-            return not preview.player.source().isEmpty()
+        if mediatypes.is_video(path):
+            # Playing, or stepped to a frame on the image page, the video is up
+            # only while the player still holds it: once a move let go of it,
+            # skipping the reload left Space with nothing to play.
+            return (page in (preview.VIDEO, preview.IMAGE)
+                    and not preview.player.source().isEmpty())
         if page == preview.ANIMATED:
             return preview.animated.movie() is not None
         return page == preview.IMAGE and not preview.image.current_pixmap().isNull()

@@ -3742,6 +3742,40 @@ class PreviewRefreshTests(WindowCase):
         self.window._refresh_view()
         self.assertEqual([shown], loads)
 
+    def test_a_stepped_video_let_go_of_is_loaded_again(self):
+        """A stepped frame stands on the image page, and was taken for the video
+        itself: after a move let go of the player, Space played nothing."""
+        from qingjian.core import video
+        av = video._av()
+        if av is None or "mpeg4" not in av.codecs_available:
+            self.skipTest("PyAV with an MPEG-4 encoder is not installed")
+        import numpy as np
+        clip = self.source / "IMG_0003b.mp4"
+        with av.open(str(clip), "w") as container:
+            stream = container.add_stream("mpeg4", rate=24)
+            stream.width, stream.height, stream.pix_fmt = 64, 48, "yuv420p"
+            for number in range(24):
+                frame = av.VideoFrame.from_ndarray(
+                    np.full((48, 64, 3), number * 10, np.uint8), format="rgb24")
+                for packet in stream.encode(frame):
+                    container.mux(packet)
+            for packet in stream.encode():
+                container.mux(packet)
+        self.addCleanup(self.window.preview.release)
+        self.window.rescan()
+        self.assertTrue(self.engine.go_to(clip))
+        self.window._refresh_view()
+        preview = self.window.preview
+        self.window._step_frame(1)
+        self.assertEqual(preview.IMAGE, preview.stack.currentIndex())
+        loads = self.count_loads()
+        self.window._refresh_view()
+        self.assertEqual([], loads, "a stepped video still held was loaded again")
+        preview.release()
+        self.window._refresh_view()
+        self.assertEqual([clip], loads)
+        self.assertFalse(preview.player.source().isEmpty())
+
     def test_a_failed_or_cancelled_undo_puts_the_animation_back(self):
         """Undo lets go of the file on screen first, and nothing loaded it again."""
         from qingjian.core.safestore import Cancelled, TransactionError

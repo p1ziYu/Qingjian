@@ -59,21 +59,32 @@ def pruned_targets(root: str | Path, targets: Sequence[str | Path]) -> list[Path
 #: walked into its recycle bin and listed every deleted photograph there -- the
 #: $R copies and the $I stubs that share their extension -- as if still in place.
 _SYSTEM_FOLDERS = frozenset({
-    "$recycle.bin", "recycler", "recycled",          # Windows bins, old and new
+    "$recycle.bin",                                  # the Windows bin
     "system volume information",                     # restore points, indexing
-    ".trashes", ".trash",                            # macOS on a removable drive
+    ".trashes",                                      # macOS on a removable drive
 })
+#: Names a person may give a folder of their own -- "Recycled" for a craft
+#: project -- so they count only at the root of a drive, where the bins of old
+#: Windows and of a Linux desktop are kept.
+_ROOT_FOLDERS = frozenset({"recycler", "recycled", ".trash"})
 
 #: Hidden and system together is how Windows marks a folder of its own. System
 #: alone is not enough: Explorer can set it on any folder given a custom icon.
 _PROTECTED = stat.FILE_ATTRIBUTE_HIDDEN | stat.FILE_ATTRIBUTE_SYSTEM
 
 
-def system_folder(name: str) -> bool:
-    """Whether a folder called *name* belongs to the system or to this program."""
+def system_folder(name: str, parent: Path | None = None) -> bool:
+    """Whether a folder called *name*, in *parent*, belongs to the system or to us."""
     folded = name.casefold()
-    return (name.startswith(".qingjian") or folded in _SYSTEM_FOLDERS
-            or folded.startswith(".trash-"))     # a freedesktop bin on a stick
+    if (name.startswith(".qingjian") or folded in _SYSTEM_FOLDERS
+            or folded.startswith(".trash-")):    # a freedesktop bin on a stick
+        return True
+    if folded not in _ROOT_FOLDERS or parent is None:
+        return False
+    try:
+        return parent == Path(parent.anchor) or os.path.ismount(parent)
+    except (OSError, ValueError):
+        return False
 
 
 def stray_file(name: str) -> bool:
@@ -132,7 +143,7 @@ def scan(root: str | Path, recursive: bool = False, excluded: Sequence[Path] = (
                         if entry.is_symlink() or entry.is_junction():
                             continue
                         if entry.is_dir(follow_symlinks=False):
-                            if recursive and not system_folder(name) \
+                            if recursive and not system_folder(name, here) \
                                     and not _protected(entry) and not is_blocked(here / name):
                                 subfolders.append(here / name)
                             continue

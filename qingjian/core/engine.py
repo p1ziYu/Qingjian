@@ -956,8 +956,11 @@ class Engine:
                                        and parent.is_relative_to(root)):
                 return False
             # The recycle folders and anything else `scan` steps over by name.
-            if any(scanner.system_folder(part) for part in parent.relative_to(root).parts):
-                return False
+            folder = root
+            for part in parent.relative_to(root).parts:
+                if scanner.system_folder(part, folder):
+                    return False
+                folder = folder / part
             if any(parent == folder or parent.is_relative_to(folder) for folder in excluded):
                 return False
         except (OSError, RuntimeError, ValueError):

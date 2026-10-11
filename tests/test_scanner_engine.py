@@ -880,7 +880,7 @@ class SystemFolderTests(TempCase):
     """Opening a whole drive must not list what the system keeps on it."""
 
     JUNK = ("$RECYCLE.BIN/S-1-5-21-1/$RAB12CD.JPG", "$Recycle.Bin/$IAB12CD.JPG",
-            "System Volume Information/c.jpg", "RECYCLER/d.jpg", ".Trashes/501/e.jpg",
+            "System Volume Information/c.jpg", ".Trashes/501/e.jpg",
             ".Trash-1000/files/f.jpg", "._a.jpg", "DCIM/._b.jpg")
 
     def setUp(self):
@@ -894,6 +894,19 @@ class SystemFolderTests(TempCase):
     def test_recycle_bins_and_volume_folders_are_not_walked(self):
         """The bin's $R copies of deleted photographs were listed as if still there."""
         self.assertEqual(sorted(self.kept), sorted(scanner.scan(self.root, recursive=True)))
+
+    def test_a_folder_of_ones_own_called_recycled_is_still_walked(self):
+        """"Recycled" for a craft project is a name a person gives a folder; the
+        bins of old Windows and of a Linux desktop by that name sit at the root
+        of a drive, and only there are they stepped over."""
+        mine = [self.write(self.root / name / "p.jpg", b"x" * 64)
+                for name in ("Recycled", "RECYCLER", ".Trash")]
+        self.assertEqual(sorted(self.kept + mine), sorted(scanner.scan(self.root, recursive=True)))
+        drive = Path(Path.cwd().anchor)
+        for name in ("Recycled", "RECYCLER", ".Trash"):
+            with self.subTest(name=name):
+                self.assertTrue(scanner.system_folder(name, drive))
+                self.assertFalse(scanner.system_folder(name, self.root))
 
     def test_a_hidden_system_folder_is_not_walked_on_windows(self):
         """Whatever its name, a folder Windows marks hidden and system is its own."""

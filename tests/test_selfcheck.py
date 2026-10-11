@@ -152,6 +152,36 @@ class SelfcheckTests(TempCase):
         self.assertIn('("JPG", "CR2", "XMP")', source)
         self.assertIn("undo left files", source)
 
+    def test_no_check_rests_on_an_assert_statement(self):
+        """``python -O`` strips every one, and a check made of them passes
+        whatever the program did."""
+        import ast
+        tree = ast.parse(inspect.getsource(selfcheck))
+        self.assertEqual([], [node.lineno for node in ast.walk(tree)
+                              if isinstance(node, ast.Assert)])
+
+    def test_a_check_still_fails_under_python_minus_o(self):
+        """Run optimised, the core check passed with no duplicates found at all."""
+        import subprocess
+        from base import ROOT
+        script = self.tmp / "optimised.py"
+        script.write_text(
+            "import sys\n"
+            "from pathlib import Path\n"
+            "from unittest.mock import patch\n"
+            "from qingjian import selfcheck\n"
+            "from qingjian.core.engine import Engine\n"
+            "work = Path(sys.argv[1])\n"
+            "with patch.object(Engine, 'find_duplicates', lambda self, *args, **kwargs: []):\n"
+            "    selfcheck._check_core(work / 'library', work / 'data')\n"
+            "print(selfcheck.RESULTS[-1][1], selfcheck.RESULTS[-1][2])\n", encoding="utf-8")
+        result = subprocess.run([sys.executable, "-O", str(script), str(self.tmp)],
+                                capture_output=True, text=True, timeout=120,
+                                env=dict(os.environ, PYTHONPATH=str(ROOT)))
+        self.assertTrue(result.stdout.startswith("False AssertionError: expected one "
+                                                 "duplicate group, got 0"),
+                        result.stdout + result.stderr)
+
     def test_scale_and_duplicates_have_result_count_assertions(self):
         scale = inspect.getsource(selfcheck._check_scale.__wrapped__)
         dupes = inspect.getsource(selfcheck._check_duplicates.__wrapped__)

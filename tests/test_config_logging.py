@@ -362,6 +362,28 @@ class AppDirsTests(TempCase):
             self.assertEqual(root, appdirs.stranded_data(denied))
             self.assertIsNone(appdirs.stranded_data(denied))   # told once, not nagged
 
+    def test_with_no_home_directory_the_start_up_falls_back_rather_than_dying(self):
+        """``Path.home()`` raises when there is neither a home variable nor an
+        account entry -- a service account, a container under an arbitrary
+        uid. Only the first lookup was guarded: the fallback list asked again,
+        so the start-up died, and so did one whose own ``--data-dir`` worked,
+        because the stranded-data check asks too."""
+        from unittest.mock import patch
+
+        def homeless():
+            raise RuntimeError("Could not determine home directory.")
+
+        temp = self.tmp / "temp"
+        os.environ.pop(appdirs.ENV_VAR)
+        with patch.object(appdirs, "fallback_roots", self.real_fallback_roots), \
+             patch.object(appdirs, "_platform_data_root", homeless), \
+             patch.object(appdirs, "portable_dir", lambda: None), \
+             patch.object(appdirs.tempfile, "gettempdir", lambda: str(temp)):
+            self.assertEqual((temp / "qingjian-data", None), appdirs.usable_data_dir())
+            os.environ[appdirs.ENV_VAR] = str(self.data)
+            self.assertEqual((self.data, None), appdirs.usable_data_dir())
+            self.assertIsNone(appdirs.stranded_data(self.data))
+
     def test_the_temporary_directory_is_marked_as_one_the_system_may_empty(self):
         import tempfile
         self.assertTrue(appdirs.is_volatile(Path(tempfile.gettempdir()) / "qingjian-data"))

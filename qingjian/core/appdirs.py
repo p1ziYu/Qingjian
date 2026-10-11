@@ -208,9 +208,19 @@ def fallback_roots() -> list[Path]:
     temporary directory, which stays writable even on a machine whose profile
     is locked down but which the system may empty, so it is named last and
     never used without saying so.
+
+    With no home directory at all there is no application data directory to
+    name, and ``Path.home()`` raises rather than answering; the temporary
+    directory is then the only fallback, rather than a start-up that dies --
+    even one whose own ``--data-dir`` works, since :func:`stranded_data` asks
+    here too.
     """
-    return [_platform_data_root(),
-            Path(tempfile.gettempdir()) / f"{__app_name__.lower()}-data"]
+    roots = []
+    try:
+        roots.append(_platform_data_root())
+    except (OSError, RuntimeError, KeyError):       # no home directory at all
+        pass
+    return roots + [Path(tempfile.gettempdir()) / f"{__app_name__.lower()}-data"]
 
 
 def _relocated(root: Path, requested: Path) -> Path:

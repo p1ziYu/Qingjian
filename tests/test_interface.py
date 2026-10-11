@@ -162,7 +162,7 @@ class QueueFailureTests(WindowCase):
         with mock.patch.object(self.engine.queue, "failures", return_value=[None] * 20):
             for index in range(20):
                 path = paths[index % len(paths)]
-                self.window._inflight[index + 100] = (path, index % len(paths))
+                self.window._inflight[index + 100] = (path, index % len(paths), False)
                 self.window._on_queue_event("failed", SimpleNamespace(
                     id=index + 100, context={}, error=OSError("failed")))
             self.assertIn("20", self.window.status_label.text())
@@ -175,8 +175,8 @@ class QueueFailureTests(WindowCase):
     def test_failure_report_never_nests(self):
         self.settings.background_queue = True
         path = self.engine.queue_paths[0]
-        self.window._inflight[1] = (path, 0)
-        self.window._inflight[2] = (path, 0)
+        self.window._inflight[1] = (path, 0, False)
+        self.window._inflight[2] = (path, 0, False)
         depth = peak = 0
 
         def warning(*_args, **_kwargs):
@@ -1517,6 +1517,123 @@ class BackgroundQueueTests(WindowCase):
         self.until(lambda: path in self.engine.queue_paths, "the item vanished from the list")
         self.assertEqual(row, self.engine.queue_paths.index(path), "put back on the wrong row")
         self.assertTrue(path.exists())
+
+    def refuse_after(self, gate):
+        """Make every queued move fail, once *gate* is opened."""
+        from qingjian.core.safestore import TransactionError
+
+        def refuse(*args, **kwargs):
+            gate.wait(10)
+            raise TransactionError("error.external_change", "injected")
+
+        self.patch(self.engine, "classify", refuse)
+
+    def test_several_failed_moves_go_back_in_their_own_order(self):
+        """Each row was remembered against the list as later keys had left it.
+
+        Put back first to last, three failures in a row came back reversed:
+        0001, 0004, 0003, 0002, 0005.
+        """
+        import threading
+        before = list(self.engine.queue_paths)
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        self.refuse_after(gate)
+        self.engine.go_to(before[2])
+        for _ in range(3):
+            self.window.classify_index(0)
+        # A step back as well, so a later key files a row in front of earlier ones.
+        self.window.step(-1)
+        self.window.classify_index(0)
+        self.assertEqual(before[:1] + before[5:], self.engine.queue_paths)
+        gate.set()
+        self.assertTrue(self.settled())
+        self.until(lambda: not self.window._inflight, "the failures never came back")
+        self.assertEqual(before, self.engine.queue_paths)
+        self.assertEqual([str(path) for path in before], self.window.filmstrip._all)
+
+    def test_a_move_that_fails_after_entering_review_goes_back_to_its_own_list(self):
+        """A photo filed from the main list is not put into the review list."""
+        import threading
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        self.refuse_after(gate)
+        current = self.engine.current_path()
+        self.window.classify_index(0)
+        # Into the review list without waiting for the queue, as Ctrl+R used to.
+        self.engine.set_review_mode(True)
+        gate.set()
+        self.assertTrue(self.settled())
+        self.until(lambda: not self.window._inflight, "the failure never came back")
+        self.assertNotIn(current, self.engine.queue_paths, "put into the review list")
+        self.engine.set_review_mode(False)
+        self.assertIn(current, self.engine.queue_paths)
+
+    def test_ctrl_r_waits_for_the_queue_before_listing_again(self):
+        """The photo being copied came back on screen; a second 1 made IMG_0000 (2).JPG."""
+        self.settings.bindings[0].action = "copy"
+        current = self.engine.current_path()
+        self.slow_classify(seconds=3)
+        self.window.classify_index(0)
+        self.window.toggle_review()
+        self.window.toggle_review()
+        listed = current in self.engine.queue_paths
+        self.assertTrue(self.settled())
+        self.assertFalse(listed, "the photo being copied was listed again")
+
+    def test_switching_presets_waits_for_the_queue_before_listing_again(self):
+        from qingjian.core import config
+        self.settings.profiles["Trip"] = [config.Binding(**binding.to_dict())
+                                          for binding in self.settings.bindings]
+        self.window._refresh_presets()
+        current = self.engine.current_path()
+        self.slow_classify(seconds=3)
+        self.window.classify_index(0)
+        self.window.preset_combo.setCurrentText("Trip")
+        listed = current in self.engine.queue_paths
+        self.assertTrue(self.settled())
+        self.assertEqual("Trip", self.settings.current_profile)
+        self.assertFalse(listed, "the photo being moved was listed again")
+
+    def press_during_the_wait(self, key, action) -> tuple:
+        """Press *key* while *action* waits for a move still in the queue.
+
+        Returns the photo on screen when *action* began and the one after it.
+        """
+        import threading
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        real = self.engine.store._run_step
+
+        def slow(*args, **kwargs):
+            gate.wait(10)
+            return real(*args, **kwargs)
+
+        self.patch(self.engine.store, "_run_step", slow)
+        self.window.classify_index(0)
+        shown = self.engine.current_path()
+        after = self.engine.queue_paths[self.engine.index + 1]
+        self.activate()
+        QTimer.singleShot(60, lambda: QTest.keyClick(self.window, key))
+        QTimer.singleShot(250, gate.set)
+        action()
+        self.assertTrue(self.settled())
+        self.app.processEvents()
+        return shown, after
+
+    def test_s_skips_the_photo_that_was_on_screen_when_it_was_pressed(self):
+        """S waits for the queue; an arrow key pressed meanwhile chose what it skipped."""
+        shown, after = self.press_during_the_wait(Qt.Key.Key_Right, self.window.skip_current)
+        self.assertNotIn(shown, self.engine.queue_paths, "the photo on screen was not skipped")
+        self.assertIn(after, self.engine.queue_paths, "the photo after it was skipped instead")
+
+    def test_f2_renames_the_photo_that_was_on_screen_when_it_was_pressed(self):
+        with mock.patch("qingjian.ui.mainwindow.get_text", return_value=("renamed.JPG", True)):
+            shown, after = self.press_during_the_wait(Qt.Key.Key_Right,
+                                                      self.window.rename_current)
+        self.assertFalse(shown.exists(), "the photo on screen was not renamed")
+        self.assertTrue(after.exists(), "the photo after it was renamed instead")
+        self.assertTrue(shown.with_name("renamed.JPG").exists())
 
     def test_pending_failure_notice_stays_nonmodal_during_window_cleanup(self):
         """A queued failure notice can run inside closeEvent.processEvents()."""

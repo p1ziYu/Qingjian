@@ -109,7 +109,9 @@ class MainWindow(QMainWindow):
         self._binding_shortcuts: list[QShortcut] = []
         self._fixed_shortcuts: list[QShortcut] = []
         self._arrow_shortcuts: list[QShortcut] = []
-        self._inflight: dict[str, tuple[Path, int]] = {}
+        #: job id -> (path, row it was taken from, whether that was the review
+        #: list), oldest first: the queue finishes jobs in the order they came.
+        self._inflight: dict[str, tuple[Path, int, bool]] = {}
         #: The copy that drops into an envelope, its animation and where it lands.
         #: Made once: a widget created per key press is polished against the
         #: whole stylesheet every time.
@@ -1025,6 +1027,10 @@ class MainWindow(QMainWindow):
 
     # ============================================================== cursor
     def step(self, offset: int) -> None:
+        # S and F2 wait for the queue before they act; an arrow pressed during
+        # that wait used to move what they acted on.
+        if self._blocked():
+            return
         if self.engine.step(offset) is not None:
             self._refresh_view()
 
@@ -1034,6 +1040,8 @@ class MainWindow(QMainWindow):
         Key repeats arrive thirty times a second and a full render decodes a
         photograph, so holding the key used to be switched off altogether.
         """
+        if self._blocked():
+            return
         if not self._arrows.repeating:
             self.step(offset)
             return
@@ -1366,6 +1374,10 @@ class MainWindow(QMainWindow):
     def toggle_review(self) -> None:
         if self._blocked() or not self.engine.source_root:
             return
+        # A photo still being filed is on disk and in the library, so a list
+        # built now shows it again, and filing it twice makes a numbered copy.
+        if not self._drain_queue():
+            return
         self.engine.set_review_mode(not self.engine.review_mode)
         self._after_queue_change(tr("status.enter_review") if self.engine.review_mode
                                  else tr("status.leave_review"))
@@ -1381,6 +1393,9 @@ class MainWindow(QMainWindow):
 
     def _switch_preset(self, name: str) -> None:
         if name and name in self.settings.profiles:
+            if not self._drain_queue():         # it rebuilds the list; see toggle_review
+                self._refresh_presets()
+                return
             self._conflict_defaults.clear()
             self.settings.current_profile = name
             self.engine.save_settings()
@@ -1770,7 +1785,7 @@ class MainWindow(QMainWindow):
         # place whenever a grid selection spans more than the current item.
         position = self._detach(path)
         job = self.engine.enqueue(label, work, {"path": str(path), "index": position})
-        self._inflight[job.id] = (path, position)
+        self._inflight[job.id] = (path, position, self.engine.review_mode)
 
     def _detach(self, path: Path) -> int:
         """Take the item out of the queue at once; return the row it held.
@@ -1784,6 +1799,25 @@ class MainWindow(QMainWindow):
             if not self._grid_dirty and not self._grid_building:
                 self.grid.remove_path(path)
         self._refresh_view()
+        return position
+
+    def _return_row(self, later: list[str], position: int) -> int:
+        """The row a failed item goes back to, in the list as it is now.
+
+        *position* is the row it held when it was taken out, and the jobs in
+        *later* took their rows out after it, from a list without it. Each of
+        those that sat in front of it moves it up one; each at or behind it is
+        one further down once it is back. Using *position* as it stood put a
+        run of failures back in reverse.
+        """
+        for key in later:
+            entry = self._inflight.get(key)
+            if entry is None or entry[1] < 0:           # it never had a row
+                continue
+            if entry[1] < position:
+                position -= 1
+            else:
+                self._inflight[key] = (entry[0], entry[1] + 1, entry[2])
         return position
 
     def _finish_operation(self, path: Path, index: int, outcome) -> None:
@@ -1842,9 +1876,12 @@ class MainWindow(QMainWindow):
             return
         # _inflight is the record this thread owns; job.context is written by
         # the worker and is only a fallback for a job we did not enqueue.
+        later = list(self._inflight)
+        later = later[later.index(job.id) + 1:] if job.id in self._inflight else []
         entry = self._inflight.pop(job.id, None)
+        review = self.engine.review_mode
         if entry is not None:
-            path, position = entry
+            path, position, review = entry
         elif job.context.get("path"):
             path = Path(job.context["path"])
             position = int(job.context.get("index", -1))
@@ -1856,8 +1893,13 @@ class MainWindow(QMainWindow):
             self._schedule_open_pending(50)
             return
         self._remembered_replace_paths.discard(path)
-        if path.exists() and path not in self.engine.queue_paths:
+        # Only into the list it was filed from: a photo from the main list put
+        # into the review list would be sorted as if it had been sent there.
+        if (review == self.engine.review_mode and path.exists()
+                and path not in self.engine.queue_paths):
             # Put the item back exactly where it was so nothing is lost.
+            if position >= 0:
+                position = self._return_row(later, position)
             where = (len(self.engine.queue_paths) if position < 0
                      else min(position, len(self.engine.queue_paths)))
             self.engine.insert_at(path, where)
@@ -1905,10 +1947,12 @@ class MainWindow(QMainWindow):
             return
         if self._guard_unseen_key_action():
             return
-        if not self._drain_queue():
-            return
+        # What was on screen when the key was pressed: waiting for the queue
+        # runs events, and whatever is current afterwards nobody chose.
         targets = self._targets()
         if not targets or self.engine.review_mode:
+            return
+        if not self._drain_queue():
             return
         for path in targets:
             self._detach(Path(path))
@@ -1920,9 +1964,7 @@ class MainWindow(QMainWindow):
             return
         if self._guard_unseen_key_action():
             return
-        if not self._drain_queue():
-            return
-        path: Path | None
+        path: Path | None          # chosen before the wait, as in skip_current
         if self.view_mode == config.VIEW_GRID:
             targets = self._targets()
             if len(targets) != 1:
@@ -1933,6 +1975,8 @@ class MainWindow(QMainWindow):
         else:
             path = self.engine.current_path()
         if path is None:
+            return
+        if not self._drain_queue():
             return
         name, ok = get_text(self, tr("rename"), tr("info.filename"), text=path.name)
         if not ok or not name.strip():

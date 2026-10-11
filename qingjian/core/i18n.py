@@ -764,6 +764,20 @@ class Translator:
 _translator = Translator(DEFAULT_LANGUAGE)
 
 
+def normalize_language(value: str | None) -> str:
+    """The language setting *value* means, spelled as the settings page offers it.
+
+    ``--lang`` and a hand-edited settings.json take "EN", "en-US" or "auto" as
+    readily as :func:`set_language` does, but the page offers only a catalogue
+    code or ``system``. It showed its first option -- 中文 -- for anything
+    else, so saving any setting at all switched the window to Chinese.
+    """
+    text = (value or "").strip().lower()
+    if text in ("", "system", "auto"):
+        return "system"
+    return Translator.resolve(text)
+
+
 def translator() -> Translator:
     return _translator
 

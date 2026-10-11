@@ -1,7 +1,9 @@
 import importlib
+import importlib.util
 import inspect
 import os
 import sys
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from base import TempCase, unittest
@@ -19,6 +21,41 @@ class EntryPointTests(unittest.TestCase):
             self.assertEqual(17, script_entry.main())
             self.assertEqual(17, module_entry.main())
         self.assertEqual([["--json"], ["--json"]], calls)
+
+
+@unittest.skipUnless(importlib.util.find_spec("PySide6"), "PySide6 is not installed")
+class StartupArgumentTests(unittest.TestCase):
+    @staticmethod
+    def parse(*args):
+        from qingjian.ui.app import _parse
+        return _parse(["MediaSorter.exe", *args])
+
+    def test_the_equals_spelling_of_an_option_is_honoured(self):
+        """``--data-dir=D:\\QData`` was dropped without a word, and the run then
+        used the real library -- the one thing ``--data-dir`` is there to rule out."""
+        self.assertEqual(Path(r"D:\QData"), self.parse(r"--data-dir=D:\QData")["data_dir"])
+        self.assertEqual("en", self.parse("--lang=en")["language"])
+
+    def test_a_data_directory_keeps_its_closing_backslash(self):
+        """``--data-dir "E:\\Q Data\\"`` arrives as ``E:\\Q Data"``: Windows reads
+        a backslash before the closing quote as escaping it. Only the folder to
+        open used to be repaired, so the run looked for a directory ending in a quote."""
+        self.assertEqual(Path("E:\\Q Data\\"),
+                         self.parse("--data-dir", 'E:\\Q Data"')["data_dir"])
+
+    def test_the_value_of_a_qt_option_is_not_the_folder_to_open(self):
+        """Qt reads its own options from the same command line."""
+        for args in (("-platform", "offscreen"), ("--platform", "offscreen"),
+                     ("-style", "fusion"), ("-stylesheet", "dark.qss")):
+            with self.subTest(args=args):
+                self.assertEqual("", self.parse(*args)["folder"])
+        self.assertEqual(r"D:\Pics", self.parse("-platform", "offscreen", r"D:\Pics")["folder"])
+        self.assertEqual(r"D:\Pics", self.parse("-style=fusion", r"D:\Pics")["folder"])
+
+    def test_a_language_from_the_command_line_is_one_the_settings_page_offers(self):
+        """It is kept in the settings, which offer nothing called "EN" or "auto"."""
+        self.assertEqual("en", self.parse("--lang", "EN")["language"])
+        self.assertEqual("system", self.parse("--lang", "auto")["language"])
 
 
 class StartupLocaleTests(TempCase):

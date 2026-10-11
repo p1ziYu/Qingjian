@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from unittest import mock
 
-from test_interface import WindowCase, HAVE_QT
+from test_interface import QtCase, WindowCase, HAVE_QT
 
 if HAVE_QT:
     from PySide6.QtCore import QMimeData, QPoint, QPointF, Qt, QUrl
@@ -180,3 +180,22 @@ class G08KeysTests(WindowCase):
         self.assertEqual(str(self.source), self.settings.source_folder)
         self.assertTrue(drop([remote, QUrl.fromLocalFile(str(local))]))
         self.assertEqual(local, self.engine.source_root)
+
+
+class G08EditorTests(QtCase):
+    """The bindings and settings editors, built on their own."""
+
+    def test_a_language_the_page_has_no_option_for_is_not_saved_as_chinese(self):
+        """"EN", "en-US" and "auto" all run the window, but the page offered
+        none of them, showed its first option -- 中文 -- and saved it."""
+        from qingjian.ui.editors import SettingsDialog
+        from qingjian.ui.widgets import Segmented
+        for value, shown in (("EN", "en"), ("en-US", "en"), ("auto", "system")):
+            with self.subTest(value=value):
+                settings = config.Settings()
+                settings.language = value
+                dialog = SettingsDialog(settings)
+                self.addCleanup(dialog.deleteLater)
+                self.assertEqual(shown, dialog._control("language", Segmented).value())
+                dialog._save()
+                self.assertEqual(shown, dialog.result_settings().language)

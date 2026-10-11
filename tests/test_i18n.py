@@ -52,6 +52,23 @@ class CatalogueTests(unittest.TestCase):
         self.assertEqual("en", resolve("fr_FR"))
         self.assertEqual("en", resolve("de"))
 
+    def test_a_language_setting_is_spelled_the_way_the_settings_page_offers_it(self):
+        """``--lang`` and a hand-edited settings.json take "EN", "en-US" or
+        "auto". The settings page offers only a catalogue code or "system", so
+        it showed its first option, 中文, and saving any setting wrote it back."""
+        from qingjian.core import config
+        offered = i18n.LANGUAGE_CODES + ("system",)
+        for value, expected in (("EN", "en"), ("en-US", "en"), (" zh_CN ", "zh"),
+                                ("zh-Hant", "zh"), ("fr", "en"), ("auto", "system"),
+                                ("System", "system"), ("", "system"), (None, "system")):
+            with self.subTest(value=value):
+                normal = i18n.normalize_language(value)
+                self.assertEqual(expected, normal)
+                self.assertIn(normal, offered)
+                # The window speaks the same language either way.
+                self.assertEqual(i18n.Translator.resolve(value), i18n.Translator.resolve(normal))
+        self.assertEqual("en", config.Settings.from_dict({"language": "en-US"}).language)
+
     def test_system_language_follows_the_environment(self):
         import os
         previous = os.environ.get("QINGJIAN_LANG")

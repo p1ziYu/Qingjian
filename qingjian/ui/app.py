@@ -17,7 +17,7 @@ from PySide6.QtWidgets import QApplication
 from .. import __app_name__, __display_name__, __organization__, __version__
 from ..core import appdirs, config, logsetup
 from ..core.engine import Engine
-from ..core.i18n import set_language, tr
+from ..core.i18n import normalize_language, set_language, tr
 from ..core.logsetup import get_logger
 from . import icons, theme
 from .prompts import critical, warning
@@ -305,21 +305,48 @@ class Doorbell(QObject):
         self._server.close()
 
 
+#: Qt's own options that take the next argument as their value. Qt reads them
+#: from the same command line, so their value is not the folder to open: with
+#: ``-platform offscreen`` the run used to go looking for a folder "offscreen".
+_QT_VALUE_OPTIONS = frozenset({
+    "-platform", "-platformpluginpath", "-platformtheme", "-plugin", "-session",
+    "-qwindowgeometry", "-qwindowicon", "-qwindowtitle", "-style", "-stylesheet",
+    "-display", "-geometry", "-title", "-icon",
+})
+
+
+def _unquoted(item: str) -> str:
+    """Undo Windows reading a backslash before a closing quote as an escape.
+
+    Explorer hands over ``"E:\\"`` for a drive, and a typed ``--data-dir "E:\\Q
+    Data\\"`` arrives the same way: the closing quote comes through as part of
+    the argument, ``E:\\Q Data"``, and the backslash before it is gone.
+    """
+    return item[:-1] + "\\" if item.endswith('"') else item
+
+
 def _parse(argv: list[str]) -> dict:
     options = {"data_dir": None, "language": "", "folder": "", "version": False}
     rest = list(argv[1:])
     while rest:
         item = rest.pop(0)
+        # "--data-dir=D:\QData" is the other usual spelling. It used to be
+        # dropped without a word, and the run then used the real library --
+        # the one thing --data-dir is there to rule out.
+        name, equals, value = item.partition("=")
         if item in ("--version", "-V"):
             options["version"] = True
-        elif item == "--data-dir" and rest:
-            options["data_dir"] = Path(rest.pop(0))
-        elif item == "--lang" and rest:
-            options["language"] = rest.pop(0)
+        elif name in ("--data-dir", "--lang") and (equals or rest):
+            value = value if equals else rest.pop(0)
+            if name == "--data-dir" and value:
+                options["data_dir"] = Path(_unquoted(value))
+            elif name == "--lang" and value:
+                options["language"] = normalize_language(value)
+        elif (item[1:] if item.startswith("--") else item) in _QT_VALUE_OPTIONS:
+            if rest:
+                rest.pop(0)
         elif not item.startswith("-"):
-            if item.endswith('"'):
-                item = item[:-1] + "\\"
-            options["folder"] = item
+            options["folder"] = _unquoted(item)
     return options
 
 

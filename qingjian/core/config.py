@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 from . import appdirs
+from .i18n import normalize_language
 from .logsetup import get_logger
 from .safestore import QuotaPolicy, VERIFY_FAST, VERIFY_FULL, atomic_json
 from .sidecar import SidecarRules
@@ -179,7 +180,7 @@ class Settings:
                 value = min(high, value)
             return value
 
-        settings.language = text("language", default="system")
+        settings.language = normalize_language(text("language", default="system"))
         settings.density = text("density", DENSITIES, "standard")
         settings.default_view = text("default_view", (VIEW_SINGLE, VIEW_GRID), VIEW_SINGLE)
         settings.restore_position = flag("restore_position", True)

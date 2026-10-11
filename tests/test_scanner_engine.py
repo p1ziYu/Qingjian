@@ -801,6 +801,18 @@ class FileListTests(TempCase):
         self.engine.rebuild_queue()
         self.assertEqual(["A.JPG", "C.JPG", "D.JPG", "Zed.JPG"], self.names())
 
+    def test_a_rename_in_random_order_can_go_to_the_end_instead(self):
+        """The background queue would rather not reshuffle the whole list to
+        place one file, so it asks for arrivals at the end; the rest stay put."""
+        self.engine.settings.sort_mode = "random"
+        self.engine.rebuild_queue()
+        before = [path for path in self.engine.queue_paths if path.name != "B.JPG"]
+        outcome = self.engine.rename("Zed.JPG", self.src / "B.JPG")
+        change = self.engine.absorb(outcome.record, unordered=True)
+        self.assertEqual([*before, self.src / "Zed.JPG"], self.engine.queue_paths)
+        self.assertEqual([(3, self.src / "Zed.JPG")], change["added"])
+        self.assertEqual([self.src / "B.JPG"], change["removed"])
+
     def test_an_undone_move_in_random_order_comes_back(self):
         """The background queue takes the row out first and patches only removals."""
         self.engine.settings.sort_mode = "random"

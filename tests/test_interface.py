@@ -1865,6 +1865,22 @@ class BackgroundQueueTests(WindowCase):
         self.until(lambda: current.exists(), "the old name did not come back")
         self.assertFalse(target.exists())
 
+    def test_f2_in_random_order_keeps_the_new_name_in_the_list(self):
+        """Random order has no place to insert a file, and with the background
+        queue only the old row was taken out: the photo was on disk under its
+        new name and nowhere on screen until the folder was opened again."""
+        from unittest import mock
+        self.settings.sort_mode = "random"
+        self.window._rebuild_queue()
+        current = self.engine.current_path()
+        target = current.with_name("renamed.JPG")
+        with mock.patch("qingjian.ui.mainwindow.get_text", return_value=("renamed.JPG", True)):
+            self.press(Qt.Key.Key_F2)
+            self.until(lambda: target.exists(), "the file was not renamed")
+        self.assertIn(target, self.engine.queue_paths)
+        self.assertNotIn(current, self.engine.queue_paths)
+        self.assertEqual(8, len(self.engine.queue_paths))
+
     def conflict(self, decision):
         from unittest import mock
         from qingjian.ui import mainwindow

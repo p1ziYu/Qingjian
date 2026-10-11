@@ -1929,21 +1929,25 @@ class MainWindow(QMainWindow):
             # and `_apply_change` is what takes them out of both views -- going
             # through `_detach` would not, because absorb has already removed
             # the path from the queue it looks in.
-            change = self.engine.absorb(outcome.record)
-            if change is None:
-                if not self.settings.background_queue:
-                    self._rebuild_queue()
-                else:
-                    # Random and review queues have no stable insertion point.
-                    removed = []
-                    for touched in self.engine.touched_paths(outcome.record):
-                        if not touched.exists():
-                            if touched in self.engine.all_files:
-                                self.engine.all_files.remove(touched)
-                            if self.engine.drop_from_queue(touched) >= 0:
-                                removed.append(touched)
-                    if removed:
-                        self._apply_change({"removed": removed, "added": []})
+            # Random order has no insertion point. With the background queue a
+            # rebuild would reshuffle it under the user and list the photos
+            # still out a second time, so a file the record made -- a rename --
+            # goes to the end. Dropping only the rows that went left it on
+            # disk and nowhere on screen.
+            change = self.engine.absorb(outcome.record,
+                                        unordered=self.settings.background_queue)
+            if change is None and self._inflight:
+                # The review list is a query, and asked again now it would list
+                # the photos still out with the queue a second time. Their rows
+                # go; the next rebuild, from a file list absorb kept current,
+                # brings back anything this record made.
+                removed = [touched for touched in self.engine.touched_paths(outcome.record)
+                           if not touched.exists() and self.engine.drop_from_queue(touched) >= 0]
+                if removed:
+                    self._apply_change({"removed": removed, "added": []})
+                self._update_slip()
+            elif change is None:
+                self._rebuild_queue()
                 self._update_slip()
             else:
                 self._apply_change(change)

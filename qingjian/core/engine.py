@@ -732,7 +732,7 @@ class Engine:
                         seen.setdefault(str(value), Path(value))
         return list(seen.values())
 
-    def absorb(self, record: Record | None) -> dict | None:
+    def absorb(self, record: Record | None, unordered: bool = False) -> dict | None:
         """Bring the file lists in line with what *record* changed.
 
         Undo and redo used to call :meth:`rescan`, which walks the whole source
@@ -768,7 +768,8 @@ class Engine:
         if self.review_mode:
             # That queue is a database query, not a view of these lists.
             return None
-        if scanner.sort_key(self.settings.sort_mode) is None:
+        ordered = scanner.sort_key(self.settings.sort_mode) is not None
+        if not ordered and not unordered:
             return None                     # random order has no insert point
 
         queued = set(self.queue_paths)
@@ -784,7 +785,9 @@ class Engine:
             plans.append((self._same_shot(path, self.all_files),
                           self._same_shot(path, self.queue_paths)))
         members = [member for listed, _rows in plans for member in listed]
-        key = self._sort_key([*touched, *members])
+        # *unordered*: in random order a file that arrives goes to the end, for
+        # a caller that would rather not reshuffle the whole queue to place it.
+        key = self._sort_key([*touched, *members]) if ordered else None
         spec = self._filter_spec(members)
 
         added: list[tuple[int, Path]] = []
@@ -998,9 +1001,14 @@ class Engine:
         return where
 
     def _insert_into_queue(self, path: Path, key) -> int:
-        """Place *path* where a full sort would have put it; -1 if not added."""
+        """Place *path* where a full sort would have put it; -1 if not added.
+
+        With no *key*, which is random order, it goes to the end.
+        """
         if path in self.queue_paths:
             return -1
+        if key is None:
+            return self.insert_at(path, len(self.queue_paths))
         try:
             value = key(path)
         except OSError:

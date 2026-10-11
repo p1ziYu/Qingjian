@@ -1151,6 +1151,15 @@ class PreviewDecodeTests(TempCase):
                 for got, want in zip(samples, (0, 64, 128, 192, 255), strict=True):
                     self.assertLessEqual(abs(got - want), 3, samples)
 
+    def test_a_32_bit_greyscale_of_eight_bit_values_keeps_its_tones(self):
+        """Mode "I" is a 32-bit container, and a TIFF of plain 0..255 values
+        comes in as one. Scaled as sixteen bits it rendered nearly black."""
+        values = np.tile(np.linspace(0, 255, 600), (40, 1)).astype(np.int32)
+        image = thumbs.pil_to_qimage(Image.fromarray(values))      # int32: mode "I"
+        samples = [image.pixelColor(x, 5).red() for x in (0, 150, 300, 450, 599)]
+        for got, want in zip(samples, (0, 64, 128, 191, 255), strict=True):
+            self.assertLessEqual(abs(got - want), 3, samples)
+
     def test_an_animation_is_fitted_to_the_pane_it_is_shown_in(self):
         """The animation used to be scaled while its page was still hidden: the
         first GIF always came out 640x480, and one opened after the window was

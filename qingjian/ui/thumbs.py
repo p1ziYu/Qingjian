@@ -38,7 +38,11 @@ def pil_to_qimage(image) -> QImage:
         from PIL import Image  # noqa: PLC0415 - already loaded: *image* is one
 
         values = np.clip(np.asarray(image, dtype=np.float64), 0, 65535)
-        image = Image.fromarray(np.rint(values / 257).astype(np.uint8))
+        # Mode "I" is only a 32-bit container: a TIFF of plain 0..255 values
+        # comes in as one too, and scaled as if sixteen bits it went black.
+        if image.mode.startswith("I;16") or values.max(initial=0) > 255:
+            values = values / 257
+        image = Image.fromarray(np.rint(values).astype(np.uint8))
     converted = image.convert("RGBA")
     data = converted.tobytes("raw", "RGBA")
     result = QImage(data, converted.width, converted.height,

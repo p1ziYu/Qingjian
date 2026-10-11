@@ -185,6 +185,63 @@ class G08KeysTests(WindowCase):
 class G08EditorTests(QtCase):
     """The bindings and settings editors, built on their own."""
 
+    def _press(self, edit, key, text):
+        from PySide6.QtCore import QEvent
+        from PySide6.QtGui import QKeyEvent
+        from PySide6.QtWidgets import QApplication
+        QApplication.sendEvent(edit, QKeyEvent(QEvent.Type.KeyPress, key,
+                                               Qt.KeyboardModifier.NoModifier, text))
+
+    def test_a_key_whose_capital_is_two_letters_is_captured_as_typed(self):
+        """"ß".upper() is "SS", which QKeySequence reads as no key at all: the
+        dialog saved it without a word, and pressing ß then did nothing."""
+        from PySide6.QtGui import QKeySequence, QShortcut
+        from PySide6.QtWidgets import QWidget
+        from qingjian.ui.editors import ShortcutEdit
+        edit = ShortcutEdit("1")
+        self.addCleanup(edit.deleteLater)
+        self._press(edit, Qt.Key.Key_ssharp, "ß")
+        self.assertEqual("ß", edit.sequence())
+        target = QWidget()
+        self.addCleanup(target.deleteLater)
+        fired = []
+        QShortcut(QKeySequence(edit.sequence()), target).activated.connect(
+            lambda: fired.append(True))
+        target.show()
+        target.activateWindow()
+        self.assertTrue(QTest.qWaitForWindowActive(target, 2000))
+        QTest.keyClick(target, Qt.Key.Key_ssharp)
+        self.assertEqual([True], fired)
+        # Ordinary letters are still stored as capitals.
+        self._press(edit, Qt.Key.Key_A, "a")
+        self.assertEqual("A", edit.sequence())
+
+    def test_a_key_that_does_not_read_back_as_one_is_refused_rather_than_saved_dead(self):
+        from PySide6.QtGui import QKeySequence
+        from qingjian.ui.editors import ShortcutEdit
+        self.assertEqual(Qt.Key.Key_unknown, QKeySequence("İ")[0].key())   # what Qt makes of it
+        edit = ShortcutEdit("1")
+        self.addCleanup(edit.deleteLater)
+        self._press(edit, Qt.Key.Key_unknown, "İ")
+        self.assertEqual("1", edit.sequence())
+
+    def test_escape_in_a_key_field_still_cancels_the_dialog(self):
+        """The field took every key it was given, Escape included, so the
+        bindings dialog could not be cancelled from the keyboard while a key
+        field had the focus."""
+        from qingjian.ui.editors import BindingsDialog
+        dialog = BindingsDialog(config.default_bindings())
+        self.addCleanup(dialog.deleteLater)
+        rejected = []
+        dialog.rejected.connect(lambda: rejected.append(True))
+        dialog.show()
+        field = dialog.rows[0]["key"]
+        field.setFocus()
+        QTest.keyClick(field, Qt.Key.Key_Escape)
+        self.assertEqual([True], rejected)
+        self.assertFalse(dialog.isVisible())
+        self.assertEqual("1", field.sequence())
+
     def test_a_language_the_page_has_no_option_for_is_not_saved_as_chinese(self):
         """"EN", "en-US" and "auto" all run the window, but the page offered
         none of them, showed its first option -- 中文 -- and saved it."""

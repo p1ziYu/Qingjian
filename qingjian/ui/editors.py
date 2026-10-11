@@ -51,6 +51,11 @@ class ShortcutEdit(QLineEdit):
         if key in (Qt.Key.Key_Tab, Qt.Key.Key_Backtab):
             super().keyPressEvent(event)
             return
+        if key == Qt.Key.Key_Escape:
+            # The window keeps Escape for itself, so no binding can have it;
+            # passed on, it cancels the dialog as it does from any other field.
+            event.ignore()
+            return
         if key in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete):
             self.setText("")
             return
@@ -61,7 +66,15 @@ class ShortcutEdit(QLineEdit):
             return
         text = event.text()
         if text and text.isprintable() and not text.isspace():
-            self.setText(text.upper())
+            # Upper-cased only where that leaves it one character: "ß" becomes
+            # "SS", which QKeySequence reads as no key at all, so the binding
+            # was saved and then never fired. Anything that does not read back
+            # as one key is refused here rather than saved dead.
+            upper = text.upper()
+            text = upper if len(upper) == len(text) else text
+            sequence = QKeySequence(text)
+            if sequence.count() == 1 and cast(Any, sequence)[0].key() != Qt.Key.Key_unknown:
+                self.setText(text)
             return
         named = {Qt.Key.Key_Space: "Space", Qt.Key.Key_Return: "Return",
                  Qt.Key.Key_Enter: "Enter", Qt.Key.Key_Insert: "Insert",

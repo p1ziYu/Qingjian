@@ -808,17 +808,35 @@ class CoarseMtimeTests(TempCase):
                         resolver=lambda _a, _b: ops.CONFLICT_REPLACE)
         engine.undo()
         self.assertEqual(b"o" * 2000, older.read_bytes())
-        # Size and time only: the restore copy holds the bytes, and a hash here
-        # made redo read the whole replaced file again.
-        unlink = next(step for step in engine.state.top("redo").payload["forward"]
-                      if step["kind"] == "unlink")
-        self.assertNotIn("hash", unlink["expect"])
         engine.redo()
         self.assertEqual(b"f" * 3000, older.read_bytes())
         self.assertFalse(photo.exists())
         engine.undo()
         self.assertEqual(b"o" * 2000, older.read_bytes())
         self.assertFalse(engine.has_pending())
+
+    def test_redo_refuses_a_restored_file_edited_in_place_since_the_undo(self):
+        """With full verification redo reads what it is about to delete: a
+        metadata tool that keeps the size and the date still changed the
+        bytes, and the edit is refused rather than lost."""
+        root = self.tmp / "edited"
+        photo = self.write(root / "lib" / "IMG_5.JPG", b"f" * 3000)
+        keep = root / "keep"
+        older = self.write(keep / "IMG_5.JPG", b"o" * 2000)
+        settings = config.Settings()
+        settings.logging_enabled = False
+        engine = Engine(data_dir=root / "app", settings=settings)
+        self.addCleanup(engine.close)
+        engine.open_folder(root / "lib")
+        engine.classify(config.Binding(key="1", action="move", folder=str(keep)), photo,
+                        resolver=lambda _a, _b: ops.CONFLICT_REPLACE)
+        engine.undo()
+        stamp = older.stat()
+        older.write_bytes(b"e" * 2000)
+        os.utime(older, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+        with self.assertRaises(TransactionError):
+            engine.redo()
+        self.assertEqual(b"e" * 2000, older.read_bytes())
 
     def test_undoing_a_favourite_to_a_coarse_mtime_volume(self):
         photo, copy = self.sort_and_undo("favorite")

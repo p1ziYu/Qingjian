@@ -1015,10 +1015,10 @@ class SafeStore:
                 mirror["expect"] = dict(landed)
             elif (step["kind"] == WRITE and mirror.get("kind") == UNLINK
                     and _path_key(mirror.get("dst", "")) == _path_key(step["dst"])):
-                # Size and time, as the plan asked: the restore copy already
-                # holds these bytes, and a hash would make redo read the file.
-                mirror["expect"] = {key: landed[key] for key in ("size", "mtime_ns")
-                                    if key in landed}
+                # The hash as well: with full verification, redo reads the file
+                # before deleting it, so an edit made in place since the undo,
+                # same size and time, is refused rather than lost.
+                mirror["expect"] = dict(landed)
 
     def _landed_later(self, dst: Path, later: Sequence[dict],
                       kinds: Sequence[str] = (MOVE, COPY, WRITE)) -> bool:

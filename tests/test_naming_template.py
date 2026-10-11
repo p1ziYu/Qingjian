@@ -55,6 +55,16 @@ class NamingTests(TempCase):
         # Re-filing "a (2).jpg" produces "a (3).jpg", not "a (2) (2).jpg".
         self.assertEqual("a (3).jpg", naming.unique_destination(folder, "a (2).jpg").name)
 
+    def test_a_year_in_brackets_is_not_taken_for_a_counter(self):
+        """A clash on "Wedding (2019).JPG" came out as "Wedding (2).JPG"."""
+        self.assertEqual("Wedding (2019)", naming.strip_sequence("Wedding (2019)"))
+        self.assertEqual("Scan (007)", naming.strip_sequence("Scan (007)"))
+        self.assertEqual("photo", naming.strip_sequence("photo (3)"))
+        folder = self.tmp / "dest"
+        self.write(folder / "Wedding (2019).JPG")
+        self.assertEqual("Wedding (2019) (2).JPG",
+                         naming.unique_destination(folder, "Wedding (2019).JPG").name)
+
     def test_compound_suffix_split(self):
         self.assertEqual(("IMG_1.JPG", ".xmp"), naming.split_name("IMG_1.JPG.xmp"))
 

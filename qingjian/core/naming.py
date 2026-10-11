@@ -13,8 +13,15 @@ _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _COLLAPSE = re.compile(r"\s{2,}")
 
 #: Sequence suffix this module appends, and the pattern that recognises one it
-#: has appended before, so repeated runs do not stack " (2) (2)".
-_SEQUENCE = re.compile(r"^(?P<stem>.*?)(?: \((?P<number>\d+)\))$")
+#: has appended before, so repeated runs do not stack " (2) (2)". Only a number
+#: written the way this module writes one counts: no leading zero, and fewer
+#: than four digits, which takes a thousand clashes on a single name to reach.
+#: A longer number in brackets is the user's own -- a year, an event number --
+#: and taking it for a counter turned "Wedding (2019).JPG" into
+#: "Wedding (2).JPG" on a clash. Missing a real counter costs an untidy
+#: " (2) (2)"; stripping a real number loses part of the name, so the rule
+#: leans towards keeping.
+_SEQUENCE = re.compile(r"^(?P<stem>.*?)(?: \((?P<number>[1-9]\d{0,2})\))$")
 
 MAX_SEQUENCE = 100_000
 

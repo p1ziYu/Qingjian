@@ -268,6 +268,14 @@ class ConflictTests(PlannerCase):
         self.assertEqual(b"OLD", (self.keep / "solo_01.JPG").read_bytes())
         self.assertTrue(self.source.exists())
 
+    def test_keeping_both_keeps_a_number_that_is_part_of_the_name(self):
+        source = self.write(self.root / "Day4" / "Wedding (2019).JPG", b"NEW")
+        self.write(self.keep / "Wedding (2019).JPG", b"OLD")
+        outcome = self.commit(self.planner.plan_folder_action(
+            "move", self.planner.group_for(source), self.binding(), source_root=self.root))
+        self.assertEqual("Wedding (2019) (2).JPG", Path(outcome.record.destination).name)
+        self.assertEqual(b"OLD", (self.keep / "Wedding (2019).JPG").read_bytes())
+
     def test_skip_does_nothing_at_all(self):
         self.write(self.keep / "solo_01.JPG", b"OLD")
         outcome = self.planner.plan_folder_action(

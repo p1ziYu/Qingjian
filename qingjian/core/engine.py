@@ -728,13 +728,17 @@ class Engine:
         never moved, only its exclusion did -- so every touched file that still
         exists is re-tested against the filter rather than assumed to be fine.
 
-        Returns None when the lists cannot be patched confidently and the
-        caller should rebuild the queue instead; otherwise the queue rows that
-        were added and removed, so the views can be patched the same way.
+        Returns None when the queue cannot be patched confidently and the
+        caller should rebuild it instead; otherwise the queue rows that were
+        added and removed, so the views can be patched the same way. The file
+        list is brought up to date either way, because that rebuild reads it:
+        one still naming the old file lost a renamed or restored file for good.
         """
         touched = self.touched_paths(record)
         if not touched or self.source_root is None:
             return None
+        metadata.forget(touched)
+        listed = self._list_touched(touched)
         if self.review_mode:
             # That queue is a database query, not a view of these lists.
             return None
@@ -744,20 +748,12 @@ class Engine:
 
         added: list[tuple[int, Path]] = []
         removed: list[Path] = []
-        metadata.forget(touched)
-        root = self.source_root
-        excluded = scanner.pruned_targets(root, self.settings.target_folders())
         spec = self._filter_spec(touched)
         queued = set(self.queue_paths)
-        known = set(self.all_files)
 
         wanted_paths: list[Path] = []
         for path in touched:
-            if path.exists() and self._belongs(path, root, excluded):
-                if path not in known:
-                    self.all_files.append(path)
-                    known.add(path)
-                    self._index_note(path)
+            if path in listed:
                 # Whether it should be listed is re-decided every time, in both
                 # directions. Copying or marking a file leaves it exactly where
                 # it was and only changes the handled list, so a check that
@@ -771,13 +767,9 @@ class Engine:
                     removed.append(path)
                     queued.discard(path)
                 continue
-            if path in known:
-                self.all_files.remove(path)
-                known.discard(path)
             if self.drop_from_queue(path) >= 0:
                 removed.append(path)
                 queued.discard(path)
-            self._index_forget(path)
 
         for path in wanted_paths:
             if path not in queued:
@@ -788,6 +780,29 @@ class Engine:
 
         self.index = clamp_index(self.index, len(self.queue_paths))
         return {"added": added, "removed": removed}
+
+    def _list_touched(self, touched: Sequence[Path]) -> set[Path]:
+        """Add the touched files `scan` would return, drop the ones that are gone.
+
+        Returns the touched files that are listed now.
+        """
+        root = self.source_root
+        excluded = scanner.pruned_targets(root, self.settings.target_folders())
+        known = set(self.all_files)
+        listed: set[Path] = set()
+        for path in touched:
+            if path.exists() and self._belongs(path, root, excluded):
+                listed.add(path)
+                if path not in known:
+                    self.all_files.append(path)
+                    known.add(path)
+                    self._index_note(path)
+                continue
+            if path in known:
+                self.all_files.remove(path)
+                known.discard(path)
+            self._index_forget(path)
+        return listed
 
     def exclude_targets(self) -> dict | None:
         """Drop files that now sit inside a destination folder.

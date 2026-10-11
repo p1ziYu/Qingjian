@@ -1,6 +1,9 @@
 import os
 import subprocess
 from datetime import datetime
+from pathlib import Path
+
+from PIL import Image
 
 from base import TempCase, unittest
 from fixtures import build_library
@@ -10,6 +13,13 @@ from qingjian.core.opqueue import Job, OperationQueue
 from qingjian.core.safestore import Cancelled, SafeStore
 from qingjian.core.sidecar import SidecarRules
 from qingjian.core.state import StateStore
+
+
+def photo(path: Path, shade: int = 30) -> Path:
+    """A small real JPEG, so anything that reads its header finds one."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (40, 30), (shade, 20, 30)).save(path, quality=90)
+    return path
 
 
 class ScannerTests(TempCase):
@@ -756,6 +766,86 @@ class PrunedTargetTests(TempCase):
 
     def test_a_target_below_the_root_is_still_pruned(self):
         self.assertEqual(["top.jpg"], self.names([self.root / "sub"]))
+
+
+class FileListTests(TempCase):
+    """When absorb leaves the queue to a rebuild, the rebuild must see the change.
+
+    Random order and the review queue have no insert point, so absorb answers
+    None and the caller rebuilds -- from a file list absorb had not touched,
+    so a file the record created or put back was nowhere to be found.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.src = self.tmp / "src"
+        for shade, name in enumerate("ABCD"):
+            photo(self.src / f"{name}.JPG", 40 * shade)
+        settings = config.Settings()
+        settings.bindings[0].action = "move"
+        settings.bindings[0].folder = str(self.tmp / "Out")
+        settings.bindings[0].name_template = "{name}"
+        self.binding = settings.bindings[0]
+        self.engine = Engine(self.data, settings)
+        self.addCleanup(self.engine.close)
+        self.engine.open_folder(self.src)
+
+    def names(self) -> list[str]:
+        return sorted(path.name for path in self.engine.queue_paths)
+
+    def test_a_rename_in_random_order_survives_the_rebuild(self):
+        self.engine.settings.sort_mode = "random"
+        self.engine.rebuild_queue()
+        outcome = self.engine.rename("Zed.JPG", self.src / "B.JPG")
+        self.assertIsNone(self.engine.absorb(outcome.record))
+        self.engine.rebuild_queue()
+        self.assertEqual(["A.JPG", "C.JPG", "D.JPG", "Zed.JPG"], self.names())
+
+    def test_an_undone_move_in_random_order_comes_back(self):
+        """The background queue takes the row out first and patches only removals."""
+        self.engine.settings.sort_mode = "random"
+        self.engine.rebuild_queue()
+        target = self.src / "C.JPG"
+        self.engine.drop_from_queue(target)
+        outcome = self.engine.classify(self.binding, target)
+        self.assertIsNone(self.engine.absorb(outcome.record))
+        for path in self.engine.touched_paths(outcome.record):
+            if not path.exists():
+                if path in self.engine.all_files:
+                    self.engine.all_files.remove(path)
+                self.engine.drop_from_queue(path)
+        self.assertIsNone(self.engine.absorb(self.engine.undo().record))
+        self.engine.rebuild_queue()
+        self.assertEqual(["A.JPG", "B.JPG", "C.JPG", "D.JPG"], self.names())
+
+    def test_an_undo_made_in_review_mode_is_seen_after_leaving_it(self):
+        self.engine.absorb(self.engine.classify(self.binding, self.src / "C.JPG").record)
+        self.engine.set_review_mode(True)
+        self.assertIsNone(self.engine.absorb(self.engine.undo().record))
+        self.engine.rebuild_queue()
+        self.engine.set_review_mode(False)
+        self.assertEqual(["A.JPG", "B.JPG", "C.JPG", "D.JPG"], self.names())
+
+    def test_renaming_an_item_in_review_keeps_it_in_review(self):
+        """A new name is not a decision about the photograph.
+
+        The rename took the old name off the review list and put nothing in its
+        place, so the file left the review queue and, being on no list, did not
+        show in the main one either.
+        """
+        source, renamed = self.src / "A.JPG", self.src / "Renamed.JPG"
+        root = str(self.engine.source_root)
+        self.engine.skip(source)
+        self.engine.set_review_mode(True)
+        self.assertIsNone(self.engine.absorb(self.engine.rename(renamed.name, source).record))
+        self.engine.rebuild_queue()
+        self.assertEqual([renamed.name], self.names())
+        self.engine.set_review_mode(False)
+        self.assertEqual(["B.JPG", "C.JPG", "D.JPG"], self.names())
+        self.engine.undo()
+        self.assertEqual([str(source)], self.engine.state.review_queue(root))
+        self.engine.redo()
+        self.assertEqual([str(renamed)], self.engine.state.review_queue(root))
 
 
 class BelongsTests(TempCase):

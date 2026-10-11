@@ -461,6 +461,12 @@ class Planner:
         delta["records_add"].append(record.to_dict())
         # Any decision about a file takes it out of the review queue.
         delta["reviews_remove"].append([root, master])
+        if action == "rename" and record.from_review:
+            # A new name is not a decision about the photograph, so it keeps
+            # its place in review under the name it has now. Dropping it left
+            # the file on no list at all: gone from review, and still not in
+            # the main queue until the folder was opened again.
+            delta["reviews_add"].append([root, record.destination])
         if action in ("copy", "favorite"):
             # The original stays put, so remember it was dealt with.
             delta["done_add"].append(master)
@@ -479,6 +485,9 @@ class Planner:
                 delta["reviews_add"].append([root, master])
             else:
                 delta["reviews_remove"].append([root, master])
+            if record.action == "rename":
+                delta["reviews_remove" if undo else "reviews_add"].append(
+                    [root, record.destination])
         if record.action == "rename":
             for old, new, old_rating, old_label, new_rating, new_label in \
                     record.payload.get("tag_pairs") or []:

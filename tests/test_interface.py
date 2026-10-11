@@ -3592,3 +3592,75 @@ class G06PreviewOperationTests(WindowCase):
                                              (_ for _ in ()).throw(OSError("busy")))
             self.window.rename_current()
         refresh.assert_called_once()
+
+
+class PreviewRefreshTests(WindowCase):
+    """What is on screen is loaded again only when it is not what is shown already."""
+
+    def count_loads(self) -> list:
+        loads: list = []
+        real = self.window.preview.show_path
+
+        def counting(path, cached=None):
+            loads.append(Path(path))
+            return real(path, cached)
+
+        self.patch(self.window.preview, "show_path", counting)
+        return loads
+
+    def test_a_finished_job_and_a_language_switch_leave_the_picture_alone(self):
+        """Each loaded the current file again.
+
+        A playing video jumped back to the start, a paused one started
+        playing, and a photo turned for a closer look turned back.
+        """
+        import threading
+        self.settings.background_queue = True
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        real = self.engine.store._run_step
+
+        def slow(*args, **kwargs):
+            gate.wait(10)
+            return real(*args, **kwargs)
+
+        self.patch(self.engine.store, "_run_step", slow)
+        self.window.classify_index(0)
+        shown = self.engine.current_path()
+        self.window.preview.image.rotate_by(90)
+        loads = self.count_loads()
+        gate.set()
+        self.until(lambda: not self.window._inflight, "the move never finished")
+        self.app.processEvents()
+        self.window._toggle_language()
+        self.window._toggle_language()
+        self.assertEqual([], loads)
+        self.assertEqual(shown, self.window.preview.current_path)
+        self.assertEqual(90, self.window.preview.image._rotation)
+
+    def test_a_file_replaced_under_the_same_name_is_loaded_again(self):
+        shown = self.engine.current_path()
+        loads = self.count_loads()
+        self.window._refresh_view()
+        self.assertEqual([], loads)
+        Image.new("RGB", (64, 48), (250, 250, 250)).save(shown)
+        self.window._refresh_view()
+        self.assertEqual([shown], loads)
+
+    def test_a_failed_or_cancelled_undo_puts_the_animation_back(self):
+        """Undo lets go of the file on screen first, and nothing loaded it again."""
+        from qingjian.core.safestore import Cancelled, TransactionError
+        clip = self.source / "MOVING.gif"
+        frames = [Image.new("RGB", (40, 30), colour) for colour in ("red", "blue")]
+        frames[0].save(clip, save_all=True, append_images=frames[1:], duration=100, loop=0)
+        self.addCleanup(self.window.preview.release)
+        self.window.rescan()
+        self.assertTrue(self.engine.go_to(clip))
+        self.window._refresh_view()
+        self.assertIsNotNone(self.window.preview._movie, "the gif never played")
+        self.patch(self.window, "_report", lambda error: None)
+        for error in (TransactionError("error.external_change", "injected"),
+                      TransactionError("status.undo_stuck"), Cancelled("cancelled")):
+            with mock.patch.object(self.engine, "undo", side_effect=error):
+                self.window.undo()
+            self.assertIsNotNone(self.window.preview._movie, f"blank after {error!r}")

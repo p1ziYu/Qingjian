@@ -128,6 +128,8 @@ class MainWindow(QMainWindow):
         self.preloader.arrived.connect(self._preview_arrived)
         #: Heavy decodes re-asked for after a resize, so one cannot loop.
         self._preview_retries: dict[str, int] = {}
+        #: The file the preview last loaded in full, and its identity then.
+        self._shown: tuple | None = None
         set_language(self.settings.language)
 
         self.setWindowTitle(f"{__display_name__} · {tr('app.tagline')}")
@@ -1079,6 +1081,7 @@ class MainWindow(QMainWindow):
             thumb_key = self.thumbs.key(path, HOLD_EDGE)
             pixmap = self.thumbs.peek(path, HOLD_EDGE, key=thumb_key)
         if pixmap is not None:
+            self._shown = None              # a stand-in; `_settle` loads the file
             self.preview.show_still(path, pixmap)
         else:
             # Decode on a worker. Only the last few items stay wanted, so a long
@@ -1092,6 +1095,7 @@ class MainWindow(QMainWindow):
         """A held-key thumbnail landed. Show it if the flip has not gone far past it."""
         if edge != HOLD_EDGE or not self._settle_pending or path not in self._flipped:
             return
+        self._shown = None
         self.preview.show_still(Path(path), pixmap)
 
     def _settle(self) -> None:
@@ -1181,19 +1185,17 @@ class MainWindow(QMainWindow):
             wanted = [path] + ([queue[(index + step) % total]
                                  for step in (1, 2, -1)] if total > 1 else [])
             self.preloader.set_wanted(wanted, target)
-            preview_key = self.preloader.key(path, target)
-            ready = self.preloader.take(path, target, key=preview_key)
-            if ready is None and decodes_slowly(path):
-                # A large PNG or TIFF cannot be scaled while it is decoded, so it
-                # would hold the window for seconds. Show its name, decode on a
-                # worker, and swap the picture in when it lands.
-                self.preview.show_loading(path, path.name, tr("scan.reading"))
-                self.preloader.request(path, target, key=preview_key)
-            else:
-                ok, error = self.preview.show_path(path, ready)
-                if not ok:
-                    self.status(tr("status.preview_failed", name=path.name, error=error),
-                                "warning")
+            if not self._still_showing(path):
+                preview_key = self.preloader.key(path, target)
+                ready = self.preloader.take(path, target, key=preview_key)
+                if ready is None and decodes_slowly(path):
+                    # A large PNG or TIFF cannot be scaled while it is decoded, so
+                    # it would hold the window for seconds. Show its name, decode
+                    # on a worker, and swap the picture in when it lands.
+                    self.preview.show_loading(path, path.name, tr("scan.reading"))
+                    self.preloader.request(path, target, key=preview_key)
+                else:
+                    self._show_in_full(path, ready)
             self._prefetch_neighbours()
         else:
             self.preloader.set_wanted([], self._preview_target())
@@ -1253,10 +1255,43 @@ class MainWindow(QMainWindow):
                                        error=""))
             return
         self._preview_retries.pop(path, None)
-        ok, error = self.preview.show_path(current, ready)
+        self._show_in_full(current, ready)
+
+    def _show_in_full(self, path: Path, ready) -> None:
+        ok, error = self.preview.show_path(path, ready)
+        self._shown = (path, self._identity(path)) if ok else None
         if not ok:
-            self.status(tr("status.preview_failed", name=Path(path).name, error=error),
-                        "warning")
+            self.status(tr("status.preview_failed", name=path.name, error=error), "warning")
+
+    @staticmethod
+    def _identity(path: Path) -> tuple | None:
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        return (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+    def _still_showing(self, path: Path) -> bool:
+        """True when *path* is up in full already, so a refresh need not load it.
+
+        A finished background job, a language switch and the settings dialog
+        all refresh the view. Loading the file again each time sent a playing
+        video back to the start, started a paused one and turned a turned photo
+        back. A file let go for a move, or replaced under the same name, is
+        loaded again.
+        """
+        preview = self.preview
+        if preview.current_path != path or self._shown is None or self._shown[0] != path:
+            return False
+        identity = self._identity(path)
+        if identity is None or identity != self._shown[1]:
+            return False
+        page = preview.stack.currentIndex()
+        if page == preview.VIDEO:
+            return not preview.player.source().isEmpty()
+        if page == preview.ANIMATED:
+            return preview.animated.movie() is not None
+        return page == preview.IMAGE and not preview.image.current_pixmap().isNull()
 
     def _preview_target(self) -> QSize:
         surface = self.preview.image
@@ -2142,12 +2177,16 @@ class MainWindow(QMainWindow):
             outcome = self._with_progress(
                 message, lambda progress, cancel: action(progress, cancel))
         except (TransactionError, OSError) as error:
+            # The file let go above is still the one on screen; a video was
+            # left blank, and Space then played nothing.
+            self._refresh_view()
             if getattr(error, "key", "") == "status.undo_stuck":
                 self.status(tr("status.undo_stuck"), "warning")
                 return
             self._report(error)
             return
         except Cancelled:
+            self._refresh_view()
             return
         record = getattr(outcome, "record", None)
         # The record names the files that moved, so there is no reason to walk

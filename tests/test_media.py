@@ -1199,6 +1199,47 @@ class PreviewDecodeTests(TempCase):
                 self.assertEqual((60, 100), (image.width(), image.height()))
                 self.assertEqual((60, 100), imaging.thumbnail(path, (320, 320)).size)
 
+    def test_a_png_s_later_chunks_are_read_the_way_pillow_reads_them(self):
+        """The last of each kind wins, compressed XMP counts, and the date the
+        sort uses is the date everything else shows."""
+        import zlib
+        from datetime import datetime
+
+        def chunk(kind: bytes, body: bytes) -> bytes:
+            return struct.pack(">I", len(body)) + kind + body + struct.pack(
+                ">I", zlib.crc32(kind + body))
+
+        def exif(orientation: int, date: str = "") -> bytes:
+            block = Image.Exif()
+            block[0x0112] = orientation
+            if date:
+                block.get_ifd(0x8769)[0x9003] = date
+            return block.tobytes()
+
+        base = self.tmp / "plain.png"
+        Image.new("RGB", (100, 60), "blue").save(base)
+        data = base.read_bytes()
+        head, tail = data[:-12], data[-12:]                 # tail is IEND
+        xmp = (b'<x:xmpmeta><rdf:Description tiff:Orientation="6"/></x:xmpmeta>')
+        cases = {
+            "two_exif.png": (chunk(b"eXIf", exif(6)) + chunk(b"eXIf", exif(8)), 8),
+            "ztxt_xmp.png": (chunk(b"zTXt", b"XML:com.adobe.xmp\0\0" + zlib.compress(xmp)), 6),
+            "itxt_compressed.png": (chunk(b"iTXt", b"XML:com.adobe.xmp\0\1\0\0\0"
+                                          + zlib.compress(xmp)), 6),
+            "dated.png": (chunk(b"eXIf", exif(1, "2001:02:03 04:05:06")), 1),
+        }
+        for name, (extra, want) in cases.items():
+            with self.subTest(name=name):
+                path = self.write(self.tmp / name, head + extra + tail)
+                metadata.clear_cache()
+                self.assertEqual(want, metadata.read(path).orientation)
+                upright = imaging.thumbnail(path, (320, 320)).size == (100, 60)
+                self.assertEqual(want in (1, 2, 3, 4), upright)
+        dated = self.tmp / "dated.png"
+        taken = datetime(2001, 2, 3, 4, 5, 6)
+        self.assertEqual(taken, metadata.read(dated).captured)
+        self.assertEqual(taken.timestamp(), metadata.capture_only(dated))
+
     def test_a_16_bit_greyscale_thumbnail_is_scaled_not_clipped(self):
         """Pillow clips wide greyscale into eight bits, so a 16-bit scan's
         thumbnail came out almost white while the preview was right."""

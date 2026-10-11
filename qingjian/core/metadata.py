@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 import struct
 import threading
+import zlib
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -250,45 +251,72 @@ def _apply_exif(info: MediaInfo, tags: dict) -> None:
             break
 
 
-#: ``tiff:Orientation`` in an XMP packet, as an attribute or as an element.
-_XMP_ORIENTATION = re.compile(rb"tiff:Orientation(?:\s*=\s*[\"']|>)\s*([1-8])")
+#: Pillow's own reading of an XMP orientation, so the two never disagree.
+_XMP_ORIENTATION = re.compile(r'tiff:Orientation(="|>)([0-9])')
+#: How much of a PNG's end is read for the chunks that follow its pixels.
+_PNG_TAIL = 64 * 1024
+_PNG_TEXT = (b"eXIf", b"iTXt", b"zTXt", b"tEXt")
 
 
 def _png_tail(path: Path, Image) -> tuple[object | None, int]:
-    """The eXIf block and XMP orientation a PNG keeps anywhere in the file.
+    """The eXIf block and XMP orientation a PNG keeps after its pixels.
 
-    Pillow reads only the chunks in front of the image data when it opens a
-    PNG, and asking it for the rest decodes the whole picture. A camera app
-    may write eXIf after the data, and an editor may keep the orientation in
-    XMP alone; the thumbnail, which Pillow decodes anyway, turned such a PNG
-    and the preview did not. Walking the chunk headers reads a few bytes per
-    chunk and skips the pixels.
+    Pillow reads a PNG's chunks only up to the image data when it opens one,
+    and asking it for the rest decodes the whole picture. A camera app may
+    write eXIf after the data, and an editor may keep the orientation in XMP
+    alone; the thumbnail, which Pillow decodes anyway, turned such a PNG and
+    the preview did not. Those chunks sit just before the end, so one read of
+    the file's last few kilobytes finds them: each is told from stray bytes by
+    its checksum, and, as when Pillow decodes, the last of each kind wins.
     """
-    exif, turned = None, 0
     with open(path, "rb") as stream:
         if stream.read(8) != b"\x89PNG\r\n\x1a\n":
             return None, 0
-        for _chunk in range(200_000):
-            header = stream.read(8)
-            if len(header) < 8:
-                break
-            size, kind = struct.unpack(">I4s", header)
-            if kind == b"IEND":
-                break
-            if kind == b"eXIf" and size <= 1 << 20 and exif is None:
-                exif = Image.Exif()
-                exif.load(stream.read(size))
-                stream.seek(4, 1)
-                continue
-            if kind in (b"iTXt", b"tEXt") and size <= 1 << 20:
-                text = stream.read(size)
-                if text.startswith(b"XML:com.adobe.xmp") and not turned:
-                    found = _XMP_ORIENTATION.search(text)
-                    turned = int(found.group(1)) if found else 0
-                stream.seek(4, 1)
-                continue
-            stream.seek(size + 4, 1)
-    return exif, turned
+        size = stream.seek(0, 2)
+        start = max(8, size - _PNG_TAIL)
+        stream.seek(start)
+        tail = stream.read()
+    found: list[tuple[int, bytes, bytes]] = []
+    for kind in _PNG_TEXT:
+        at = tail.find(kind, 4)
+        while at >= 4:
+            length = struct.unpack(">I", tail[at - 4:at])[0]
+            body = tail[at + 4:at + 4 + length]
+            check = tail[at + 4 + length:at + 8 + length]
+            if (len(body) == length and len(check) == 4
+                    and zlib.crc32(kind + body) == struct.unpack(">I", check)[0]):
+                found.append((at, kind, body))
+            at = tail.find(kind, at + 1)
+    exif, xmp = None, ""
+    for _at, kind, body in sorted(found):
+        if kind == b"eXIf":
+            exif = body
+        elif (text := _png_text(kind, body)) is not None:
+            xmp = text
+    block = None
+    if exif is not None:
+        block = Image.Exif()
+        block.load(exif)
+    match = _XMP_ORIENTATION.search(xmp) if xmp else None
+    return block, int(match.group(2)) if match else 0
+
+
+def _png_text(kind: bytes, body: bytes) -> str | None:
+    """The XMP packet in a text chunk, decompressed as Pillow would; else None."""
+    keyword, _, rest = body.partition(b"\0")
+    if keyword != b"XML:com.adobe.xmp":
+        return None
+    try:
+        if kind == b"tEXt":
+            return rest.decode("latin-1")
+        if kind == b"zTXt":
+            return zlib.decompress(rest[1:]).decode("latin-1")
+        compressed, _method, rest = rest[0], rest[1], rest[2:]
+        _language, _, rest = rest.partition(b"\0")
+        _translated, _, text = rest.partition(b"\0")
+        return (zlib.decompress(text) if compressed else text).decode("utf-8")
+    except (IndexError, ValueError, zlib.error):
+        return None
 
 
 def _exif_tags(exif, ExifTags) -> dict:
@@ -317,6 +345,14 @@ def _read_image(info: MediaInfo) -> None:
                 else:
                     late, turned = _png_tail(info.path, Image)
                     tags = _exif_tags(late, ExifTags) if late is not None else {}
+                    early = image.info.get("XML:com.adobe.xmp")
+                    if not turned and isinstance(early, str):
+                        found = _XMP_ORIENTATION.search(early)
+                        turned = int(found.group(2)) if found else 0
+            except OSError as error:
+                # Locked or offline just now: not a fact about the file.
+                info.transient = _transient(error)
+                tags = {}
             except Exception:
                 tags = {}
         if tags:
@@ -465,8 +501,13 @@ def capture_only(path: str | Path) -> float | None:
     try:
         with Image.open(source) as image:
             if image.format == "PNG" and "exif" not in image.info:
-                return source.stat().st_mtime
-            exif = image.getexif()
+                # The full reader takes a date from eXIf after the pixels, so
+                # date sorting does too, or the two orders disagreed.
+                exif, _turned = _png_tail(source, Image)
+                if exif is None:
+                    return source.stat().st_mtime
+            else:
+                exif = image.getexif()
             inner = {}
             try:
                 inner = exif.get_ifd(_EXIF_IFD)

@@ -734,6 +734,25 @@ class DiagnosticBundleTests(TempCase):
         # words in front of it.
         self.assertEqual("keep this //.", logsetup.redact_text("keep this //."))
 
+    def test_a_mac_folder_name_with_a_colon_is_masked_to_the_end(self):
+        """The Windows forms stop at a character a Windows name cannot hold,
+        and a Mac folder may be called "Trip: Japan". The rest of the path went
+        out as words, and the mask in front of it kept the POSIX form away."""
+        for line, names in (
+                ("could not read /Users/chen/Trip: Japan/ChenLi.jpg", ("Japan", "ChenLi")),
+                ("could not read ~/Pictures/Wedding: Chen & Li/IMG_1.jpg", ("Chen & Li", "IMG_1")),
+                ("could not read /mnt/photos/Chen|Li/x.jpg", ("Li/x",)),
+                ("could not read /home/chen/What?/ChenLi.jpg", ("ChenLi",))):
+            with self.subTest(line=line):
+                masked = logsetup.redact_text(line)
+                self.assertTrue(masked.startswith("could not read <path drive="), masked)
+                self.assertEqual(1, masked.count("<path "), masked)
+                for name in names:
+                    self.assertNotIn(name, masked)
+        # A path that ends at the colon is still a path and a reason.
+        self.assertTrue(logsetup.redact_text("moved /srv/Keep/a.jpg: denied")
+                        .endswith(": denied"))
+
     def test_a_folder_name_after_a_dot_is_not_reported_as_an_extension(self):
         """``Wedding.ChenLi`` is a folder, and "chenli" is the name in it."""
         for folder, word in ((r"D:\Photos\Wedding.ChenLi", "chenli"),

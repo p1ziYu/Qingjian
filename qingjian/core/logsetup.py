@@ -285,11 +285,40 @@ def _mask_matches(pattern: re.Pattern[str], text: str) -> list[tuple[str, bool]]
             # sentence, and "kept" is where the next piece of it begins.
             index = match.end()
             continue
+        found = _posix_tail(text, match.start(), found)
         pieces.append((text[kept:match.start()], False))
         pieces.append((_mask_path(found), True))
         kept = index = match.start() + len(found)
     pieces.append((text[kept:], False))
     return pieces
+
+
+#: Characters a Windows name may not hold, at which the Windows forms stop.
+_WINDOWS_FORBIDDEN = frozenset(':*?"<>|')
+_POSIX_RUN = re.compile(r"(?:/(?:[^/\x00\r\n]*[^\s/\x00])?)+")
+
+
+def _posix_tail(text: str, start: int, found: str) -> str:
+    """*found*, run on to the end of a POSIX path the Windows forms stopped inside.
+
+    A Mac or Linux folder may be called "Trip: Japan", and the rooted and
+    home-relative forms end at the colon a Windows name could not hold, so the
+    rest of the path went out as words of the sentence -- and, kept from the
+    POSIX form by the mask in front of it, unmasked. A path that goes on past
+    such a character, with a further separator on the same line, is taken to
+    its end; "target: denied" is still a path and a reason.
+    """
+    if "\\" in found or found[:1] not in ("/", "~"):
+        return found
+    end = start + len(found)
+    line_end = text.find("\n", end)
+    rest = text[end:line_end if line_end >= 0 else len(text)]
+    if rest[:1] not in _WINDOWS_FORBIDDEN or "/" not in rest:
+        return found
+    run = _POSIX_RUN.match(text, start + found.index("/"))
+    if run is None or run.end() <= end:
+        return found
+    return _trim_path(text[start:run.end()], text[run.end():run.end() + 1])
 
 
 def redact_text(text: str) -> str:

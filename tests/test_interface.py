@@ -330,6 +330,77 @@ class ProgressHandoverTests(WindowCase):
         self.window._with_progress("work", work)
         self.assertTrue(self.wait_until(lambda: self.engine.source_root == incoming))
 
+    def test_a_folder_reached_through_a_link_is_opened_once(self):
+        """A mapped drive, a subst drive or a junction opens under another spelling.
+
+        The request was only let go once the open folder equalled it as handed
+        over, which a resolved path never does: the folder was scanned again
+        and again, the cursor snapping back to the first photograph each time.
+        """
+        from PIL import Image
+        real = self.tmp / "nas" / "photos"
+        real.mkdir(parents=True)
+        Image.new("RGB", (32, 32)).save(real / "N_0.JPG")
+        link = self.tmp / "Z_drive"
+        try:
+            link.symlink_to(self.tmp / "nas", target_is_directory=True)
+        except OSError:
+            self.skipTest("this account cannot make a symbolic link")
+        with mock.patch.object(self.engine, "open_folder",
+                               wraps=self.engine.open_folder) as opened:
+            self.window.open_requested(str(link / "photos"))
+            QTest.qWait(300)
+        self.assertEqual(1, opened.call_count)
+        self.assertEqual(real.resolve(), self.engine.source_root)
+        self.assertIsNone(self.window._pending_open)
+
+    def test_a_handed_over_folder_that_cannot_be_read_is_reported_once(self):
+        """A failed open answers the hand-over; it used to come back with every F5."""
+        from qingjian.core import scanner
+        locked = self.tmp / "locked"
+        locked.mkdir()
+        reported: list = []
+        self.patch(self.window, "_report", reported.append)
+        real_scan = scanner.scan
+
+        def scan(root, *args, **kwargs):
+            if Path(root) == locked.resolve():
+                raise PermissionError(13, "Access is denied", str(root))
+            return real_scan(root, *args, **kwargs)
+
+        self.patch(scanner, "scan", scan)
+        self.window.open_requested(str(locked))
+        QTest.qWait(100)
+        for _ in range(3):
+            self.window.rescan()
+            QTest.qWait(50)
+        self.assertEqual(1, len(reported))
+        self.assertIsNone(self.window._pending_open)
+        self.assertEqual(self.source, self.engine.source_root)
+
+    def test_a_folder_handed_over_during_a_prompt_opens_when_it_closes(self):
+        """Only some prompts looked for a parked hand-over once they closed.
+
+        After the rename prompt it waited for some unrelated scan or dialog
+        much later, and then swapped the folder out from under the user.
+        """
+        incoming = self.tmp / "incoming"
+        incoming.mkdir()
+
+        def prompt(*_args, **_kwargs):
+            with mock.patch.object(QApplication, "activeModalWidget", return_value=self.window):
+                self.window.open_requested(str(incoming))
+                QTest.qWait(250)
+                self.assertEqual(self.source, self.engine.source_root,
+                                 "opened behind the prompt")
+            return "", False
+
+        with mock.patch("qingjian.ui.mainwindow.get_text", prompt):
+            self.window.rename_current()
+        self.until(lambda: self.engine.source_root == incoming,
+                   "the hand-over was parked after the prompt closed", timeout=3.0)
+        self.assertIsNone(self.window._pending_open)
+
 
 class BusyShortcutTests(WindowCase):
     def test_posted_shortcuts_do_not_open_dialogs_during_progress(self):
@@ -1560,6 +1631,33 @@ class BackgroundQueueTests(WindowCase):
         drain.assert_called_once_with()
         self.assertEqual([0], pending, "the window closed over a queued move")
         self.assertTrue((self.keep / current.name).exists())
+
+    def test_closing_while_a_key_waits_for_the_queue_closes_after_the_wait(self):
+        """A close asked for while S waited for the queue was put off, not done.
+
+        Only a progress dialog looked at it afterwards, so the window shut at
+        some later scan instead, in the middle of whatever the user was doing.
+        """
+        import threading
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        real = self.engine.store._run_step
+
+        def slow(*args, **kwargs):
+            gate.wait(10)
+            return real(*args, **kwargs)
+
+        self.patch(self.engine.store, "_run_step", slow)
+        skipped: list = []
+        self.patch(self.engine, "skip", skipped.append)
+        self.window.classify_index(0)
+        QTimer.singleShot(50, self.window.close)
+        QTimer.singleShot(150, gate.set)
+        self.window.skip_current()
+        self.until(lambda: not self.window.isVisible(), "the close request was dropped",
+                   timeout=3.0)
+        self.assertFalse(self.window._close_requested)
+        self.assertEqual([], skipped, "the skip went ahead behind a closing window")
 
 
 @unittest.skipUnless(HAVE_QT, "PySide6 is not installed")

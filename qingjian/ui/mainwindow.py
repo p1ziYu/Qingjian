@@ -885,22 +885,23 @@ class MainWindow(QMainWindow):
         if folder:
             self.open_folder(Path(folder))
 
-    def open_folder(self, folder: Path, restore: bool = False) -> None:
+    def open_folder(self, folder: Path, restore: bool = False) -> bool:
+        """Scan *folder* onto the counter. False only when the scan never started."""
         if self._busy:
-            return
+            return False
         if not self._drain_queue():
-            return
+            return False
         try:
             self._with_progress(tr("scan.scanning"),
                                 lambda progress, cancel: self.engine.open_folder(
                                     folder, progress, cancel))
         except Cancelled:
             self._after_queue_change("")
-            return
+            return True
         except Exception as error:      # noqa: BLE001 - report every scan failure
             self._report(error)
             self._after_queue_change("")
-            return
+            return True
         self.preloader.clear()
         self._conflict_defaults.clear()
         self._update_slip()
@@ -908,6 +909,7 @@ class MainWindow(QMainWindow):
         if restore and self.settings.last_path:
             self.engine.go_to(self.settings.last_path)
         self._after_queue_change(tr("scan.complete", count=len(self.engine.all_files)))
+        return True
 
     def rescan(self) -> None:
         if self._busy or not self.engine.source_root:
@@ -2024,6 +2026,14 @@ class MainWindow(QMainWindow):
                 dialog.close()
                 dialog.deleteLater()
             self._busy = was_busy
+        if not was_busy and self._close_requested:
+            # The window was asked to close while this waited. Only a progress
+            # dialog used to look at that afterwards, so the window closed at
+            # some later scan instead. Closing comes first, and whatever the
+            # wait was for is not started behind it.
+            self._close_requested = False
+            QTimer.singleShot(0, self.close)
+            return False
         return not self.engine.queue.pending
 
     def _transition(self, action, message: str) -> None:
@@ -2365,15 +2375,22 @@ class MainWindow(QMainWindow):
             self._open_pending()
 
     def _open_pending(self) -> None:
-        if (self._pending_open is None or self._busy or
-                QApplication.activeModalWidget() is not None):
+        if self._pending_open is None or self._closed:
             return
-        if self.engine.queue.pending:
-            self._schedule_open_pending(50)
+        if (self._busy or self.engine.queue.pending or
+                QApplication.activeModalWidget() is not None or
+                QApplication.activePopupWidget() is not None):
+            # Something else holds the window. Only some prompts looked for a
+            # parked hand-over when they closed, so it fired at an unrelated
+            # moment much later; asking again shortly opens it right after.
+            self._schedule_open_pending(100)
             return
         target = self._pending_open
-        self.open_folder(target)
-        if self._pending_open == target and self.engine.source_root == target:
+        # A scan that ran answers the request, whether it opened, failed or was
+        # cancelled. Waiting until the folder on the counter equalled the one
+        # handed over never ended for a mapped drive or a link, which open
+        # under their resolved name, and a failure came back after every F5.
+        if self.open_folder(target) and self._pending_open == target:
             self._pending_open = None
 
     def _schedule_open_pending(self, delay: int = 0) -> None:
@@ -2416,6 +2433,11 @@ class MainWindow(QMainWindow):
             pass
 
     def closeEvent(self, event) -> None:          # noqa: N802 - Qt naming
+        if self._closed:
+            # A close asked for again during the wait below arrives once more
+            # after it; everything has been let go already.
+            event.accept()
+            return
         if self._busy:
             self._close_requested = True
             event.ignore()
@@ -2429,7 +2451,7 @@ class MainWindow(QMainWindow):
             # `wait_idle` alone froze the window for up to half a minute with
             # nothing on screen. Drain the same way undo does, so the last file
             # being moved is visible and the window keeps painting.
-            if not self._drain_queue():
+            if not self._drain_queue() and self.engine.queue.pending:
                 # Still working after the wait: closing here would abandon a
                 # transaction part-way, so let the user decide rather than
                 # deciding for them.

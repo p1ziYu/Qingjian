@@ -808,6 +808,11 @@ class CoarseMtimeTests(TempCase):
                         resolver=lambda _a, _b: ops.CONFLICT_REPLACE)
         engine.undo()
         self.assertEqual(b"o" * 2000, older.read_bytes())
+        # Size and time only: the restore copy holds the bytes, and a hash here
+        # made redo read the whole replaced file again.
+        unlink = next(step for step in engine.state.top("redo").payload["forward"]
+                      if step["kind"] == "unlink")
+        self.assertNotIn("hash", unlink["expect"])
         engine.redo()
         self.assertEqual(b"f" * 3000, older.read_bytes())
         self.assertFalse(photo.exists())

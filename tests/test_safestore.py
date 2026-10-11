@@ -5,7 +5,7 @@ from pathlib import Path
 
 from base import TempCase, unittest
 from qingjian.core import safestore as ss
-from qingjian.core.safestore import (Cancelled, Plan, QuotaPolicy, SafeStore, TransactionError,
+from qingjian.core.safestore import (MOVE, Cancelled, Plan, QuotaPolicy, SafeStore, TransactionError,
                                      VERIFY_FAST, VERIFY_FULL, identity, reclaim_candidates,
                                      step_copy, step_move, step_unlink)
 
@@ -266,6 +266,47 @@ class PrecheckTests(StoreCase):
         self.assertTrue(first.is_file(), "the first member moved although the plan was doomed")
         self.assertTrue(second.is_file())
         self.assertEqual([], self.tree(self.dst))
+
+
+class ForeignFileRollbackTests(StoreCase):
+    def test_a_file_that_turned_up_at_an_unreached_target_is_left_alone(self):
+        """A two-shot move was killed after the first. A file of the same size,
+        a second off in time, then appeared where the second was going. Taken
+        for the move's own copy, rolling back tried to move it back, refused,
+        and left a journal that blocked every later operation."""
+        import os
+        stamp = 1_700_000_000_123_456_789
+        for fast in (True, False):
+            with self.subTest(fast_path=fast):
+                root = self.tmp / ("fast" if fast else "slow")
+                store = SafeStore(root / "data", fast_path=fast)
+                source, keep = root / "s", root / "k"
+                source.mkdir(parents=True)
+                keep.mkdir()
+                for name in ("a.jpg", "a.cr2"):
+                    (source / name).write_bytes(name.encode() * 1000)
+                    os.utime(source / name, ns=(stamp, stamp))
+                forward = [step_move(source / n, keep / n, identity(source / n, VERIFY_FAST))
+                           for n in ("a.jpg", "a.cr2")]
+                real = store._run_step
+
+                def killed(step, *args, **kwargs):
+                    if step["kind"] == MOVE and step["src"].endswith("a.cr2"):
+                        raise KeyboardInterrupt("kill")
+                    return real(step, *args, **kwargs)
+
+                store._run_step = killed
+                with self.assertRaises(BaseException):
+                    store.run(Plan(forward=forward, inverse=SafeStore.invert(forward)))
+                store._run_step = real
+                foreign = keep / "a.cr2"
+                foreign.write_bytes(b"X.CR2" * 1000)
+                os.utime(foreign, ns=(stamp + 1_000_000_000,) * 2)
+                store.abandon(rollback=True)
+                self.assertFalse(store.has_pending())
+                self.assertEqual(b"X.CR2" * 1000, foreign.read_bytes())
+                self.assertEqual(b"a.jpg" * 1000, (source / "a.jpg").read_bytes())
+                self.assertFalse((keep / "a.jpg").exists())
 
 
 class AbandonTests(StoreCase):

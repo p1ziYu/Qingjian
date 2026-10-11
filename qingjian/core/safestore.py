@@ -727,7 +727,13 @@ class SafeStore:
                 # a card's clock may have rounded it, and a run stopped before a
                 # move deleted its source never taught the inverse at all.
                 landed = self._landing(step)
-                if landed is not None:
+                # A move counts only once its source has gone -- or been filled
+                # again by a later step, as undoing a Replace does -- or its copy
+                # has proved the bytes: a file of the right size and time that
+                # turned up at the target is not this run's to move back.
+                if landed is not None and (
+                        step["kind"] == COPY or self._moved_or_copied(step)
+                        or self._landed_later(Path(step["src"]), forward[index + 1:])):
                     step["result"] = landed
                     self._sync_inverse(payload, index, step)
             elif (step["kind"] == WRITE and (step.get("result") or {}).get("hash")
@@ -737,10 +743,8 @@ class SafeStore:
             if self._step_done(step, verify, forward[index + 1:]):
                 done = index + 1
                 continue
-            if (step["kind"] == MOVE
-                    and identity_matches(Path(step["dst"]),
-                                         step.get("result") or step.get("src_id"), VERIFY_FAST)
-                    and Path(step["src"]).exists()):
+            if (step["kind"] == MOVE and Path(step["src"]).exists()
+                    and self._landing(step) is not None and self._moved_or_copied(step)):
                 done = index + 1        # a cross-volume move that copied but could not unlink
             break
         steps = (inverse[len(inverse) - done:] if len(inverse) == len(forward)
@@ -1006,9 +1010,15 @@ class SafeStore:
             if (step["kind"] == MOVE and mirror.get("kind") == MOVE
                     and _path_key(mirror.get("src", "")) == _path_key(step["dst"])):
                 mirror["src_id"] = dict(landed)
-            elif (step["kind"] in (COPY, WRITE) and mirror.get("kind") == UNLINK
+            elif (step["kind"] == COPY and mirror.get("kind") == UNLINK
                     and _path_key(mirror.get("dst", "")) == _path_key(step["dst"])):
                 mirror["expect"] = dict(landed)
+            elif (step["kind"] == WRITE and mirror.get("kind") == UNLINK
+                    and _path_key(mirror.get("dst", "")) == _path_key(step["dst"])):
+                # Size and time, as the plan asked: the restore copy already
+                # holds these bytes, and a hash would make redo read the file.
+                mirror["expect"] = {key: landed[key] for key in ("size", "mtime_ns")
+                                    if key in landed}
 
     def _landed_later(self, dst: Path, later: Sequence[dict],
                       kinds: Sequence[str] = (MOVE, COPY, WRITE)) -> bool:

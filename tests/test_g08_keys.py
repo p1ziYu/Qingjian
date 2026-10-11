@@ -257,6 +257,31 @@ class G08EditorTests(QtCase):
                 dialog._save()
                 self.assertEqual(shown, dialog.result_settings().language)
 
+    def test_an_entry_another_copy_left_goes_when_the_switch_is_turned_off(self):
+        """Such an entry reads as off, so turning the switch off changed nothing
+        and saving left the entry in Explorer; it took on, save, off, save."""
+        from types import SimpleNamespace
+        from test_config_logging import FakeRegistry
+        from qingjian.core import platform_
+        from qingjian.ui.editors import SettingsDialog
+        from qingjian.ui.widgets import Switch
+        registry = FakeRegistry()
+        self.patch(platform_, "IS_WINDOWS", True)
+        self.patch(platform_, "_registry", lambda _registry=None: registry)
+        engine = SimpleNamespace(data_dir=self.data, backup_usage=lambda: 0)
+        platform_.set_folder_menu(True, "Open with Qingjian", [r"F:\Gone\MediaSorter.exe"])
+        untouched = SettingsDialog(config.Settings(), engine)
+        self.addCleanup(untouched.deleteLater)
+        untouched._save()
+        self.assertTrue(platform_.folder_menu_installed(), "removed without being asked")
+        dialog = SettingsDialog(config.Settings(), engine)
+        self.addCleanup(dialog.deleteLater)
+        switch = dialog._control("folder_menu", Switch)
+        switch.setChecked(True)
+        switch.setChecked(False)
+        dialog._save()
+        self.assertFalse(platform_.folder_menu_installed())
+
     def test_saving_with_the_folder_menu_on_repairs_an_entry_another_copy_left(self):
         """A portable folder that moved leaves Explorer's entry starting a
         program that is gone. The switch read it as on, and saving with it on

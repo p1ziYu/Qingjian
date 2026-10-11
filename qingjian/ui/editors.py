@@ -532,9 +532,15 @@ class SettingsDialog(QDialog):
             # on writes it afresh.
             self._folder_menu_command = self._open_with_command()
             self._folder_menu_was = platform_.folder_menu_installed(self._folder_menu_command)
+            # Such an entry reads as off, so turning the switch off left it in
+            # place; one turned on and off again here is asked to go.
+            self._folder_menu_stale = (not self._folder_menu_was
+                                       and platform_.folder_menu_installed())
+            self._folder_menu_touched = False
+            switch = self._switch("folder_menu", self._folder_menu_was)
+            switch.toggled.connect(lambda _on: setattr(self, "_folder_menu_touched", True))
             card.add_row(SettingRow(
-                tr("settings.folder_menu"), tr("settings.folder_menu.desc"),
-                self._switch("folder_menu", self._folder_menu_was)))
+                tr("settings.folder_menu"), tr("settings.folder_menu.desc"), switch))
         layout.addWidget(card)
         layout.addStretch(1)
         return page
@@ -742,7 +748,10 @@ class SettingsDialog(QDialog):
             hide_from_queue=self._control("sidecar_hide", Switch).isChecked())
 
         menu = self._controls.get("folder_menu")
-        if isinstance(menu, Switch) and menu.isChecked() != self._folder_menu_was:
+        if isinstance(menu, Switch) and (
+                menu.isChecked() != self._folder_menu_was
+                or (not menu.isChecked() and self._folder_menu_stale
+                    and self._folder_menu_touched)):
             try:
                 platform_.set_folder_menu(menu.isChecked(), tr("app.open_with"),
                                           self._folder_menu_command)

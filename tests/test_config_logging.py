@@ -765,9 +765,16 @@ class DiagnosticBundleTests(TempCase):
                 self.assertEqual(1, masked.count("<path "), masked)
                 for name in names:
                     self.assertNotIn(name, masked)
-        # A path that ends at the colon is still a path and a reason.
+        # A path that ends at the colon is still a path and a reason, even with
+        # another path after it.
         self.assertTrue(logsetup.redact_text("moved /srv/Keep/a.jpg: denied")
                         .endswith(": denied"))
+        line = logsetup.redact_text("cannot read /srv/ann/a.png: [Errno 2] No such file "
+                                    "or directory: '/srv/ann/a.png'")
+        self.assertIn(": [Errno 2] No such file or directory: '<path", line)
+        self.assertEqual(2, line.count("<path "), line)
+        line = logsetup.redact_text("move /srv/a.jpg: permission denied, retry with /srv/b")
+        self.assertIn(": permission denied, retry with <path", line)
 
     def test_a_folder_name_after_a_dot_is_not_reported_as_an_extension(self):
         """``Wedding.ChenLi`` is a folder, and "chenli" is the name in it."""

@@ -296,6 +296,8 @@ def _mask_matches(pattern: re.Pattern[str], text: str) -> list[tuple[str, bool]]
 #: Characters a Windows name may not hold, at which the Windows forms stop.
 _WINDOWS_FORBIDDEN = frozenset(':*?"<>|')
 _POSIX_RUN = re.compile(r"(?:/(?:[^/\x00\r\n]*[^\s/\x00])?)+")
+#: What stands before a path that begins afresh rather than one that goes on.
+_PATH_OPENERS = frozenset(" \t'\"([{<=,;")
 
 
 def _posix_tail(text: str, start: int, found: str) -> str:
@@ -305,15 +307,19 @@ def _posix_tail(text: str, start: int, found: str) -> str:
     home-relative forms end at the colon a Windows name could not hold, so the
     rest of the path went out as words of the sentence -- and, kept from the
     POSIX form by the mask in front of it, unmasked. A path that goes on past
-    such a character, with a further separator on the same line, is taken to
-    its end; "target: denied" is still a path and a reason.
+    such a character into a further name on the same line is taken to its
+    end; "target: denied" is still a path and a reason, and so is
+    "a.png: No such file: '/home/...'".
     """
     if "\\" in found or found[:1] not in ("/", "~"):
         return found
     end = start + len(found)
     line_end = text.find("\n", end)
     rest = text[end:line_end if line_end >= 0 else len(text)]
-    if rest[:1] not in _WINDOWS_FORBIDDEN or "/" not in rest:
+    slash = rest.find("/")
+    # The separator has to carry on a name -- "Japan/" -- not start a path of
+    # its own after a space or a quote, as in "...: No such file: '/home/...".
+    if rest[:1] not in _WINDOWS_FORBIDDEN or slash < 1 or rest[slash - 1] in _PATH_OPENERS:
         return found
     run = _POSIX_RUN.match(text, start + found.index("/"))
     if run is None or run.end() <= end:

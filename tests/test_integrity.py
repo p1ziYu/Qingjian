@@ -502,9 +502,11 @@ class CopyThenDeleteTests(TempCase):
     what a source held open by another program leaves, and it must be finishable.
     """
 
-    def stopped_before_the_delete(self):
+    def stopped_before_the_delete(self, replacing: bytes = b""):
         source, keep = self.tmp / "lib", self.tmp / "keep"
         photo = self.write(source / "IMG_1.JPG", b"x" * 5000)
+        if replacing:
+            self.write(keep / "IMG_1.JPG", replacing)
         settings = config.Settings()
         settings.logging_enabled = False
         settings.fast_path = False
@@ -526,7 +528,8 @@ class CopyThenDeleteTests(TempCase):
         safestore._unlink_source = locked_once
         self.addCleanup(setattr, safestore, "_unlink_source", real)
         with self.assertRaises(TransactionError):
-            engine.classify(config.Binding(key="1", action="move", folder=str(keep)), photo)
+            engine.classify(config.Binding(key="1", action="move", folder=str(keep)), photo,
+                            resolver=lambda _a, _b: ops.CONFLICT_REPLACE)
         self.assertTrue(engine.has_pending())
         self.assertTrue(photo.is_file())
         self.assertTrue((keep / "IMG_1.JPG").is_file())
@@ -545,6 +548,29 @@ class CopyThenDeleteTests(TempCase):
         self.assertFalse(engine.has_pending())
         self.assertEqual(b"x" * 5000, photo.read_bytes())
         self.assertFalse(moved.exists())
+
+
+    def test_a_replace_stopped_there_recovers(self):
+        """The delete of the replaced file ran before the copy, and with the copy
+        now in its place it read as a file changed under the transaction:
+        recovery failed for good."""
+        engine, photo, moved = self.stopped_before_the_delete(b"old" * 3000)
+        engine.recover()
+        self.assertFalse(engine.has_pending())
+        self.assertFalse(photo.exists())
+        self.assertEqual(b"x" * 5000, moved.read_bytes())
+        engine.undo()
+        self.assertEqual(b"x" * 5000, photo.read_bytes())
+        self.assertEqual(b"old" * 3000, moved.read_bytes())
+
+    def test_a_replace_stopped_there_rolls_back_to_the_replaced_file(self):
+        """Taken for a run that had done nothing, rolling it back undid nothing
+        and then discarded the restore copy: the replaced file was gone."""
+        engine, photo, moved = self.stopped_before_the_delete(b"old" * 3000)
+        engine.abandon_pending(rollback=True)
+        self.assertFalse(engine.has_pending())
+        self.assertEqual(b"x" * 5000, photo.read_bytes())
+        self.assertEqual(b"old" * 3000, moved.read_bytes())
 
 
 @unittest.skipUnless(sys.platform == "win32", "read-only only blocks deletion on Windows")

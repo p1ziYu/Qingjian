@@ -956,8 +956,7 @@ class SafeStore:
             elif step["kind"] == COPY and mirror.get("kind") == UNLINK:
                 mirror["expect"] = dict(landed)
 
-    @staticmethod
-    def _landed_later(dst: Path, later: Sequence[dict],
+    def _landed_later(self, dst: Path, later: Sequence[dict],
                       kinds: Sequence[str] = (MOVE, COPY, WRITE)) -> bool:
         """Did a later step already put its own file at *dst*?
 
@@ -981,8 +980,33 @@ class SafeStore:
                 return bool(restored.get("hash")) and identity_matches(dst, restored, VERIFY_FULL)
             if not identity_matches(dst, step.get("result") or step.get("src_id"), VERIFY_FAST):
                 return False
-            return step["kind"] != MOVE or not Path(step["src"]).exists()
+            return step["kind"] != MOVE or self._moved_or_copied(step)
         return False
+
+    def _moved_or_copied(self, step: dict) -> bool:
+        """Has this MOVE put its file at its target, even if the source is still there?
+
+        A move that copies -- across volumes, or on one with the fast path off --
+        can land its copy and then fail to delete the source: a viewer holds it
+        open, or the run is killed. Its ``result`` is written only once the copy
+        is in place, so a run that has not reached it yet never passes for one
+        that did, and the copy has to prove it holds the source's bytes. Taken
+        for not having run, a Replace that stopped there could neither be
+        finished nor rolled back, and rolling it back discarded the only copy
+        of the file it replaced.
+        """
+        src, dst = Path(step["src"]), Path(step["dst"])
+        if not src.exists():
+            return True
+        if not step.get("result") or (self.fast_path and same_volume(src, dst.parent)):
+            return False
+        try:
+            if os.path.samefile(src, dst):
+                return False
+        except OSError:
+            return False
+        return (identity_matches(src, step.get("src_id"), VERIFY_FAST)
+                and _same_content(src, dst, step.get("result")))
 
     def _run_step(self, step: dict, verify: str, stage: str, progress: Progress,
                   later: Sequence[dict] = ()) -> bool:

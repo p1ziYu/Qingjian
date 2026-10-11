@@ -362,15 +362,32 @@ def redact_text(text: str) -> str:
     ``/`` and run on through the rest of the line -- "could not move <path
     drive=<path ...>", with the reason the line was logged for gone with it.
     """
-    pieces = [(part, index % 2 == 1) for index, part in enumerate(_split_masks(text))]
-    for name in _account_names():
-        pieces = [(part if masked else re.sub(re.escape(name), ACCOUNT_MASK, part,
-                                              flags=re.IGNORECASE), masked)
-                  for part, masked in pieces]
+    pieces = [(part, True) if index % 2 else (_strike_accounts(part), False)
+              for index, part in enumerate(_split_masks(text))]
     for pattern in _PATTERNS:
         pieces = [piece for part, masked in pieces
                   for piece in ([(part, True)] if masked else _mask_matches(pattern, part))]
     return "".join(part for part, _masked in pieces)
+
+
+def _strike_accounts(text: str) -> str:
+    """*text* with every spelling of the signed-in account put out of sight."""
+    for name in _account_names():
+        text = re.sub(re.escape(name), ACCOUNT_MASK, text, flags=re.IGNORECASE)
+    return text
+
+
+def _mask_path_field(value: str) -> str:
+    """A settings path masked to the tag a log line naming it carries.
+
+    A log line has the account struck out before its paths are masked, and the
+    tag is taken from what is left; a setting masked as it stands was tagged
+    from the account's own name. Every library under ``C:\\Users\\<name>``
+    then carried one tag in the settings and another in the log, and the one
+    thing the tag is for -- following a report from a log line to the folder
+    it is about -- was gone on exactly the machines it was written for.
+    """
+    return _mask_path(_strike_accounts(value)) if value else value
 
 
 def _split_masks(text: str) -> list[str]:
@@ -495,7 +512,7 @@ def _mask_binding(value):
         if key in _TEMPLATE_FIELDS and isinstance(item, str):
             masked[key] = _mask_template(item)
         elif key in _PATH_FIELDS and isinstance(item, str):
-            masked[key] = _mask_path(item) if item else item
+            masked[key] = _mask_path_field(item)
         else:
             masked[key] = redact_json(item)
     return masked
@@ -530,7 +547,7 @@ def redact_settings(data):
         elif key == "current_profile" and isinstance(item, str):
             masked[key] = order.get(item, "preset ?") if item else item
         elif key in _PATH_FIELDS and isinstance(item, str):
-            masked[key] = _mask_path(item) if item else item
+            masked[key] = _mask_path_field(item)
         elif key in _TEMPLATE_FIELDS and isinstance(item, str):
             masked[key] = _mask_template(item)
         else:

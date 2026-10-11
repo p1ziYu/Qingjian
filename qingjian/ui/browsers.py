@@ -414,6 +414,11 @@ class _Browser(QListWidget):
         if not total or not self.isVisible():
             return
         start, end = self.visible_rows()
+        if end + 1 < total and self.visualItemRect(self.item(end + 1)).isNull():
+            # The batched layout has not reached the rest of the screen yet,
+            # and nothing else asks again once it has: no scroll, and no resize
+            # where the scroll bar is always there, never there, or not needed.
+            self._schedule_fetch()
         low, high = viewport.band(start, end, total, _OVERSCAN)
         wanted = [str(self.item(row).data(_ROLE_PATH)) for row in range(low, high + 1)]
         self._tile_room = max(_TILE_LIMIT, len(wanted))

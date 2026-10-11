@@ -573,6 +573,22 @@ class DiagnosticBundleTests(TempCase):
         # Two paths in one sentence stay two masks rather than merging into one.
         self.assertEqual(3, log_text.count("<path "))
 
+    def test_a_library_under_the_account_folder_keeps_one_tag(self):
+        # On Windows the library sits under C:\Users\<account>, and the log
+        # strikes the account out before it masks the path; the settings must
+        # be tagged from the same text or the two never meet.
+        from unittest import mock
+        with mock.patch.object(logsetup, "_account_names", return_value=(self.ACCOUNT,)):
+            self._populate()
+            bundle = logsetup.diagnostic_bundle(self.tmp / "bundle.zip", self.data)
+        with zipfile.ZipFile(bundle) as archive:
+            settings = json.loads(archive.read("settings.json"))
+            log_text = archive.read("logs/qingjian.log").decode("utf-8")
+        tags = re.findall(r"id=[0-9a-f]+", log_text)
+        self.assertIn(re.search(r"id=[0-9a-f]+", settings["source_folder"]).group(0), tags)
+        folder = settings["profiles"][settings["current_profile"]][0]["folder"]
+        self.assertIn(re.search(r"id=[0-9a-f]+", folder).group(0), tags)
+
     def test_the_settings_page_lists_exactly_what_the_zip_contains(self):
         self._populate()
         bundle = logsetup.diagnostic_bundle(self.tmp / "bundle.zip", self.data)

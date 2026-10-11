@@ -199,7 +199,10 @@ def run(argv: list[str] | None = None) -> int:
     argv = argv or []
     keep = "--keep" in argv
     RESULTS.clear()
-    workspace = Path(tempfile.mkdtemp(prefix="qingjian-selfcheck-"))
+    # %TEMP% is often spelled with 8.3 names (C:\Users\JOHNSM~1), and the
+    # engine resolves every folder it opens, so the checks compare its paths
+    # against the long spelling.
+    workspace = Path(tempfile.mkdtemp(prefix="qingjian-selfcheck-")).resolve()
     data = workspace / "data"
     data.mkdir()
     os.environ["QINGJIAN_DATA_DIR"] = str(data)

@@ -967,6 +967,30 @@ class GridProbeTests(QtCase):
         self.assertIn((last, view.edge), cache._wanted)
         self.assertGreaterEqual(view._tile_room, on_screen)
 
+    def test_a_fetch_ahead_of_the_layout_asks_again_once_it_catches_up(self):
+        # Where a scroll bar appears and shrinks the viewport, the resize asks
+        # again; where its room never changes (always shown, never shown, or a
+        # list that fits) nothing did, and the rest of the screen stayed blank.
+        from qingjian.ui.browsers import ThumbnailGrid
+        from qingjian.ui.thumbs import ThumbnailCache
+        cache = ThumbnailCache()
+        self.addCleanup(cache.shutdown)
+        view = ThumbnailGrid(cache)
+        self.addCleanup(view.deleteLater)
+        view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        view.resize(3800, 1900)
+        view.set_show_names(False)
+        view.set_edge(96)
+        view.show()
+        view.set_paths([str(self.tmp / f"img{i:05d}.jpg") for i in range(1000)])
+        view._fetch_timer.stop()
+        view.request_visible()                       # before any batch is laid out
+        cell, port = view.gridSize(), view.viewport()
+        on_screen = max(1, port.width() // cell.width()) * (port.height() // cell.height())
+        last = view.paths()[on_screen - 1]
+        self.until(lambda: (last, view.edge) in cache._wanted,
+                   "the tiles past the first batch were never asked for", timeout=5)
+
 
 @unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
 class FilmstripDecorationTests(QtCase):

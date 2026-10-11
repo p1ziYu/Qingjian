@@ -6,6 +6,8 @@ otherwise. Every path degrades to "we could not tell" rather than raising.
 """
 from __future__ import annotations
 
+import re
+import struct
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -248,27 +250,80 @@ def _apply_exif(info: MediaInfo, tags: dict) -> None:
             break
 
 
+#: ``tiff:Orientation`` in an XMP packet, as an attribute or as an element.
+_XMP_ORIENTATION = re.compile(rb"tiff:Orientation(?:\s*=\s*[\"']|>)\s*([1-8])")
+
+
+def _png_tail(path: Path, Image) -> tuple[object | None, int]:
+    """The eXIf block and XMP orientation a PNG keeps anywhere in the file.
+
+    Pillow reads only the chunks in front of the image data when it opens a
+    PNG, and asking it for the rest decodes the whole picture. A camera app
+    may write eXIf after the data, and an editor may keep the orientation in
+    XMP alone; the thumbnail, which Pillow decodes anyway, turned such a PNG
+    and the preview did not. Walking the chunk headers reads a few bytes per
+    chunk and skips the pixels.
+    """
+    exif, turned = None, 0
+    with open(path, "rb") as stream:
+        if stream.read(8) != b"\x89PNG\r\n\x1a\n":
+            return None, 0
+        for _chunk in range(200_000):
+            header = stream.read(8)
+            if len(header) < 8:
+                break
+            size, kind = struct.unpack(">I4s", header)
+            if kind == b"IEND":
+                break
+            if kind == b"eXIf" and size <= 1 << 20 and exif is None:
+                exif = Image.Exif()
+                exif.load(stream.read(size))
+                stream.seek(4, 1)
+                continue
+            if kind in (b"iTXt", b"tEXt") and size <= 1 << 20:
+                text = stream.read(size)
+                if text.startswith(b"XML:com.adobe.xmp") and not turned:
+                    found = _XMP_ORIENTATION.search(text)
+                    turned = int(found.group(1)) if found else 0
+                stream.seek(4, 1)
+                continue
+            stream.seek(size + 4, 1)
+    return exif, turned
+
+
+def _exif_tags(exif, ExifTags) -> dict:
+    tags = {ExifTags.TAGS.get(t, str(t)): v for t, v in dict(exif).items()}
+    try:
+        inner = cast(Any, exif).get_ifd(0x8769)
+        tags.update({ExifTags.TAGS.get(t, str(t)): v for t, v in inner.items()})
+    except (KeyError, ValueError, TypeError, AttributeError):
+        pass
+    return tags
+
+
 def _read_image(info: MediaInfo) -> None:
     Image, ExifTags = _pillow()
     if Image is None:
         return
     try:
+        turned = 0
         with Image.open(info.path) as image:
             info.width, info.height = image.size
             info.fmt = image.format or ""
             info.frames = getattr(image, "n_frames", 1)
             try:
-                exif = image.getexif() if image.format != "PNG" or "exif" in image.info else {}
-                tags = {ExifTags.TAGS.get(t, str(t)): v for t, v in dict(exif).items()}
-                try:
-                    inner = cast(Any, exif).get_ifd(0x8769)
-                    tags.update({ExifTags.TAGS.get(t, str(t)): v for t, v in inner.items()})
-                except (KeyError, ValueError, TypeError, AttributeError):
-                    pass
+                if image.format != "PNG" or "exif" in image.info:
+                    tags = _exif_tags(image.getexif(), ExifTags)
+                else:
+                    late, turned = _png_tail(info.path, Image)
+                    tags = _exif_tags(late, ExifTags) if late is not None else {}
             except Exception:
                 tags = {}
         if tags:
             _apply_exif(info, tags)
+        if turned and "Orientation" not in tags:
+            # Where eXIf says nothing, Pillow takes XMP's word, and so do we.
+            info.orientation = turned
     except Exception as error:
         info.error = str(error)
         info.transient = _transient(error)

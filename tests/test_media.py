@@ -1166,6 +1166,39 @@ class PreviewDecodeTests(TempCase):
                     self.corners(expected.size,
                                  lambda point: image.pixelColor(*point).getRgb()[:3]))
 
+    def test_a_png_turned_after_its_pixels_or_in_xmp_alone_shows_turned(self):
+        """Pillow reads a PNG's chunks only up to its pixels, and the eXIf a
+        camera app writes after them, or an orientation kept in XMP alone, went
+        unseen: the thumbnail turned the picture and the preview did not."""
+        from PIL import PngImagePlugin
+        picture = Image.new("RGB", (100, 60), "blue")
+        exif = Image.Exif()
+        exif[0x0112] = 6
+        early = self.tmp / "early.png"
+        picture.save(early, exif=exif.tobytes())
+        data, at, chunks = early.read_bytes(), 8, []
+        while at < len(data):
+            size = struct.unpack(">I", data[at:at + 4])[0]
+            chunks.append(data[at:at + 12 + size])
+            at += 12 + size
+        late = self.write(self.tmp / "late.png", data[:8] + b"".join(
+            [c for c in chunks if c[4:8] != b"eXIf"][:-1]
+            + [c for c in chunks if c[4:8] == b"eXIf"] + chunks[-1:]))
+        xmp = self.tmp / "xmp.png"
+        text = PngImagePlugin.PngInfo()
+        text.add_itxt("XML:com.adobe.xmp",
+                      '<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/'
+                      '1999/02/22-rdf-syntax-ns#"><rdf:Description xmlns:tiff="http://ns.adobe.com'
+                      '/tiff/1.0/" tiff:Orientation="6"/></rdf:RDF></x:xmpmeta>')
+        picture.save(xmp, pnginfo=text)
+        for path in (late, xmp):
+            with self.subTest(path=path.name):
+                metadata.clear_cache()
+                self.assertEqual(6, metadata.read(path).orientation)
+                image, _error = preview.decode_qimage(path, QSize(1400, 1000))
+                self.assertEqual((60, 100), (image.width(), image.height()))
+                self.assertEqual((60, 100), imaging.thumbnail(path, (320, 320)).size)
+
     def test_a_16_bit_greyscale_thumbnail_is_scaled_not_clipped(self):
         """Pillow clips wide greyscale into eight bits, so a 16-bit scan's
         thumbnail came out almost white while the preview was right."""

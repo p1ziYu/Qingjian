@@ -6,8 +6,10 @@ of failing to start.
 """
 from __future__ import annotations
 
-from pathlib import Path
+import math
+import struct
 import threading
+from pathlib import Path
 
 from .logsetup import get_logger
 
@@ -35,21 +37,52 @@ def available() -> bool:
     return _av() is not None
 
 
+def _upright(frame) -> list:
+    """The turns and mirrors that show *frame* the way it was recorded.
+
+    A phone held upright stores its frames on their side, with a display matrix
+    that turns them. PyAV's ``rotation`` reads only the turn, and a mirrored
+    matrix -- some front cameras and editing apps write one -- comes out of it
+    as half a turn, so a mirrored clip stood upside down. The matrix is read
+    the way ffmpeg's own autorotate reads it: the angle first, then the signs
+    that say whether it also mirrors.
+    """
+    from PIL import Image  # noqa: PLC0415 - PyAV already needs Pillow here
+    turn = Image.Transpose
+    matrix = None
+    try:
+        for data in frame.side_data:
+            if "DISPLAYMATRIX" in str(data.type).upper():
+                matrix = struct.unpack("<9i", bytes(data)[:36])
+                break
+    except (AttributeError, TypeError, ValueError, struct.error):
+        matrix = None
+    try:
+        if matrix is None:
+            theta = round(-float(getattr(frame, "rotation", 0) or 0)) % 360
+            return {90: [turn.ROTATE_270], 180: [turn.ROTATE_180],
+                    270: [turn.ROTATE_90]}.get(theta, [])
+        theta = round(math.degrees(math.atan2(matrix[1], matrix[0]))) % 360
+    except (TypeError, ValueError, OverflowError):
+        return []
+    a, c, d = matrix[0], matrix[3], matrix[4]
+    if theta == 90:
+        return [turn.TRANSPOSE if c > 0 else turn.ROTATE_270]
+    if theta == 180:
+        return ([turn.FLIP_LEFT_RIGHT] if a < 0 else []) + ([turn.FLIP_TOP_BOTTOM] if d < 0 else [])
+    if theta == 270:
+        return [turn.TRANSVERSE if c < 0 else turn.ROTATE_90]
+    if theta == 0 and d < 0:
+        return [turn.FLIP_TOP_BOTTOM]
+    return []
+
+
 def _to_pil(frame, max_width: int = 2560):
     width = min(max_width, frame.width)
     height = max(1, round(frame.height * width / frame.width))
     image = frame.reformat(width=width, height=height, format="rgb24").to_image()
-    # A phone held upright stores its frames on their side and a display matrix
-    # that turns them. PyAV reports that turn counter-clockwise, so an upright
-    # iPhone clip reads -90: a quarter turn clockwise to show it as recorded.
-    try:
-        turn = round(float(getattr(frame, "rotation", 0) or 0) / 90) % 4
-    except (TypeError, ValueError, OverflowError):
-        turn = 0
-    if turn:
-        from PIL import Image  # noqa: PLC0415 - PyAV already needs Pillow here
-        image = image.transpose((Image.Transpose.ROTATE_90, Image.Transpose.ROTATE_180,
-                                 Image.Transpose.ROTATE_270)[turn - 1])
+    for step in _upright(frame):
+        image = image.transpose(step)
     return image
 
 

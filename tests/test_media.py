@@ -865,7 +865,8 @@ class G09MediaTests(TempCase):
 
 
 class VideoRotationTests(TempCase):
-    def portrait_clip(self):
+    def portrait_clip(self, matrix=(0, 0x10000, 0, -0x10000, 0, 0, 0, 0, 0x40000000),
+                      name: str = "portrait.mp4"):
         """A clip coded landscape whose track header says "turn me clockwise".
 
         That is how a phone held upright records: the sensor writes the frames
@@ -874,7 +875,7 @@ class VideoRotationTests(TempCase):
         av = video._av()
         if av is None or "mpeg4" not in av.codecs_available:
             self.skipTest("PyAV with an MPEG-4 encoder is not installed")
-        path = self.tmp / "portrait.mp4"
+        path = self.tmp / name
         with av.open(str(path), "w") as container:
             stream = container.add_stream("mpeg4", rate=25)
             stream.width, stream.height, stream.pix_fmt = 64, 48, "yuv420p"
@@ -889,7 +890,7 @@ class VideoRotationTests(TempCase):
                 container.mux(packet)
         data = path.read_bytes()
         identity = struct.pack(">9i", 0x10000, 0, 0, 0, 0x10000, 0, 0, 0, 0x40000000)
-        turned = struct.pack(">9i", 0, 0x10000, 0, -0x10000, 0, 0, 0, 0, 0x40000000)
+        turned = struct.pack(">9i", *matrix)
         at = data.index(identity, data.index(b"tkhd"))
         path.write_bytes(data[:at] + turned + data[at + len(turned):])
         return path
@@ -905,6 +906,18 @@ class VideoRotationTests(TempCase):
             # Turned clockwise, the stored top-left corner is now the top-right.
             self.assertGreater(image.getpixel((image.width - 5, 4))[0], 200)
             self.assertLess(image.getpixel((4, 4))[0], 50)
+
+
+    def test_a_mirrored_clip_is_mirrored_not_turned_over(self):
+        """PyAV reads a mirroring matrix as half a turn, and the clip stood on
+        its head; it is the left and right that change places."""
+        path = self.portrait_clip((-0x10000, 0, 0, 0, 0x10000, 0, 0, 0, 0x40000000),
+                                  "mirrored.mp4")
+        image = video.cover(path)
+        self.assertEqual((64, 48), image.size)
+        self.assertGreater(image.getpixel((image.width - 5, 4))[0], 200)
+        self.assertLess(image.getpixel((image.width - 5, image.height - 5))[0], 50)
+        self.assertLess(image.getpixel((4, 4))[0], 50)
 
 
 class RawLayoutTests(TempCase):

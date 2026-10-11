@@ -111,6 +111,31 @@ class G11UndoStateTests(TempCase):
         self.assertEqual((4, 1), engine.reclaim(force=True))
         self.assertFalse(snapshot.exists())
 
+    def test_reclaiming_retires_the_records_before_deleting_their_copies(self):
+        """A failure in between may leak a restore copy, never leave an undo with nothing behind it."""
+        from qingjian.core.safestore import QuotaPolicy
+        photo = self.write(self.tmp / "src" / "one.jpg", b"one" * 100)
+        engine = Engine(self.data, config.Settings())
+        self.addCleanup(engine.close)
+        engine.trash(photo, allow_system=False)
+        kept = engine.state.top("history").snapshots
+        self.assertTrue(kept and all(Path(ref).is_file() for ref in kept))
+        engine.settings.quota = QuotaPolicy(max_operations=0, max_bytes=1,
+                                             max_days=0, automatic=False)
+
+        def locked(ids):
+            raise sqlite3.OperationalError("database is locked")
+
+        engine.state.retire = locked
+        with self.assertRaises(sqlite3.OperationalError):
+            engine.reclaim(force=True)
+        del engine.state.retire
+        self.assertTrue(engine.can_undo())
+        self.assertTrue(all(Path(ref).is_file() for ref in kept),
+                        "the recycled photo was deleted while its undo stayed offered")
+        engine.undo()
+        self.assertEqual(b"one" * 100, photo.read_bytes())
+
 
 
 class TagWithoutQueueLockTests(TempCase):

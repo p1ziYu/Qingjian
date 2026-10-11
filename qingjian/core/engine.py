@@ -1059,8 +1059,11 @@ class Engine:
         for index in drop:
             refs.extend(records[index].snapshots)
             ids.append(records[index].id)
-        freed = self.store.discard_snapshots(refs)
+        # The records stop being undoable before their files go, as `StateStore.apply`
+        # does it: a failure in between leaks disk, never an undo with nothing behind
+        # it -- and for a recycled photo that copy is the photo itself.
         self.state.retire(ids)
+        freed = self.store.discard_snapshots(refs)
         log.info("reclaimed %d bytes from %d records", freed, len(ids))
         return (freed, len(ids))
 

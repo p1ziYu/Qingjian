@@ -943,6 +943,35 @@ class FarDateTests(TempCase):
         self.assertEqual(3, len(engine.queue_paths))
 
 
+class LockedCaptureTimeTests(TempCase):
+    def test_a_capture_time_read_from_a_locked_file_is_not_remembered(self):
+        """A photo locked once while the folder was sorted kept its mtime as
+        its capture date in the cache until the file next changed."""
+        from unittest import mock
+        from qingjian.core import metadata
+        src = self.tmp / "src"
+        path = src / "A.JPG"
+        src.mkdir()
+        exif = Image.Exif()
+        exif.get_ifd(0x8769)[0x9003] = "2015:07:04 12:00:00"
+        Image.new("RGB", (64, 64)).save(path, exif=exif)
+        engine = Engine(self.data, config.Settings())
+        self.addCleanup(engine.close)
+
+        def locked(*_args, **_kwargs):
+            raise PermissionError(13, "being used by another process")
+
+        metadata.clear_cache()
+        with mock.patch.object(Image, "open", locked):
+            self.assertEqual(engine.warm_capture_times([path]), {})
+            self.assertAlmostEqual(path.stat().st_mtime, engine.capture_time(path), places=3)
+        self.assertIsNone(engine.cache.get(path, "captured"))
+        metadata.clear_cache()
+        taken = datetime(2015, 7, 4, 12).timestamp()
+        self.assertEqual(taken, engine.capture_time(path))
+        self.assertEqual(taken, engine.cache.get(path, "captured"))
+
+
 class RescanTests(TempCase):
     def test_a_cancelled_rescan_leaves_the_lists_as_they_were(self):
         """Cancelling while the queue was rebuilt kept the new file list.

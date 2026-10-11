@@ -199,7 +199,12 @@ class Engine:
         cached = self.cache.get(path, "captured")
         if cached is not None:
             return float(cached)
-        value = metadata.capture_time(path)
+        value = metadata.capture_time(path, strict=True)
+        if value is None:
+            # Locked or not yet downloaded just now: sort it by its mtime this
+            # time, but do not remember that, or it keeps the wrong date until
+            # the file is next edited.
+            return float(metadata.capture_time(path) or 0.0)
         self.cache.put(path, captured=float(value))
         return value
 
@@ -231,7 +236,9 @@ class Engine:
 
         def timestamp(path: Path) -> float:
             quick = metadata.capture_only(path)
-            return quick if quick is not None else metadata.capture_time(path)
+            # None for a file that could not be read just now; it is left out
+            # here, and the sort asks `capture_time`, which does not store it.
+            return quick if quick is not None else metadata.capture_time(path, strict=True)
 
         # One thread on purpose. Parsing EXIF is mostly Python holding the
         # interpreter lock, so a pool made this measurably slower, not faster.

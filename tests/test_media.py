@@ -859,3 +859,49 @@ class G09MediaTests(TempCase):
                 gray = imaging._gray_array(path, 64)
                 self.assertEqual(0.0, float(gray.min()))
                 self.assertEqual(255.0, float(gray.max()))
+
+
+# Media decoding, raw layout, metadata and preview regressions.
+
+
+class VideoRotationTests(TempCase):
+    def portrait_clip(self):
+        """A clip coded landscape whose track header says "turn me clockwise".
+
+        That is how a phone held upright records: the sensor writes the frames
+        on their side and the display matrix in ``tkhd`` turns them for showing.
+        """
+        av = video._av()
+        if av is None or "mpeg4" not in av.codecs_available:
+            self.skipTest("PyAV with an MPEG-4 encoder is not installed")
+        path = self.tmp / "portrait.mp4"
+        with av.open(str(path), "w") as container:
+            stream = container.add_stream("mpeg4", rate=25)
+            stream.width, stream.height, stream.pix_fmt = 64, 48, "yuv420p"
+            for number in range(5):
+                pixels = np.zeros((48, 64, 3), dtype=np.uint8)
+                pixels[:16, :16] = 255                  # a marker in the stored top-left
+                frame = av.VideoFrame.from_ndarray(pixels, format="rgb24")
+                frame.pts = number
+                for packet in stream.encode(frame):
+                    container.mux(packet)
+            for packet in stream.encode():
+                container.mux(packet)
+        data = path.read_bytes()
+        identity = struct.pack(">9i", 0x10000, 0, 0, 0, 0x10000, 0, 0, 0, 0x40000000)
+        turned = struct.pack(">9i", 0, 0x10000, 0, -0x10000, 0, 0, 0, 0, 0x40000000)
+        at = data.index(identity, data.index(b"tkhd"))
+        path.write_bytes(data[:at] + turned + data[at + len(turned):])
+        return path
+
+    def test_a_portrait_phone_clip_is_decoded_upright(self):
+        """The grid poster and a stepped frame used to come out on their side."""
+        path = self.portrait_clip()
+        self.assertEqual(90, metadata.read(path, use_cache=False).rotation)
+        poster = video.cover(path)
+        stepped, _when = video.frame_at(path, 0.0, 1)
+        for image in (poster, stepped):
+            self.assertEqual((48, 64), image.size)
+            # Turned clockwise, the stored top-left corner is now the top-right.
+            self.assertGreater(image.getpixel((image.width - 5, 4))[0], 200)
+            self.assertLess(image.getpixel((4, 4))[0], 50)

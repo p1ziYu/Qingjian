@@ -38,7 +38,19 @@ def available() -> bool:
 def _to_pil(frame, max_width: int = 2560):
     width = min(max_width, frame.width)
     height = max(1, round(frame.height * width / frame.width))
-    return frame.reformat(width=width, height=height, format="rgb24").to_image()
+    image = frame.reformat(width=width, height=height, format="rgb24").to_image()
+    # A phone held upright stores its frames on their side and a display matrix
+    # that turns them. PyAV reports that turn counter-clockwise, so an upright
+    # iPhone clip reads -90: a quarter turn clockwise to show it as recorded.
+    try:
+        turn = round(float(getattr(frame, "rotation", 0) or 0) / 90) % 4
+    except (TypeError, ValueError, OverflowError):
+        turn = 0
+    if turn:
+        from PIL import Image  # noqa: PLC0415 - PyAV already needs Pillow here
+        image = image.transpose((Image.Transpose.ROTATE_90, Image.Transpose.ROTATE_180,
+                                 Image.Transpose.ROTATE_270)[turn - 1])
+    return image
 
 
 def frame_at(path: str | Path, position_seconds: float, direction: int = 1,

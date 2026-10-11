@@ -169,13 +169,25 @@ class Engine:
             raise
 
     def rescan(self, progress=_noop, cancel=_never) -> int:
+        """Read the source folder again; on any failure, change nothing.
+
+        Cancelling while the queue was rebuilt used to keep the new file list
+        beside the old queue, so the count and the queue disagreed and the
+        next in-place patch worked from a list the queue was not built from.
+        """
         if not self.source_root:
             return 0
+        previous = (self.all_files, self.queue_paths, self.index)
         self._stem_index.clear()
         metadata.clear_cache()
-        self.all_files = scanner.scan(self.source_root, self.settings.recursive,
-                                      self.settings.target_folders(), progress, cancel)
-        self.rebuild_queue(progress, cancel)
+        try:
+            self.all_files = scanner.scan(self.source_root, self.settings.recursive,
+                                          self.settings.target_folders(), progress, cancel)
+            self.rebuild_queue(progress, cancel)
+        except BaseException:
+            self.all_files, self.queue_paths, self.index = previous
+            self._stem_index.clear()
+            raise
         return len(self.all_files)
 
     def capture_time(self, path: Path) -> float:

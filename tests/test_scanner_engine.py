@@ -848,6 +848,40 @@ class FileListTests(TempCase):
         self.assertEqual([str(renamed)], self.engine.state.review_queue(root))
 
 
+class RescanTests(TempCase):
+    def test_a_cancelled_rescan_leaves_the_lists_as_they_were(self):
+        """Cancelling while the queue was rebuilt kept the new file list.
+
+        The old queue then sat beside a file list it was not built from, and
+        the next patch to either worked from the wrong one.
+        """
+        from unittest import mock
+        src = self.tmp / "src"
+        for name in ("A", "B"):
+            photo(src / f"{name}.JPG")
+        for name in ("X", "Y", "Z"):
+            photo(src / "sub" / f"{name}.JPG")
+        engine = Engine(self.data, config.Settings())
+        self.addCleanup(engine.close)
+        engine.open_folder(src)
+        engine.index = 1
+        files, queue = list(engine.all_files), list(engine.queue_paths)
+        engine.settings.recursive = True
+        scans = []
+        real_scan = scanner.scan
+
+        def scan(*args, **kwargs):
+            scans.append(real_scan(*args, **kwargs))
+            return scans[-1]
+
+        with mock.patch.object(scanner, "scan", scan), self.assertRaises(Cancelled):
+            engine.rescan(cancel=lambda: bool(scans))
+        self.assertEqual(5, len(scans[0]), "the walk itself should have finished")
+        self.assertEqual(files, engine.all_files)
+        self.assertEqual(queue, engine.queue_paths)
+        self.assertEqual(1, engine.index)
+
+
 class ShotRowTests(TempCase):
     """A shot is one row: it leaves the queue as one and comes back as one.
 

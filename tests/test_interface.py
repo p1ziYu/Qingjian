@@ -1414,7 +1414,7 @@ class RuntimeMainWindowContractTests(WindowCase):
              mock.patch.object(self.engine, "absorb") as absorb:
             self.window.rename_current()
         rename.assert_called_once()
-        finish.assert_called_once_with(current, self.engine.index, outcome)
+        finish.assert_called_once_with(current, self.engine.index, outcome, follow=None)
         absorb.assert_not_called()
 
         self.settings.bindings[0].action = "skip"

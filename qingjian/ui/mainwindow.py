@@ -1911,7 +1911,14 @@ class MainWindow(QMainWindow):
                 self._inflight[key] = (entry[0], entry[1] + 1, entry[2])
         return position
 
-    def _finish_operation(self, path: Path, index: int, outcome) -> None:
+    def _finish_operation(self, path: Path, index: int, outcome,
+                          follow: Path | None = None) -> None:
+        """Report a finished operation and patch the views with what it changed.
+
+        *follow* is a file the cursor goes to as soon as the lists hold it, so
+        the views are drawn once, on it, rather than first on whatever slid
+        into the place it left.
+        """
         remembered_replace = path in self._remembered_replace_paths
         self._remembered_replace_paths.discard(path)
         if outcome is None or outcome.cancelled:
@@ -1940,6 +1947,8 @@ class MainWindow(QMainWindow):
             # disk and nowhere on screen.
             change = self.engine.absorb(outcome.record,
                                         unordered=self.settings.background_queue)
+            if follow is not None:
+                self.engine.go_to(follow)
             if change is None and self.settings.background_queue:
                 # The review list is a query. Asked again after every filing it
                 # refilled both views, which threw away the tile picked while
@@ -2108,17 +2117,18 @@ class MainWindow(QMainWindow):
             return
         if released and (outcome is None or outcome.cancelled or outcome.skipped):
             self._refresh_view()
+        # The renamed photo is still the one being looked at. Re-sorted under
+        # its new name it left the neighbour in its place, and the Delete or
+        # key pressed next went to that neighbour.
+        record = getattr(outcome, "record", None)
+        renamed = Path(record.destination) if record is not None and record.destination else None
         # `_finish_operation` owns the absorb in synchronous mode; doing it here
         # as well patched the views twice for one rename.
-        self._finish_operation(path, self.engine.index, outcome)
-        record = getattr(outcome, "record", None)
-        if record is not None and record.destination and self.engine.go_to(record.destination):
-            # The renamed photo is still the one being looked at. Re-sorted
-            # under its new name it left the neighbour in its place, and the
-            # Delete or key pressed next went to that neighbour.
+        self._finish_operation(path, self.engine.index, outcome, follow=renamed)
+        if renamed is not None and self.engine.go_to(renamed):
             if self.view_mode == config.VIEW_GRID:
                 self.grid.clearSelection()
-                self.grid.show_path(record.destination)
+                self.grid.show_path(renamed)
             self._refresh_view()
 
     def trash_current(self) -> None:

@@ -39,6 +39,28 @@ class StateTests(TempCase):
         self.assertEqual({"/a/3.jpg"}, self.state.done_paths())
         self.assertEqual((4, "green"), self.state.tag("/a/1.jpg"))
 
+    def test_a_record_with_a_damaged_payload_still_moves_between_stacks(self):
+        """Such a payload reads as empty everywhere else, but the step lists an
+        undo carries were written into it with json_set, which refused it: that
+        record stayed on top of history and every undo failed."""
+        delta = empty_delta()
+        delta["records_add"].append(self.record().to_dict())
+        self.state.apply(delta)
+        for damaged in ("{broken", "[1, 2]", ""):
+            with self.subTest(payload=damaged):
+                self.state._db.execute("UPDATE records SET payload=? WHERE id='r1'", (damaged,))
+                self.state._db.commit()
+                move = empty_delta()
+                move["records_move"].append({"id": "r1", "to": STACK_REDO,
+                                             "forward": [{"kind": "move"}], "inverse": []})
+                self.state.apply(move)
+                self.assertEqual(1, self.state.counts()["redo"])
+                self.assertEqual([{"kind": "move"}],
+                                 self.state.top(STACK_REDO).payload["forward"])
+                back = empty_delta()
+                back["records_move"].append({"id": "r1", "to": STACK_HISTORY})
+                self.state.apply(back)
+
     def test_failed_apply_does_not_queue_snapshots_as_orphans(self):
         redo = self.record(id="redo", stack=STACK_REDO)
         redo_data = redo.to_dict()

@@ -619,6 +619,78 @@ class DiagnosticBundleTests(TempCase):
         self.assertEqual("qingjian.log", index[0]["name"])       # still says which
         self.assertNotIn("settings.json", settings["unreadable"])
 
+    def test_a_mask_is_never_masked_again(self):
+        """The rooted Windows form masks a POSIX path as ``<path drive=/ ...>``,
+        and the POSIX pattern then started again at that ``/`` and ran on
+        through the rest of the line -- taking with it the very reason the line
+        was logged for."""
+        masked = logsetup.redact_text("could not move /srv/Chen/a.jpg into /srv/Keep Nana: denied")
+        self.assertTrue(masked.startswith("could not move <path drive=/ "), masked)
+        self.assertTrue(masked.endswith(": denied"), masked)
+        self.assertEqual(2, masked.count("<path "), masked)
+        self.assertNotIn("drive=<path", masked)
+        # A member masked twice -- the database summary is -- reads as once.
+        self.assertEqual(masked, logsetup.redact_text(masked))
+        # A match too short to be a path is passed over, not cut out with the
+        # words in front of it.
+        self.assertEqual("keep this //.", logsetup.redact_text("keep this //."))
+
+    def test_a_folder_name_after_a_dot_is_not_reported_as_an_extension(self):
+        """``Wedding.ChenLi`` is a folder, and "chenli" is the name in it."""
+        for folder, word in ((r"D:\Photos\Wedding.ChenLi", "chenli"),
+                             (r"E:\Keep\Mr.Zhang", "zhang"),
+                             (r"C:\Users\john.smith", "smith")):
+            with self.subTest(folder=folder):
+                masked = logsetup.redact_settings({
+                    "source_folder": folder, "current_profile": "P",
+                    "profiles": {"P": [{"key": "1", "folder": folder}]}})
+                self.assertNotIn(word, json.dumps(masked).lower())
+                self.assertNotIn(word, logsetup.redact_text(f"opened {folder}").lower())
+        # A file's own type is still worth saying, and says nothing about anyone.
+        self.assertIn("ext=.jpg", logsetup.redact_text(r"moved D:\Keep\IMG_0001.JPG"))
+        self.assertIn("ext=.cr2", logsetup.redact_text(r"moved D:\Keep\IMG_0001.CR2"))
+        self.assertIn("ext=.json", logsetup.redact_text(r"read C:\Data\settings.json"))
+
+    def test_a_data_directory_on_a_share_is_opened_by_a_uri_sqlite_accepts(self):
+        """``as_uri`` names a share's server as the authority, and so does what
+        ``resolve()`` makes of a mapped drive; sqlite refuses any authority but
+        an empty one, so a data directory on a NAS was never summarised."""
+        from pathlib import PureWindowsPath
+        share = PureWindowsPath(r"\\CHEN-NAS\family\Qingjian\state\state.db")
+        self.assertEqual("file:////CHEN-NAS/family/Qingjian/state/state.db?mode=ro",
+                         logsetup._read_only_uri(share))
+        local = PureWindowsPath(r"C:\Users\a b\state.db")
+        self.assertEqual("file:///C:/Users/a%20b/state.db?mode=ro",
+                         logsetup._read_only_uri(local))
+
+    @unittest.skipIf(os.name == "nt", "a share-shaped URI can be staged locally only on POSIX")
+    def test_a_share_shaped_uri_really_opens_the_database(self):
+        """On POSIX ``//tmp`` is ``/tmp``, so a URI naming the first folder as its
+        server stands in for a share and must still be read."""
+        from unittest.mock import patch
+        from urllib.parse import quote
+        self._populate()
+        target = (self.data / "state" / "state.db").resolve()
+        as_share = lambda path: "file:/" + quote(path.as_posix())    # noqa: E731
+        with patch.object(type(target), "as_uri", as_share):
+            summary = logsetup.state_summary(self.data / "state" / "state.db")
+        self.assertNotIn("unreadable", summary)
+        self.assertEqual(1, summary["rows"]["records"])
+
+    def test_sqlite_naming_the_server_does_not_put_it_in_the_bundle(self):
+        """"invalid uri authority: CHEN-NAS" holds no path for a mask to find."""
+        import sqlite3
+        from unittest.mock import patch
+        self._populate()
+        refused = sqlite3.OperationalError("invalid uri authority: CHEN-NAS")
+        with patch.object(logsetup.sqlite3, "connect", side_effect=refused):
+            bundle = logsetup.diagnostic_bundle(self.tmp / "share.zip", self.data)
+        blob = self._blob(bundle)
+        self.assertFalse("CHEN-NAS" in blob, "the server's name survived into the bundle")
+        with zipfile.ZipFile(bundle) as archive:
+            summary = json.loads(archive.read("state-summary.json"))
+        self.assertEqual("invalid uri authority", summary["unreadable"])
+
 
 class PlatformTests(TempCase):
     @unittest.skipUnless(sys.platform == "win32", "the recycle-bin queries are Windows APIs")

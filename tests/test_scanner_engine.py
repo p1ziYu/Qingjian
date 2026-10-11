@@ -848,6 +848,66 @@ class FileListTests(TempCase):
         self.assertEqual([str(renamed)], self.engine.state.review_queue(root))
 
 
+class SystemFolderTests(TempCase):
+    """Opening a whole drive must not list what the system keeps on it."""
+
+    JUNK = ("$RECYCLE.BIN/S-1-5-21-1/$RAB12CD.JPG", "$Recycle.Bin/$IAB12CD.JPG",
+            "System Volume Information/c.jpg", "RECYCLER/d.jpg", ".Trashes/501/e.jpg",
+            ".Trash-1000/files/f.jpg", "._a.jpg", "DCIM/._b.jpg")
+
+    def setUp(self):
+        super().setUp()
+        self.root = self.tmp / "drive"
+        self.kept = [self.write(self.root / "a.jpg", b"x" * 64),
+                     self.write(self.root / "DCIM" / "b.jpg", b"x" * 64)]
+        for junk in self.JUNK:
+            self.write(self.root / junk, b"x" * 64)
+
+    def test_recycle_bins_and_volume_folders_are_not_walked(self):
+        """The bin's $R copies of deleted photographs were listed as if still there."""
+        self.assertEqual(sorted(self.kept), sorted(scanner.scan(self.root, recursive=True)))
+
+    def test_a_hidden_system_folder_is_not_walked_on_windows(self):
+        """Whatever its name, a folder Windows marks hidden and system is its own."""
+        import contextlib
+        from types import SimpleNamespace
+        from unittest import mock
+        self.write(self.root / "Config.Msi" / "g.jpg", b"x" * 64)
+        real_scandir = os.scandir
+
+        class Entry:
+            def __init__(self, entry):
+                self._entry = entry
+
+            def __getattr__(self, name):
+                return getattr(self._entry, name)
+
+            def stat(self, follow_symlinks=True):
+                hidden_system = 0x2 | 0x4 if self._entry.name == "Config.Msi" else 0
+                return SimpleNamespace(st_file_attributes=hidden_system)
+
+        def listing(path):
+            return contextlib.nullcontext([Entry(entry) for entry in real_scandir(path)])
+
+        with mock.patch.object(scanner, "IS_WINDOWS", True), \
+                mock.patch.object(scanner.os, "scandir", listing):
+            found = scanner.scan(self.root, recursive=True)
+        self.assertEqual(sorted(self.kept), sorted(found))
+
+    def test_absorbing_agrees_with_the_scan(self):
+        settings = config.Settings()
+        settings.recursive = True
+        engine = Engine(self.data, settings)
+        self.addCleanup(engine.close)
+        engine.open_folder(self.root)
+        root = engine.source_root
+        for junk in self.JUNK:
+            with self.subTest(path=junk):
+                self.assertFalse(engine._belongs(root / junk, root, []))
+        for kept in self.kept:
+            self.assertTrue(engine._belongs(root / kept.relative_to(self.root), root, []))
+
+
 class RescanTests(TempCase):
     def test_a_cancelled_rescan_leaves_the_lists_as_they_were(self):
         """Cancelling while the queue was rebuilt kept the new file list.

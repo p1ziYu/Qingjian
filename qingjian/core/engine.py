@@ -937,14 +937,16 @@ class Engine:
                 return False
             if path.suffix.lower() not in mediatypes.MEDIA_EXTENSIONS:
                 return False
+            if scanner.stray_file(path.name):
+                return False
             parent = path.parent.resolve()
             if parent != path.parent:
                 return False
             if parent != root and not (self.settings.recursive
                                        and parent.is_relative_to(root)):
                 return False
-            # The recycle folder and anything else `scan` steps over.
-            if any(part.startswith(".qingjian") for part in parent.relative_to(root).parts):
+            # The recycle folders and anything else `scan` steps over by name.
+            if any(scanner.system_folder(part) for part in parent.relative_to(root).parts):
                 return False
             if any(parent == folder or parent.is_relative_to(folder) for folder in excluded):
                 return False

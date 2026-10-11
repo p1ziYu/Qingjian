@@ -4,12 +4,14 @@ from __future__ import annotations
 import os
 import random
 import re
+import stat
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Sequence
 
 from . import mediatypes, metadata, sidecar as sidecar_mod
+from .platform_ import IS_WINDOWS
 from .safestore import Cancelled
 
 Progress = Callable[[str, int], None]
@@ -53,6 +55,47 @@ def pruned_targets(root: str | Path, targets: Sequence[str | Path]) -> list[Path
     return kept
 
 
+#: Folders a volume keeps for itself, in any letter case. Opening a whole drive
+#: walked into its recycle bin and listed every deleted photograph there -- the
+#: $R copies and the $I stubs that share their extension -- as if still in place.
+_SYSTEM_FOLDERS = frozenset({
+    "$recycle.bin", "recycler", "recycled",          # Windows bins, old and new
+    "system volume information",                     # restore points, indexing
+    ".trashes", ".trash",                            # macOS on a removable drive
+})
+
+#: Hidden and system together is how Windows marks a folder of its own. System
+#: alone is not enough: Explorer can set it on any folder given a custom icon.
+_PROTECTED = stat.FILE_ATTRIBUTE_HIDDEN | stat.FILE_ATTRIBUTE_SYSTEM
+
+
+def system_folder(name: str) -> bool:
+    """Whether a folder called *name* belongs to the system or to this program."""
+    folded = name.casefold()
+    return (name.startswith(".qingjian") or folded in _SYSTEM_FOLDERS
+            or folded.startswith(".trash-"))     # a freedesktop bin on a stick
+
+
+def stray_file(name: str) -> bool:
+    """Whether a file called *name* is never a photograph, whatever its extension.
+
+    ``._IMG_0001.JPG`` is the resource fork a Mac leaves beside every file it
+    writes to a non-Mac disk, and a partial copy is ours, still in flight.
+    """
+    return name.startswith("._") or (name.startswith(".qingjian-") and name.endswith(".part"))
+
+
+def _protected(entry: os.DirEntry) -> bool:
+    if not IS_WINDOWS:
+        return False
+    try:
+        # Answered from the listing on Windows, so this costs no system call.
+        attributes = entry.stat(follow_symlinks=False).st_file_attributes
+    except (OSError, AttributeError):
+        return False
+    return attributes & _PROTECTED == _PROTECTED
+
+
 def scan(root: str | Path, recursive: bool = False, excluded: Sequence[Path] = (),
          progress: Progress = _noop, cancel: Cancel = _never) -> list[Path]:
     """Every media file under *root*, skipping targets, symlinks and junctions.
@@ -89,15 +132,15 @@ def scan(root: str | Path, recursive: bool = False, excluded: Sequence[Path] = (
                         if entry.is_symlink() or entry.is_junction():
                             continue
                         if entry.is_dir(follow_symlinks=False):
-                            if recursive and not name.startswith(".qingjian") \
-                                    and not is_blocked(here / name):
+                            if recursive and not system_folder(name) \
+                                    and not _protected(entry) and not is_blocked(here / name):
                                 subfolders.append(here / name)
                             continue
                         if not entry.is_file(follow_symlinks=False):
                             continue
                     except OSError:
                         continue
-                    if name.startswith(".qingjian-") and name.endswith(".part"):
+                    if stray_file(name):
                         continue
                     if os.path.splitext(name)[1].lower() not in mediatypes.MEDIA_EXTENSIONS:
                         continue

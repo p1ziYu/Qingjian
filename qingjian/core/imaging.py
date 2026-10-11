@@ -325,11 +325,16 @@ def similarity(left: int | None, right: int | None) -> float:
     return 1.0 - hamming(left, right) / HASH_BITS
 
 
-def quality_score(path: str | Path) -> dict:
-    """Focus and exposure in one pass, for the 'which frame to keep' decision."""
+def quality_score(path: str | Path) -> dict | None:
+    """Focus and exposure in one pass, for the 'which frame to keep' decision.
+
+    None when the file could not be decoded. A score of zero there read as
+    "blurry", and was cached as a fact about a file that may only have been
+    locked or not yet downloaded at the time.
+    """
     pixels = _gray_array(path, 256)
     if pixels is None:
-        return {"sharpness": 0.0, "brightness": 0.0, "blown": 0.0, "crushed": 0.0}
+        return None
     laplace = (
         -4.0 * pixels[1:-1, 1:-1]
         + pixels[:-2, 1:-1] + pixels[2:, 1:-1]

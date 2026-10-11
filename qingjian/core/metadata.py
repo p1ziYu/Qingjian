@@ -145,6 +145,10 @@ class MediaInfo:
     captured: datetime | None = None
     captured_is_fallback: bool = True
     error: str = ""
+    #: The file could not be read just now -- locked by another program, held
+    #: by a virus scanner, a cloud file not yet on this machine -- as opposed
+    #: to read and found wanting. Nothing learnt from such a read is kept.
+    transient: bool = False
 
     @property
     def is_landscape(self) -> bool:
@@ -184,6 +188,16 @@ class MediaInfo:
             return when.timestamp()
         except (OSError, OverflowError, ValueError):
             return (when - datetime(1970, 1, 1)).total_seconds()
+
+
+def _transient(error: BaseException) -> bool:
+    """Did a read fail because of the moment rather than the file?
+
+    A sharing violation, a virus scanner holding the file or a cloud file not
+    yet downloaded all come from the operating system and carry an errno. A
+    file that is simply not a picture is reported by the decoder without one.
+    """
+    return isinstance(error, OSError) and error.errno is not None
 
 
 def _apply_exif(info: MediaInfo, tags: dict) -> None:
@@ -243,6 +257,7 @@ def _read_image(info: MediaInfo) -> None:
             _apply_exif(info, tags)
     except Exception as error:
         info.error = str(error)
+        info.transient = _transient(error)
 
 
 def _read_raw(info: MediaInfo) -> None:
@@ -296,8 +311,10 @@ def _read_video(info: MediaInfo) -> None:
                 return
         except Exception as error:
             info.error = str(error)
+            info.transient = _transient(error)
     header = isobmff.read_header(info.path)
     if header:
+        info.transient = False
         info.fmt = str(header.get("brand") or "")
         duration = header.get("duration")
         if isinstance(duration, (int, float)) and duration > 0:
@@ -346,7 +363,8 @@ def read(path: str | Path, use_cache: bool = True) -> MediaInfo:
             info.captured = datetime(1970, 1, 1) + timedelta(seconds=stat.st_mtime)
         info.captured_is_fallback = True
 
-    if use_cache:
+    # A read that failed for the moment is not kept: the next one may succeed.
+    if use_cache and not info.transient:
         with _CACHE_LOCK:
             _CACHE[key] = info
             while len(_CACHE) > CACHE_LIMIT:
@@ -399,9 +417,17 @@ def capture_only(path: str | Path) -> float | None:
         return None
 
 
-def capture_time(path: str | Path) -> float:
-    """Epoch seconds used for date sorting; the mtime when nothing better exists."""
+def capture_time(path: str | Path, *, strict: bool = False) -> float | None:
+    """Epoch seconds used for date sorting; the mtime when nothing better exists.
+
+    With *strict*, None instead of the mtime when the file could not be read
+    just now (see ``MediaInfo.transient``). A caller that remembers capture
+    times sorts such a file by its mtime for the moment and does not store it,
+    or a photo locked once during a scan would keep the wrong date for good.
+    """
     info = read(path)
+    if strict and info.transient:
+        return None
     when = info.captured or datetime.fromtimestamp(info.mtime)
     try:
         return when.timestamp()

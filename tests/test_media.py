@@ -1011,3 +1011,36 @@ class RawLayoutTests(TempCase):
                 self.assertEqual(6, info.orientation)
                 if name == "crop.dng":
                     self.assertEqual((6000, 4000), (info.width, info.height))
+
+
+class TransientReadTests(TempCase):
+    def test_a_file_that_cannot_be_opened_just_now_is_not_remembered(self):
+        """A sharing violation, a virus scanner or a cloud file not yet on the
+        disk is a moment, not a fact about the file. Remembering the mtime it
+        fell back to kept the photo sorted by the wrong date for good."""
+        path = self.tmp / "IMG_0001.jpg"
+        exif = Image.Exif()
+        exif.get_ifd(0x8769)[0x9003] = "2015:07:04 12:00:00"
+        Image.new("RGB", (64, 64)).save(path, exif=exif)
+
+        def locked(*_args, **_kwargs):
+            raise PermissionError(13, "The process cannot access the file because "
+                                      "it is being used by another process")
+
+        with patch.object(Image, "open", locked):
+            self.assertIsNone(metadata.capture_time(path, strict=True))
+            # Without strict, sorting still gets a number to sort by.
+            self.assertIsInstance(metadata.capture_time(path), float)
+        info = metadata.read(path)
+        self.assertFalse(info.captured_is_fallback)
+        self.assertEqual(datetime(2015, 7, 4, 12), info.captured)
+        self.assertEqual(info.timestamp(), metadata.capture_time(path, strict=True))
+        # A file that is simply not a picture is a fact, and is remembered.
+        broken = self.write(self.tmp / "broken.jpg", b"\xff\xd8\xff" + b"\x00" * 200)
+        self.assertIs(metadata.read(broken), metadata.read(broken))
+        self.assertIsNotNone(metadata.capture_time(broken, strict=True))
+
+    def test_a_frame_that_cannot_be_decoded_has_no_quality_score(self):
+        """Scored as zero it was cached as blurry until the file next changed."""
+        junk = self.write(self.tmp / "junk.jpg", b"nope" * 3000)
+        self.assertIsNone(imaging.quality_score(junk))

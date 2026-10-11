@@ -350,14 +350,19 @@ def _build_candidates(paths: list[Path], hashes: list[int], cache, score_quality
                 if cancel():
                     raise Cancelled("cancelled")
                 score = imaging.quality_score(path)
-                sharp = score["sharpness"]
-                if cache is not None:
-                    cache.put_by_key(keys[path], sharpness=sharp, blown=score.get("blown", 0.0),
+                if score is None:
+                    # Not decodable just now. Unknown is neither blurry nor
+                    # worth remembering: the next scan scores it again.
+                    score = {}
+                elif cache is not None:
+                    cache.put_by_key(keys[path], sharpness=score["sharpness"],
+                                     blown=score.get("blown", 0.0),
                                      crushed=score.get("crushed", 0.0))
+                sharp = float(score.get("sharpness", 0.0))
             else:
                 score = cached
                 sharp = float(cached["sharpness"])
-            defect = imaging.looks_unusable(score)
+            defect = imaging.looks_unusable(score) if score else ""
         return Candidate(path=path, size=info.size, width=info.width, height=info.height,
                          sharpness=sharp, captured=info.timestamp(),
                          digest=digest, phash=value, defect=defect)

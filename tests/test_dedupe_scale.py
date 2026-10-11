@@ -457,6 +457,26 @@ class G10CacheAndIgnoreTests(TempCase):
         engine.close()
 
 
+class ScoringFailureTests(TempCase):
+    def test_a_frame_that_cannot_be_decoded_is_not_cached_as_blurry(self):
+        """A file locked or offline while it was scored was cached at sharpness
+        zero, and so flagged blurry until it next changed."""
+        folder = self.tmp / "locked"
+        folder.mkdir()
+        paths = [self.write(folder / name, os.urandom(9000)) for name in ("a.jpg", "b.jpg")]
+        info = SimpleNamespace(size=9000, width=100, height=100,
+                               captured_is_fallback=True, timestamp=lambda: 0.0)
+        cache = HashCache(self.tmp / "hashes.db")
+        self.addCleanup(cache.close)
+        with patch.object(dedupe.metadata, "read", return_value=info), \
+                patch.object(dedupe.imaging, "phash", return_value=7), \
+                patch.object(dedupe.imaging, "_gray_array", return_value=None):
+            groups = dedupe.find_similar(paths, cache=cache)
+        self.assertEqual({""}, {m.defect for g in groups for m in g.members})
+        for path in paths:
+            self.assertIsNone(cache.get(path, "sharpness"))
+
+
 class G10DialogLifetimeTests(unittest.TestCase):
     def test_timed_out_pool_is_not_destroyed_with_dialog(self):
         from PySide6.QtCore import QCoreApplication, QEvent

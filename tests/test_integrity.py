@@ -450,6 +450,58 @@ class ReplaceReplayTests(TempCase):
             self.assertEqual(b"OLD!" * 700, (keep / name).read_bytes())
 
 
+class CopyThenDeleteTests(TempCase):
+    """With the fast path switched off, a move on one disk is a copy and then a delete.
+
+    So the state a rename can never leave -- the photo at both ends -- is exactly
+    what a source held open by another program leaves, and it must be finishable.
+    """
+
+    def stopped_before_the_delete(self):
+        source, keep = self.tmp / "lib", self.tmp / "keep"
+        photo = self.write(source / "IMG_1.JPG", b"x" * 5000)
+        settings = config.Settings()
+        settings.logging_enabled = False
+        settings.fast_path = False
+        settings.source_folder = str(source)
+        engine = Engine(data_dir=self.tmp / "app", settings=settings)
+        self.addCleanup(engine.close)
+        engine.open_folder(source)
+        real = safestore._unlink_source
+        held = []
+
+        def locked_once(src, landed=None):
+            if not held:
+                held.append(src)
+                error = PermissionError(13, "used by another process")
+                error.winerror = 32
+                raise error
+            return real(src, landed)
+
+        safestore._unlink_source = locked_once
+        self.addCleanup(setattr, safestore, "_unlink_source", real)
+        with self.assertRaises(TransactionError):
+            engine.classify(config.Binding(key="1", action="move", folder=str(keep)), photo)
+        self.assertTrue(engine.has_pending())
+        self.assertTrue(photo.is_file())
+        self.assertTrue((keep / "IMG_1.JPG").is_file())
+        return engine, photo, keep / "IMG_1.JPG"
+
+    def test_recovery_finishes_the_delete(self):
+        engine, photo, moved = self.stopped_before_the_delete()
+        engine.recover()
+        self.assertFalse(engine.has_pending())
+        self.assertFalse(photo.exists())
+        self.assertEqual(b"x" * 5000, moved.read_bytes())
+
+    def test_rollback_takes_the_copy_away(self):
+        engine, photo, moved = self.stopped_before_the_delete()
+        engine.abandon_pending(rollback=True)
+        self.assertFalse(engine.has_pending())
+        self.assertEqual(b"x" * 5000, photo.read_bytes())
+        self.assertFalse(moved.exists())
+
+
 @unittest.skipUnless(sys.platform == "win32", "read-only only blocks deletion on Windows")
 class ReadOnlySourceTests(TempCase):
     """A camera-protected photo must still move to another disk (F-011, F-117)."""

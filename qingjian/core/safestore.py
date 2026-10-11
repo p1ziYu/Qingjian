@@ -971,10 +971,13 @@ class SafeStore:
                 return False                            # already done
             if done_at_dst and src.exists():
                 # Crashed between writing the target and removing the source. A rename
-                # is atomic, so on one volume this state is impossible and the source
-                # must be kept; across volumes the target has to prove it holds the
-                # bytes before the source is deleted.
-                if (same_volume(src, dst.parent)
+                # is atomic, so where the move is one this state is impossible and the
+                # source must be kept; a copy -- across volumes, or on one with the
+                # fast path switched off -- has to prove the target holds the bytes
+                # before the source is deleted, and a second name for the very same
+                # file proves nothing.
+                if ((self.fast_path and same_volume(src, dst.parent))
+                        or os.path.samefile(src, dst)
                         or not identity_matches(src, step.get("src_id"), VERIFY_FAST)
                         or not _same_content(src, dst, result)):
                     raise TransactionError("error.changed_midway", str(src), path=str(src))

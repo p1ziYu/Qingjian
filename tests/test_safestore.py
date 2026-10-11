@@ -392,6 +392,26 @@ class RecoveryTests(StoreCase):
                         "the journal was deleted, so the finished move has no record")
         self.assertTrue((self.dst / "a.bin").is_file())
 
+    def test_a_second_name_for_the_source_is_not_a_finished_copy(self):
+        """Without the fast path a move on one disk is a copy, but not every pair is one.
+
+        A folder linked to the source folder shows the very same file at the far
+        end; deleting the "source" because the two agree would delete it.
+        """
+        store = SafeStore(self.data / "store", fast_path=False)
+        source = self.file("a.bin")
+        alias = self.tmp / "alias"
+        try:
+            alias.symlink_to(self.src, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks unavailable")
+        payload = self.move_plan(source, alias / "a.bin").to_dict()
+        payload["stage_id"] = "stage"
+        ss.atomic_json(store.journal_path, payload)
+        with self.assertRaises(TransactionError):
+            store.recover()
+        self.assertTrue(source.is_file(), "the only copy was deleted as a finished move's source")
+
     def test_a_damaged_journal_is_not_silently_dropped(self):
         self.store.journal_path.write_text("{ not json", encoding="utf-8")
         with self.assertRaises(json.JSONDecodeError):

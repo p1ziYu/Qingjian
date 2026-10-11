@@ -1922,6 +1922,30 @@ class BackgroundQueueTests(WindowCase):
         self.assertNotIn(current, self.engine.queue_paths)
         self.assertEqual(8, len(self.engine.queue_paths))
 
+    def test_f2_leaves_the_renamed_photo_on_screen(self):
+        """Re-sorted under its new name, the photo left its neighbour in its
+        place, and a Delete pressed next would have gone to that neighbour."""
+        from unittest import mock
+        from qingjian.core import config
+        for view in (config.VIEW_SINGLE, config.VIEW_GRID):
+            with self.subTest(view=view):
+                self.window._set_view(view)
+                current = self.engine.current_path()
+                if view == config.VIEW_GRID:
+                    self.window.grid.clearSelection()
+                    self.window.grid.show_path(current)
+                target = current.with_name(f"AAA_{view}.JPG")      # sorts to the top
+                with mock.patch("qingjian.ui.mainwindow.get_text",
+                                return_value=(target.name, True)):
+                    self.press(Qt.Key.Key_F2)
+                    self.until(lambda: target.exists(), "the file was not renamed")
+                self.app.processEvents()
+                self.assertEqual(target, self.engine.current_path())
+                if view == config.VIEW_GRID:
+                    self.assertEqual([str(target)], self.window.grid.selected_paths())
+                else:
+                    self.assertEqual(target, self.window.preview.current_path)
+
     def conflict(self, decision):
         from unittest import mock
         from qingjian.ui import mainwindow

@@ -2111,6 +2111,15 @@ class MainWindow(QMainWindow):
         # `_finish_operation` owns the absorb in synchronous mode; doing it here
         # as well patched the views twice for one rename.
         self._finish_operation(path, self.engine.index, outcome)
+        record = getattr(outcome, "record", None)
+        if record is not None and record.destination and self.engine.go_to(record.destination):
+            # The renamed photo is still the one being looked at. Re-sorted
+            # under its new name it left the neighbour in its place, and the
+            # Delete or key pressed next went to that neighbour.
+            if self.view_mode == config.VIEW_GRID:
+                self.grid.clearSelection()
+                self.grid.show_path(record.destination)
+            self._refresh_view()
 
     def trash_current(self) -> None:
         if self._blocked():

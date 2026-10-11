@@ -162,6 +162,11 @@ def _extended_path(path: Path) -> Path:
     return Path("\\\\?\\" + text)
 
 
+def _staged_path(dst: Path, stage: str) -> Path:
+    """The hidden sibling a copy to *dst* is written to first, owned by one run."""
+    return _extended_path(dst.with_name(f".qingjian-{stage}-{dst.name}.part"))
+
+
 def _unlink_source(src: Path, landed: Path | None = None) -> None:
     """Remove the source of a finished move, even when the camera protected it.
 
@@ -653,9 +658,29 @@ class SafeStore:
                     # The record goes in first: a snapshot nothing points at is
                     # a restore copy the user can never find or reclaim.
                     save_state(delta)
+            self._drop_partials(payload)
             log.warning("journal %s abandoned (rollback=%s)", payload.get("stage_id"), rollback)
             self.journal_path.unlink(missing_ok=True)
             return True
+
+    @staticmethod
+    def _drop_partials(payload: dict) -> None:
+        """Remove what a run killed mid-copy staged, in whatever subfolder it went to.
+
+        Sweeping folders finds only their top level, and a path template puts a
+        photo in T/2026/08. The journal names every path a step or its rollback
+        writes to, and the run's stage id, so each staged name is known exactly:
+        one unlink per path, no listing, and never a file another run owns.
+        """
+        stage = str(payload.get("stage_id") or "")
+        if not stage:
+            return
+        steps = [*(payload.get("forward") or []), *(payload.get("inverse") or [])]
+        for path in {step[end] for step in steps for end in ("src", "dst") if step.get(end)}:
+            try:
+                _staged_path(Path(path), stage).unlink(missing_ok=True)
+            except OSError:
+                continue
 
     def _rollback(self, payload: dict, progress: Progress) -> None:
         """Undo the steps that already ran. Not journalled: it only ever shrinks the prefix."""
@@ -864,7 +889,7 @@ class SafeStore:
         The temporary carries this transaction's stage id so it is owned by
         exactly one run and is never matched by a wildcard.
         """
-        staged = _extended_path(dst.with_name(f".qingjian-{stage}-{dst.name}.part"))
+        staged = _staged_path(dst, stage)
         staged.unlink(missing_ok=True)
         try:
             info = copy_verified(source, staged, progress, _NEVER, verify)

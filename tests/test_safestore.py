@@ -324,6 +324,27 @@ class AbandonTests(StoreCase):
         self.assertTrue(self.store.has_pending(), "the journal went away with the record")
         self.assertTrue(Path(snapshot["file"]).is_file())
 
+    def test_abandoning_removes_its_partial_copy_from_a_template_subfolder(self):
+        """A kill mid-copy leaves the staged copy where the template put the photo.
+
+        The sweep that follows only looks at the top of each folder in play, so
+        that copy would stay in dst/2026/08 for good.
+        """
+        photo = self.file("a.bin")
+        target = self.dst / "2026" / "08" / "a.bin"
+        plan = self.move_plan(photo, target)
+        payload = plan.to_dict()
+        payload["stage_id"] = "stage"
+        theirs = self.write(target.with_name(".qingjian-other-a.bin.part"), b"another run")
+        for rollback in (True, False):
+            with self.subTest(rollback=rollback):
+                ss.atomic_json(self.store.journal_path, payload)
+                partial = self.write(target.with_name(".qingjian-stage-a.bin.part"), b"half")
+                self.assertTrue(self.store.abandon(rollback))
+                self.assertFalse(partial.exists(), "the half-written copy was left behind")
+                self.assertTrue(photo.is_file())
+        self.assertTrue(theirs.exists(), "a staged copy of another run was taken")
+
     def test_a_damaged_journal_can_be_set_aside(self):
         self.store.journal_path.write_text("{ not json", encoding="utf-8")
         self.assertTrue(self.store.abandon(False, save_state=lambda delta: None))

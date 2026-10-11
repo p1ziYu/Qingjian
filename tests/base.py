@@ -20,7 +20,10 @@ class TempCase(unittest.TestCase):
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
-        self.tmp = Path(self._tmp.name)
+        # Resolved, as the engine resolves every folder it opens: a temporary
+        # directory under an 8.3 name ("RUNNER~1") otherwise names the same
+        # files two ways, and a test compares one spelling with the other.
+        self.tmp = Path(self._tmp.name).resolve()
         self.data = self.tmp / "data"
         self.data.mkdir()
         self._previous = os.environ.get("QINGJIAN_DATA_DIR")

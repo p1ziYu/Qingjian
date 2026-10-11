@@ -3586,7 +3586,7 @@ class G06Task1Tests(TestCase):
     def setUp(self):
         self.temp = TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         os.environ["QINGJIAN_DATA_DIR"] = str(self.root / "data")
 
     def gif(self, size=(120, 90)):
@@ -3640,7 +3640,7 @@ class G06Task3Tests(TestCase):
     def setUp(self):
         self.temp = TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         os.environ["QINGJIAN_DATA_DIR"] = str(self.root / "data")
 
     def test_f085_photo_keeps_height_on_tall_view(self):
@@ -3661,7 +3661,7 @@ class G06Task7Tests(TestCase):
     def setUp(self):
         self.temp = TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         os.environ["QINGJIAN_DATA_DIR"] = str(self.root / "data")
 
     def test_f091_release_outside_card_does_not_activate(self):

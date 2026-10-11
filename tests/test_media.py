@@ -301,7 +301,7 @@ class G06Task2Tests(TestCase):
     def setUp(self):
         self.temp = TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         os.environ["QINGJIAN_DATA_DIR"] = str(self.root / "data")
 
     def test_f086_sharing_violation_retries_move(self):
@@ -386,7 +386,7 @@ class G06Task6Tests(TestCase):
     def setUp(self):
         self.temp = TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         os.environ["QINGJIAN_DATA_DIR"] = str(self.root / "data")
 
     def test_f017_previous_frame_at_end_stops_after_one_window(self):

@@ -714,13 +714,11 @@ class SafeStore:
         inverse = list(payload.get("inverse") or [])
         done = 0
         for index, step in enumerate(forward):
-            if step["kind"] == MOVE:
-                # The inverse has to expect what landed, or it refuses to move it
-                # back: a card's clock may have rounded it, and a run stopped
-                # before the source was deleted never taught the inverse at all.
-                expected = step.get("result") or step.get("src_id")
-                landed = (expected if identity_matches(Path(step["dst"]), expected, VERIFY_FAST)
-                          else _rounded_landing(step["dst"], expected))
+            if step["kind"] in (MOVE, COPY):
+                # The inverse has to expect what landed, or it refuses to undo it:
+                # a card's clock may have rounded it, and a run stopped before a
+                # move deleted its source never taught the inverse at all.
+                landed = self._landing(step)
                 if landed is not None:
                     step["result"] = landed
                     self._sync_inverse(payload, index, step)
@@ -870,7 +868,8 @@ class SafeStore:
             return emptied and (_fast_matches(info(dst), expected)
                                 or _rounded_landing(dst, expected) is not None)
         if kind == COPY:
-            return _fast_matches(info(dst), result or step.get("src_id"))
+            return (_fast_matches(info(dst), result or step.get("src_id"))
+                    or (info(dst) is not None and self._landing(step) is not None))
         if kind == WRITE:
             return bool(result) and identity_matches(dst, result, verify)
         if kind == UNLINK:
@@ -1014,12 +1013,33 @@ class SafeStore:
             if step["kind"] == WRITE:
                 restored = step.get("result") or {}
                 return bool(restored.get("hash")) and identity_matches(dst, restored, VERIFY_FULL)
-            expected = step.get("result") or step.get("src_id")
-            if not identity_matches(dst, expected, VERIFY_FAST) and not (
-                    step["kind"] == MOVE and _rounded_landing(dst, expected) is not None):
+            if self._landing(step) is None:
                 return False
             return step["kind"] != MOVE or self._moved_or_copied(step)
         return False
+
+    @staticmethod
+    def _landing(step: dict) -> dict | None:
+        """What a MOVE or COPY left at its target: as recorded, or as a card rounded it.
+
+        None when its target does not hold it. A copy's source is still there,
+        so a rounded copy has to prove it holds the source's bytes; a move's is
+        proved where the source is weighed against it.
+        """
+        dst = Path(step["dst"])
+        expected = step.get("result") or step.get("src_id")
+        if not expected:
+            return None
+        if identity_matches(dst, expected, VERIFY_FAST):
+            return expected
+        landed = _rounded_landing(dst, expected)
+        if landed is None or step["kind"] != COPY:
+            return landed
+        src = Path(step["src"])
+        try:
+            return landed if src.is_file() and _same_content(src, dst, step.get("result")) else None
+        except OSError:
+            return None
 
     def _moved_or_copied(self, step: dict) -> bool:
         """Has this MOVE put its file at its target, even if the source is still there?
@@ -1121,6 +1141,11 @@ class SafeStore:
             if identity_matches(dst, result or step.get("src_id"), VERIFY_FAST):
                 return False
             if dst.exists():
+                landed = self._landing(step)
+                if landed is not None:
+                    # A card's clock rounded the copy; the inverse learns that.
+                    step["result"] = landed
+                    return False
                 raise TransactionError("error.changed_midway", str(dst), path=str(dst))
             if not identity_matches(src, step.get("src_id"), VERIFY_FAST):
                 raise TransactionError("error.external_change", str(src), path=str(src))

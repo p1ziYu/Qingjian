@@ -746,6 +746,36 @@ class CoarseMtimeTests(TempCase):
         self.assertFalse(photo.exists())
         self.assertEqual(b"f" * 3000, target.read_bytes())
 
+    def test_a_copy_over_a_card_file_killed_once_it_landed_rolls_back(self):
+        """A copy kept no allowance for the card's clock, so rolling back a
+        Replace killed after the copy landed undid nothing, then discarded the
+        restore copy: the file it replaced was gone."""
+        root = self.tmp / "copied"
+        usb = root / "usb"
+        photo = self.write(root / "lib" / "IMG_5.JPG", b"f" * 3000)
+        os.utime(photo, ns=(1_700_000_000_123_456_789,) * 2)
+        self.write(usb / "IMG_5.JPG", b"o" * 3000)
+        os.utime(usb / "IMG_5.JPG", ns=(1_600_000_000_000_000_000,) * 2)
+        engine = self.coarse_card(root, usb)
+        first: list[bytes] = []
+        real_atomic = safestore.atomic_json
+
+        def remember(path, value):
+            real_atomic(path, value)
+            if not first and Path(path) == engine.store.journal_path:
+                first.append(Path(path).read_bytes())
+
+        safestore.atomic_json = remember
+        self.addCleanup(setattr, safestore, "atomic_json", real_atomic)
+        engine.classify(config.Binding(key="1", action="copy", folder=str(usb)), photo,
+                        resolver=lambda _a, _b: ops.CONFLICT_REPLACE)
+        safestore.atomic_json = real_atomic
+        engine.store.journal_path.write_bytes(first[0])         # what a kill there leaves
+        engine.abandon_pending(rollback=True)
+        self.assertFalse(engine.has_pending())
+        self.assertEqual(b"o" * 3000, (usb / "IMG_5.JPG").read_bytes())
+        self.assertEqual(b"f" * 3000, photo.read_bytes())
+
     def test_undoing_a_favourite_to_a_coarse_mtime_volume(self):
         photo, copy = self.sort_and_undo("favorite")
         self.assertTrue(photo.is_file())

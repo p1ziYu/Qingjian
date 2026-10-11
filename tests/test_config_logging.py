@@ -20,13 +20,13 @@ class ConfigTests(TempCase):
             "current_profile": "P",
         }), encoding="utf-8")
         settings = config.load(path)
-        self.assertEqual(4, settings.workers)
+        self.assertEqual(config.WORKERS, settings.workers)
         self.assertEqual(config.Settings().quota.max_bytes, settings.quota.max_bytes)
         self.assertEqual(1, settings.bindings[0].sequence_start)
         from unittest.mock import patch
         with patch.object(config.Settings, "from_dict", side_effect=TypeError("bad shape")):
             settings = config.load(path)
-        self.assertEqual(4, settings.workers)
+        self.assertEqual(config.WORKERS, settings.workers)
         self.assertTrue(path.with_suffix(".broken.json").exists())
 
     def test_defaults_are_sane(self):
@@ -144,7 +144,7 @@ class ConfigTests(TempCase):
                                               "workers": "many", "similar_threshold": 5})
         self.assertEqual("standard", settings.density)
         self.assertEqual("full", settings.verification)
-        self.assertEqual(4, settings.workers)
+        self.assertEqual(config.WORKERS, settings.workers)
         self.assertLessEqual(settings.similar_threshold, 1.0)
 
     def test_similarity_threshold_is_clamped_to_index_capability(self):
@@ -541,7 +541,7 @@ class DiagnosticBundleTests(TempCase):
         self.assertTrue(environment["python"])
 
         # Settings that are not paths survive untouched; paths keep their shape.
-        self.assertEqual(4, settings["workers"])
+        self.assertEqual(config.WORKERS, settings["workers"])
         self.assertEqual("soft", settings["recycle_mode"])
         self.assertRegex(settings["source_folder"], r"depth=\d+")
         bindings = settings["profiles"][settings["current_profile"]]

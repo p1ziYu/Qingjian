@@ -13,6 +13,7 @@ from .i18n import normalize_language
 from .logsetup import get_logger
 from .safestore import QuotaPolicy, VERIFY_FAST, VERIFY_FULL, atomic_json
 from .sidecar import SidecarRules
+from .work import WORKERS
 
 log = get_logger("config")
 
@@ -114,7 +115,9 @@ class Settings:
     log_days: int = 7
     # performance
     background_queue: bool = True
-    workers: int = 4
+    #: Files read side by side by a duplicate scan. Unset, it is what the scan
+    #: chose for itself before the setting was read at all: one per core, 2 to 8.
+    workers: int = WORKERS
     #: A 168 px RGBA tile is about 110 KB, so this holds several thousand.
     thumb_cache_mb: int = 512
     hash_cache: bool = True
@@ -196,7 +199,7 @@ class Settings:
         settings.logging_enabled = flag("logging_enabled", True)
         settings.log_days = number("log_days", 7, 1, 365)
         settings.background_queue = flag("background_queue", True)
-        settings.workers = number("workers", 4, 1, 32)
+        settings.workers = number("workers", WORKERS, 1, 32)
         settings.thumb_cache_mb = number("thumb_cache_mb", 512, 64, 65536)
         settings.hash_cache = flag("hash_cache", True)
         settings.similar_threshold = number("similar_threshold", 0.92, 0.89, 1.0)

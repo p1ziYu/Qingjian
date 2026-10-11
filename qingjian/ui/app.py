@@ -352,7 +352,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # Loaded before the lock is taken, because every message below this line
     # has to come out in the user's own language.
-    settings = config.load()
+    notes: list[str] = []
+    settings = config.load(notes=notes)
     if options["language"]:
         settings.language = options["language"]
     set_language(settings.language)
@@ -361,9 +362,12 @@ def main(argv: list[str] | None = None) -> int:
     # its console: a start-up event logged before this line reaches nothing but
     # `logging.lastResort`, so the one fact that explains such a session would
     # be missing from the very bundle the user is asked to attach. `configure`
-    # is safe to call twice and the engine calls it again below.
+    # is safe to call twice and the engine calls it again below. Settings that
+    # had to be reset could only be noted until now; they are logged here.
     logsetup.configure(settings.logging_enabled, settings.log_days,
                        directory=data_root / "logs")
+    for note in notes:
+        log.warning("%s", note)
 
     # One instance per data directory: two copies sorting the same library
     # would race on the journal.

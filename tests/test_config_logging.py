@@ -57,6 +57,72 @@ class ConfigTests(TempCase):
         self.assertEqual("system", settings.language)
         self.assertTrue((self.data / "settings.broken.json").exists())
 
+    def test_a_settings_file_with_a_byte_order_mark_is_read_not_reset(self):
+        """Notepad and PowerShell 5 write one, so a file someone fixed by hand
+        was treated as damaged and every setting in it was thrown away."""
+        path = self.data / "settings.json"
+        path.write_bytes(b"\xef\xbb\xbf" + json.dumps({"workers": 6}).encode("utf-8"))
+        self.assertEqual(6, config.load(path).workers)
+        self.assertFalse(path.with_suffix(".broken.json").exists())
+
+    def test_a_second_damaged_file_does_not_overwrite_the_first_backup(self):
+        """The backup is the only copy of the settings the reset threw away."""
+        path = self.data / "settings.json"
+        for text in ('{"first": ', '{"second": ', '{"third": '):
+            path.write_text(text, encoding="utf-8")
+            config.load(path)
+        self.assertEqual(['{"first": ', '{"second": ', '{"third": '],
+                         [(self.data / name).read_text(encoding="utf-8") for name in (
+                             "settings.broken.json", "settings.broken.2.json",
+                             "settings.broken.3.json")])
+
+    def test_a_reset_can_be_noted_until_there_is_a_log_to_write_it_to(self):
+        """Start-up reads the settings before logging exists, so a warning
+        logged there reached only stderr, which the frozen build hides."""
+        path = self.data / "settings.json"
+        path.write_text("{ nope", encoding="utf-8")
+        notes: list[str] = []
+        config.load(path, notes=notes)
+        self.assertEqual(1, len(notes))
+        self.assertIn("settings unreadable", notes[0])
+        self.assertIn("settings.broken.json", notes[0])
+
+    def test_a_read_only_settings_file_does_not_fail_every_save(self):
+        """Windows will not replace a file whose read-only attribute is set,
+        and the start-up write probe only ever makes files of its own, so a
+        settings.json restored with the attribute on passed it and then
+        refused every save. Staged here the way Windows reads the attribute."""
+        import stat
+        from unittest.mock import patch
+        path = self.data / "settings.json"
+        config.save(config.Settings(), path)
+        os.chmod(path, stat.S_IREAD)
+        self.addCleanup(lambda: path.exists() and os.chmod(path, stat.S_IREAD | stat.S_IWRITE))
+        real = config.atomic_json
+
+        def like_windows(target, value):
+            if not Path(target).stat().st_mode & stat.S_IWRITE:
+                raise PermissionError(13, "Access is denied", str(target))
+            real(target, value)
+
+        settings = config.Settings()
+        settings.workers = 9
+        with patch.object(config, "atomic_json", like_windows):
+            config.save(settings, path)
+        self.assertEqual(9, config.load(path).workers)
+
+    @unittest.skipUnless(os.name == "nt", "the read-only attribute is a Windows rule")
+    def test_a_read_only_settings_file_is_replaced_on_windows(self):
+        import stat
+        path = self.data / "settings.json"
+        config.save(config.Settings(), path)
+        os.chmod(path, stat.S_IREAD)
+        self.addCleanup(lambda: path.exists() and os.chmod(path, stat.S_IREAD | stat.S_IWRITE))
+        settings = config.Settings()
+        settings.workers = 9
+        config.save(settings, path)
+        self.assertEqual(9, config.load(path).workers)
+
     def test_unknown_values_fall_back(self):
         settings = config.Settings.from_dict({"density": "enormous", "verification": "magic",
                                               "workers": "many", "similar_threshold": 5})

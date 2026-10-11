@@ -2362,6 +2362,24 @@ class SecondLaunchTests(QtCase):
         written = (self.data / "logs" / "qingjian.log").read_text(encoding="utf-8")
         self.assertIn("error.lock_unreachable", written)
 
+    def test_settings_reset_at_start_up_are_logged_where_a_bundle_can_carry_it(self):
+        """They are read before there is a log -- the settings say whether there
+        is to be one -- so the warning went only to stderr, which the frozen
+        build hides, and nothing recorded that the user's settings were reset."""
+        from unittest.mock import Mock, patch
+        from qingjian.ui import app as app_module
+
+        self.write(self.data / "settings.json", b'{"profiles": {"Family": [')
+        self.addCleanup(self._close_windows)
+        with patch.object(QApplication, "exec", lambda _self: 0), \
+             patch.object(app_module, "_hand_over_with_retry", Mock(return_value=True)), \
+             patch.object(app_module, "warning", self._remember), \
+             patch.object(app_module, "critical", self._remember):
+            self.assertEqual(0, app_module.main(["MediaSorter.exe", "--lang", "en"]))
+        written = (self.data / "logs" / "qingjian.log").read_text(encoding="utf-8")
+        self.assertIn("settings unreadable", written)
+        self.assertIn("settings.broken.json", written)
+
     def test_a_data_directory_the_engine_cannot_use_is_explained_not_quoted(self):
         """A folder may take a file and still refuse a sub-directory or a
         deletion, so the engine can fail where the probe passed. Showing the

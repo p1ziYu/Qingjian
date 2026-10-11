@@ -1,7 +1,10 @@
 """Key bindings, presets and application settings."""
 from __future__ import annotations
 
+import itertools
 import json
+import os
+import stat
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
@@ -260,27 +263,75 @@ class Settings:
         return replace(self, language=language)
 
 
-def load(path: str | Path | None = None) -> Settings:
+def load(path: str | Path | None = None, notes: list[str] | None = None) -> Settings:
+    """Read the settings, setting a damaged file aside rather than failing.
+
+    Start-up loads these before there is a log -- the settings say whether
+    there is to be one -- so a warning logged here reached nothing but stderr,
+    which the frozen build hides, and the one record of the user's settings
+    being reset went nowhere. A caller in that position passes *notes* and logs
+    what lands there once the log is open.
+    """
     target = Path(path) if path else appdirs.settings_path()
     if not target.exists():
         settings = Settings()
         settings.ensure_profile()
         return settings
     try:
-        data = json.loads(target.read_text(encoding="utf-8"))
+        # "utf-8-sig": Notepad and PowerShell 5 write a byte-order mark, and a
+        # file someone fixed by hand is not a damaged one.
+        data = json.loads(target.read_text(encoding="utf-8-sig"))
         settings = Settings.from_dict(data)
     except (OSError, ValueError, TypeError, OverflowError, RecursionError) as error:
-        log.warning("settings unreadable (%s); keeping the file and starting fresh", error)
-        try:
-            target.replace(target.with_suffix(".broken.json"))
-        except OSError:
-            pass
+        spare = _set_aside(target)
+        note = (f"settings unreadable ({error}); "
+                + (f"kept as {spare.name}" if spare else "left in place") + ", starting fresh")
+        if notes is None:
+            log.warning("%s", note)
+        else:
+            notes.append(note)
         settings = Settings()
         settings.ensure_profile()
         return settings
     return settings
 
 
+def _set_aside(target: Path) -> Path | None:
+    """Move a damaged settings file out of the way without losing an earlier one.
+
+    Every damaged copy is kept under a name of its own: the second failure used
+    to overwrite ``settings.broken.json``, and with it the only copy of the
+    settings the first one had reset.
+    """
+    for number in itertools.count(1):
+        spare = target.with_suffix(".broken.json" if number == 1 else f".broken.{number}.json")
+        if spare.exists():
+            continue
+        try:
+            target.replace(spare)
+        except OSError:
+            return None
+        return spare
+    return None                                     # pragma: no cover - count() is endless
+
+
 def save(settings: Settings, path: str | Path | None = None) -> None:
     target = Path(path) if path else appdirs.settings_path()
+    _clear_read_only(target)
     atomic_json(target, settings.to_dict())
+
+
+def _clear_read_only(path: Path) -> None:
+    """Let a read-only settings file be replaced. Never raises.
+
+    Windows will not replace a file whose read-only attribute is set, so a
+    settings.json copied off a CD or a read-only share, or restored from a
+    backup with the attribute on, passed the start-up write probe -- which
+    makes files of its own -- and then failed every save after it.
+    """
+    try:
+        mode = path.stat().st_mode
+        if not mode & stat.S_IWRITE:
+            os.chmod(path, mode | stat.S_IWRITE)
+    except OSError:
+        pass

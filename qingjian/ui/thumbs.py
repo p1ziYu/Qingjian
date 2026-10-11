@@ -195,12 +195,20 @@ class ThumbnailCache(QObject):
             pixmap = QPixmap.fromImage(image)
         self._cache[key] = pixmap
         self._bytes += pixmap.width() * pixmap.height() * 4
+        self._fit_budget()
+        self.ready.emit(str(target), edge, pixmap)
+
+    def _fit_budget(self) -> None:
         while self._bytes > self._budget and len(self._cache) > 1:
             _old_key, old = self._cache.popitem(last=False)
             self._bytes -= old.width() * old.height() * 4
-        self.ready.emit(str(target), edge, pixmap)
 
     # -- housekeeping --------------------------------------------------
+    def set_budget(self, budget_mb: int) -> None:
+        """Adopt a new memory budget at once, letting the oldest tiles go to fit it."""
+        self._budget = max(32, budget_mb) * 1024 * 1024
+        self._fit_budget()
+
     def pending(self) -> int:
         return len(self._pending)
 

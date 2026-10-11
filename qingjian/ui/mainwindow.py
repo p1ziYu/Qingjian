@@ -913,25 +913,28 @@ class MainWindow(QMainWindow):
         self._after_queue_change(tr("scan.complete", count=len(self.engine.all_files)))
         return True
 
-    def rescan(self) -> None:
+    def rescan(self) -> bool:
+        """Read the folder again. True only when the list was rebuilt from it."""
         if self._busy or not self.engine.source_root:
-            return
+            return False
         if not self._drain_queue():
-            return
+            return False
         try:
             self._with_progress(tr("scan.scanning"),
                                 lambda progress, cancel: self.engine.rescan(progress, cancel))
         except (TransactionError, OSError) as error:
             self._report(error)
-            return
+            return False
         except Cancelled:
-            return
+            return False
         self._conflict_defaults.clear()
         self._after_queue_change(tr("scan.complete", count=len(self.engine.all_files)))
+        return True
 
-    def _rebuild_queue(self) -> None:
+    def _rebuild_queue(self) -> bool:
+        """Filter and sort the list again. False when it was left as it was."""
         if self._busy:
-            return
+            return False
         try:
             if len(self.engine.all_files) > 2000:
                 # Filtering and date-sorting a big library takes long enough
@@ -942,11 +945,12 @@ class MainWindow(QMainWindow):
             else:
                 self.engine.rebuild_queue()
         except Cancelled:
-            return
+            return False
         except OSError as error:
             self._report(error)
-            return
+            return False
         self._after_queue_change("")
+        return True
 
     def _after_queue_change(self, message: str) -> None:
         self._update_slip()
@@ -1347,39 +1351,61 @@ class MainWindow(QMainWindow):
 
     # =========================================================== filtering
     def _filter_changed(self) -> None:
-        if not self._drain_queue():
-            return
-        self.settings.filter_mode = str(self.filter_combo.currentData() or "all")
-        self.engine.save_settings()
-        self._rebuild_queue()
+        self._change_listing("filter_mode", str(self.filter_combo.currentData() or "all"))
 
     def _sort_changed(self) -> None:
-        if not self._drain_queue():
-            return
-        self.settings.sort_mode = str(self.sort_combo.currentData() or "name")
-        self.engine.save_settings()
-        self._rebuild_queue()
+        self._change_listing("sort_mode", str(self.sort_combo.currentData() or "name"))
 
     def _reverse_changed(self, checked: bool) -> None:
-        if not self._drain_queue():
-            return
-        self.settings.sort_reverse = bool(checked)
-        self.engine.save_settings()
-        self._rebuild_queue()
+        self._change_listing("sort_reverse", bool(checked))
+
+    def _change_listing(self, name: str, value) -> None:
+        """Adopt a filter or sort choice, or take it back if the list cannot follow.
+
+        A rebuild that was cancelled, failed or never got past the queue left
+        the control and the saved setting on the new choice over the old list.
+        Undo then tested a photo it put back against a filter the list was
+        never built with, and it came back on disk but not on screen.
+        """
+        previous = getattr(self.settings, name)
+        if self._drain_queue():
+            setattr(self.settings, name, value)
+            self.engine.save_settings()
+            if self._rebuild_queue():
+                return
+            setattr(self.settings, name, previous)
+            self.engine.save_settings()
+        self._show_listing()
+
+    def _show_listing(self) -> None:
+        """Put the list controls back on the settings, without coming back in here."""
+        controls = (self.filter_combo, self.sort_combo, self.reverse_button,
+                    self.recursive_check)
+        for control in controls:
+            control.blockSignals(True)
+        try:
+            for combo, value in ((self.filter_combo, self.settings.filter_mode),
+                                 (self.sort_combo, self.settings.sort_mode)):
+                combo.setCurrentIndex(max(0, combo.findData(value)))
+            self.reverse_button.setChecked(self.settings.sort_reverse)
+            self.recursive_check.setChecked(self.settings.recursive)
+        finally:
+            for control in controls:
+                control.blockSignals(False)
 
     def _recursive_changed(self, checked: bool) -> None:
-        if self._blocked():
-            # Put the box back without coming straight back in here.
-            self.recursive_check.blockSignals(True)
-            self.recursive_check.setChecked(self.settings.recursive)
-            self.recursive_check.blockSignals(False)
-            return
-        if not self._drain_queue():
+        if self._blocked() or not self._drain_queue():
+            self._show_listing()
             return
         self.settings.recursive = bool(checked)
         self.engine.save_settings()
         if checked:
-            self.rescan()            # subfolders have to be read to be listed
+            # Subfolders have to be read to be listed. A scan that did not
+            # finish leaves the flat list, and the box and setting with it.
+            if self.engine.source_root and not self.rescan():
+                self.settings.recursive = False
+                self.engine.save_settings()
+                self._show_listing()
             return
         # Turning it off only ever removes files, and they are already in hand.
         change = self.engine.drop_subfolders()
@@ -2402,6 +2428,8 @@ class MainWindow(QMainWindow):
         updated.source_folder = self.settings.source_folder
         self.settings = updated
         self.engine.apply_settings(updated)
+        # Read only when the window was built, so a new budget waited for a restart.
+        self.thumbs.set_budget(updated.thumb_cache_mb)
         set_language(updated.language)
         theme.apply(QApplication.instance(), updated.density)
         height = self._envelope_height()

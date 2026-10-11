@@ -1217,6 +1217,68 @@ class RecoverExitTests(WindowCase):
         self.assertEqual([], asked)
 
 
+class ListingChoiceTests(WindowCase):
+    """A filter, sort or subfolder choice the list could not follow is taken back.
+
+    The control and the saved setting kept the new choice over the old list,
+    and undo then tested a photo it put back against a filter the list was
+    never built with: back on disk, missing from the screen.
+    """
+
+    def saved(self):
+        from qingjian.core import config
+        return config.load(self.data / "settings.json")
+
+    def test_a_cancelled_filter_puts_the_box_and_the_setting_back(self):
+        from qingjian.core.safestore import Cancelled
+        before = list(self.engine.queue_paths)
+        combo = self.window.filter_combo
+        with mock.patch.object(self.engine, "rebuild_queue", side_effect=Cancelled("cancelled")):
+            combo.setCurrentIndex(combo.findData("videos"))
+        self.assertEqual("all", combo.currentData())
+        self.assertEqual("all", self.settings.filter_mode)
+        self.assertEqual("all", self.saved().filter_mode)
+        self.assertEqual(before, self.engine.queue_paths)
+        combo.setCurrentIndex(combo.findData("videos"))
+        self.assertEqual("videos", self.saved().filter_mode)
+        self.assertEqual([], self.engine.queue_paths)
+
+    def test_a_sort_that_waited_in_vain_for_the_queue_puts_the_controls_back(self):
+        combo = self.window.sort_combo
+        with mock.patch.object(self.window, "_drain_queue", return_value=False):
+            combo.setCurrentIndex(combo.findData("size"))
+            self.window.reverse_button.setChecked(True)
+        self.assertEqual(("name", "name"), (combo.currentData(), self.settings.sort_mode))
+        self.assertEqual((False, False), (self.window.reverse_button.isChecked(),
+                                          self.settings.sort_reverse))
+
+    def test_a_cancelled_subfolder_scan_unticks_the_box_again(self):
+        from qingjian.core.safestore import Cancelled
+        self.assertFalse(self.settings.recursive)
+        with mock.patch.object(self.engine, "rescan", side_effect=Cancelled("cancelled")):
+            self.window.recursive_check.setChecked(True)
+        self.assertFalse(self.window.recursive_check.isChecked())
+        self.assertFalse(self.settings.recursive)
+        self.assertFalse(self.saved().recursive)
+
+    def test_a_new_thumbnail_budget_applies_without_a_restart(self):
+        from qingjian.core import config
+        from qingjian.ui import mainwindow
+
+        class Accepting:
+            def __init__(self, settings, _engine, _parent):
+                self.settings = config.Settings.from_dict(settings.to_dict())
+                self.settings.thumb_cache_mb = 64
+
+            def result_settings(self):
+                return self.settings
+
+        self.patch(mainwindow, "SettingsDialog", Accepting)
+        self.patch(self.window, "_run_dialog", lambda _dialog: QDialog.DialogCode.Accepted)
+        self.window.open_settings()
+        self.assertEqual(64 * 1024 * 1024, self.window.thumbs._budget)
+
+
 class RuntimeMainWindowContractTests(WindowCase):
     """Run the expensive-path contracts against live widgets and an Engine."""
 

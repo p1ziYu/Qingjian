@@ -848,6 +848,144 @@ class FileListTests(TempCase):
         self.assertEqual([str(renamed)], self.engine.state.review_queue(root))
 
 
+class ShotRowTests(TempCase):
+    """A shot is one row: it leaves the queue as one and comes back as one.
+
+    Patching the queue in place has to agree with a rebuild row for row, or the
+    next rebuild moves the cursor onto something the user has already seen.
+    """
+
+    def build(self, name: str, rules: SidecarRules | None = None,
+              action: str = "copy") -> Engine:
+        base = self.tmp / name
+        self.src, self.out = base / "src", base / "Out"
+        self.jpeg, self.raw = photo(self.src / "IMG_1.JPG"), self.src / "IMG_1.CR2"
+        self.write(self.raw, b"raw" * 100)
+        self.write(self.src / "IMG_1.JPG.xmp", b"<x:xmpmeta/>")
+        photo(self.src / "IMG_2.JPG", 90)
+        settings = config.Settings()
+        if rules is not None:
+            settings.sidecar = rules
+        self.binding = settings.bindings[0]
+        self.binding.action = action
+        self.binding.folder = str(self.out)
+        self.binding.name_template = "{name}"
+        engine = Engine(base / "data", settings)
+        self.addCleanup(engine.close)
+        engine.open_folder(self.src)
+        return engine
+
+    @staticmethod
+    def rows(engine: Engine) -> list[str]:
+        return [path.name for path in engine.queue_paths]
+
+    def assert_a_rebuild_agrees(self, engine: Engine) -> None:
+        patched = list(engine.queue_paths)
+        engine.rebuild_queue()
+        self.assertEqual(patched, engine.queue_paths)
+
+    def test_a_copied_shot_does_not_come_back_as_its_raw(self):
+        """Copying marked only the JPEG handled, so the raw became the shot's row.
+
+        The next key press then filed the whole shot again, as IMG_1 (2).JPG
+        and IMG_1 (2).CR2.
+        """
+        for action in ("copy", "favorite"):
+            with self.subTest(action=action):
+                engine = self.build(action, action=action)
+                engine.absorb(engine.classify(self.binding, self.jpeg).record)
+                self.assertEqual(["IMG_2.JPG"], self.rows(engine))
+                self.assert_a_rebuild_agrees(engine)
+                self.assertEqual(["IMG_1.CR2", "IMG_1.JPG", "IMG_1.JPG.xmp"],
+                                 self.tree(self.out))
+                # Two files of the shot could have been rows; the XMP never could.
+                self.assertEqual(2, engine.hidden_handled())
+
+    def test_undoing_the_copy_brings_back_one_row(self):
+        engine = self.build("undo")
+        engine.absorb(engine.classify(self.binding, self.jpeg).record)
+        engine.absorb(engine.undo().record)
+        self.assertEqual(["IMG_1.JPG", "IMG_2.JPG"], self.rows(engine))
+        self.assertEqual(set(), engine.state.done_paths())
+        self.assert_a_rebuild_agrees(engine)
+
+    def test_a_skipped_shot_is_one_row_in_either_queue(self):
+        """After a skip and any rebuild the raw stood for the shot in the main queue."""
+        engine = self.build("skip")
+        engine.absorb(engine.skip(self.jpeg).record)
+        self.assertEqual(["IMG_2.JPG"], self.rows(engine))
+        self.assert_a_rebuild_agrees(engine)
+        engine.set_review_mode(True)
+        self.assertEqual(["IMG_1.JPG"], self.rows(engine))
+        # One shot is one entry, as the count beside the review button shows it.
+        self.assertEqual(1, engine.state.review_count(str(engine.source_root)))
+
+    def test_a_shot_marked_by_an_earlier_version_is_still_one_row(self):
+        """Lists written before this fix name only the JPEG of a handled shot."""
+        engine = self.build("earlier")
+        engine.state.apply({"done_add": [str(self.jpeg)]})
+        engine.rebuild_queue()
+        self.assertEqual(["IMG_2.JPG"], self.rows(engine))
+
+    def test_with_companions_listed_a_copied_raw_leaves_its_row_too(self):
+        engine = self.build("listed", SidecarRules(hide_from_queue=False))
+        self.assertEqual(["IMG_1.CR2", "IMG_1.JPG", "IMG_2.JPG"], self.rows(engine))
+        engine.absorb(engine.classify(self.binding, self.jpeg).record)
+        self.assertEqual(["IMG_2.JPG"], self.rows(engine))
+        self.assert_a_rebuild_agrees(engine)
+
+    def test_a_raw_the_copy_left_behind_keeps_a_row(self):
+        """With linking set to never, the raw was not copied, so it is not handled."""
+        engine = self.build("never", SidecarRules(prompt="never"))
+        outcome = engine.classify(self.binding, self.jpeg)
+        self.assertEqual([str(self.jpeg)], outcome.record.payload["paths"])
+        engine.absorb(outcome.record)
+        self.assertEqual(["IMG_1.CR2", "IMG_2.JPG"], self.rows(engine))
+        self.assert_a_rebuild_agrees(engine)
+
+    def test_an_undone_move_lists_the_raw_again_when_companions_are_shown(self):
+        """A restored raw was folded into its JPEG even with hiding turned off."""
+        engine = self.build("shown", SidecarRules(hide_from_queue=False, prompt="always"),
+                            action="move")
+        engine.absorb(engine.classify(self.binding, self.jpeg).record)
+        self.assertEqual(["IMG_2.JPG"], self.rows(engine))
+        engine.absorb(engine.undo().record)
+        self.assertEqual(["IMG_1.CR2", "IMG_1.JPG", "IMG_2.JPG"], self.rows(engine))
+        self.assert_a_rebuild_agrees(engine)
+
+    def test_a_raw_a_move_left_behind_takes_the_shots_row(self):
+        """The record names only what moved, so the raw that stayed was never re-tested.
+
+        A rebuild listed it; the patched queue did not, until the next rebuild
+        moved everything under the cursor.
+        """
+        from qingjian.core.sidecar import KIND_MASTER, SidecarGroup, SidecarMember
+        for name, rules, alone in (("never", SidecarRules(prompt="never"), False),
+                                   ("unticked", None, True)):
+            with self.subTest(name=name):
+                engine = self.build(name, rules, action="move")
+                group = (SidecarGroup(self.jpeg, [SidecarMember(self.jpeg, KIND_MASTER, 1)])
+                         if alone else None)
+                engine.absorb(engine.classify(self.binding, self.jpeg, group=group).record)
+                self.assertEqual(["IMG_1.CR2", "IMG_2.JPG"], self.rows(engine))
+                self.assert_a_rebuild_agrees(engine)
+                engine.absorb(engine.undo().record)
+                self.assertEqual(["IMG_1.JPG", "IMG_2.JPG"], self.rows(engine))
+                self.assert_a_rebuild_agrees(engine)
+                engine.absorb(engine.redo().record)
+                self.assertEqual(["IMG_1.CR2", "IMG_2.JPG"], self.rows(engine))
+                self.assert_a_rebuild_agrees(engine)
+
+    def test_the_raw_surfaces_when_the_row_was_taken_out_first(self):
+        """The background queue takes the row out before the move runs."""
+        engine = self.build("background", SidecarRules(prompt="never"), action="move")
+        engine.drop_from_queue(self.jpeg)
+        change = engine.absorb(engine.classify(self.binding, self.jpeg).record)
+        self.assertEqual([self.raw], [path for _where, path in change["added"]])
+        self.assertEqual(["IMG_1.CR2", "IMG_2.JPG"], self.rows(engine))
+        self.assert_a_rebuild_agrees(engine)
+
+
 class BelongsTests(TempCase):
     def setUp(self):
         super().setUp()

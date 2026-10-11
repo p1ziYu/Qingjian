@@ -14,7 +14,7 @@ from pathlib import PureWindowsPath
 from typing import Callable, Sequence
 
 from . import sidecar as sidecar_mod
-from . import metadata, naming, template
+from . import mediatypes, metadata, naming, template
 from .config import Binding, Settings
 from .logsetup import get_logger
 from .naming import NameError_
@@ -468,8 +468,11 @@ class Planner:
             # the main queue until the folder was opened again.
             delta["reviews_add"].append([root, record.destination])
         if action in ("copy", "favorite"):
-            # The original stays put, so remember it was dealt with.
-            delta["done_add"].append(master)
+            # The originals stay put, so remember they were dealt with: the raw
+            # the copy carried as well as the JPEG. With companions listed as
+            # rows of their own, marking only the JPEG left the copied raw on
+            # screen to be copied again.
+            delta["done_add"].extend(_listable(record))
         return delta
 
     def _reverse_side_effects(self, record: Record, delta: dict, undo: bool) -> None:
@@ -501,6 +504,16 @@ class Planner:
                     ])
         if record.action in ("copy", "favorite"):
             if undo:
-                delta["done_remove"].append(master)
+                delta["done_remove"].extend(_listable(record))
             else:
-                delta["done_add"].append(master)
+                delta["done_add"].extend(_listable(record))
+
+
+def _listable(record: Record) -> list[str]:
+    """The files of *record* that could be rows in the queue.
+
+    A sidecar such as an XMP never is, so marking it handled would only make
+    the count of hidden files say more than the queue ever showed.
+    """
+    return [path for path in record.paths
+            if path == record.original or mediatypes.is_media(path)]

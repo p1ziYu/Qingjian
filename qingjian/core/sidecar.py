@@ -10,6 +10,7 @@ import os
 
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Sequence
 
 from . import mediatypes
 
@@ -245,11 +246,24 @@ def representative(paths: list[Path]) -> Path:
     return min(paths, key=lambda p: (_REPRESENTATIVE_RANK.get(mediatypes.kind(p), 9), p.name.casefold()))
 
 
-def collapse_groups(paths: list[Path], rules: SidecarRules | None = None) -> list[Path]:
-    """Reduce a file list to one representative per shot, preserving order."""
+def collapse_groups(paths: list[Path], rules: SidecarRules | None = None,
+                    excluded: Sequence[Path] = ()) -> list[Path]:
+    """Reduce a file list to one representative per shot, preserving order.
+
+    *excluded* names files the caller left out of *paths* because they were
+    handled or sent to review, and whatever would travel with one of them
+    leaves with it. The shot is one row: dropping only the JPEG left its raw
+    alone in the group, the raw became the shot's row, and the next key press
+    filed the whole shot a second time. When companions never travel, the
+    raw is a file of its own and keeps its row.
+    """
     rules = rules or SidecarRules()
     if not (rules.enabled and rules.hide_from_queue):
         return list(paths)
+    handled: dict[tuple[str, str], list[Path]] = {}
+    if rules.prompt != PROMPT_NEVER:
+        for path in excluded:
+            handled.setdefault(group_key(path), []).append(path)
     buckets: dict[tuple[str, str], list[Path]] = {}
     order: list[tuple[str, str]] = []
     for path in paths:
@@ -261,6 +275,12 @@ def collapse_groups(paths: list[Path], rules: SidecarRules | None = None) -> lis
     result = []
     for key in order:
         members = buckets[key]
+        gone = handled.get(key)
+        if gone:
+            members = [path for path in members
+                       if all(rules.classify(path, other) is None for other in gone)]
+            if not members:
+                continue
         master = representative(members)
         linked = [path for path in members if path == master or
                   rules.classify(path, master) is not None]

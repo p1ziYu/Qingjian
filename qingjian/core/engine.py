@@ -8,6 +8,7 @@ by eye and this layer testable without a display.
 from __future__ import annotations
 
 import csv
+import os
 import threading
 import time
 import uuid
@@ -721,12 +722,17 @@ class Engine:
         that touched one shot. Here the record already names the files involved,
         so the lists are patched in place.
 
-        Membership is decided by the queue and by the filter, never by
-        ``all_files``: that list keeps an entry for a file the queue has already
-        let go, so trusting it meant an undone move put the file back on disk
-        and nowhere on screen. Undoing a skip is the same shape -- the file
-        never moved, only its exclusion did -- so every touched file that still
-        exists is re-tested against the filter rather than assumed to be fine.
+        Membership is decided the way a rebuild decides it, one shot at a
+        time: every file of each shot the record touched is taken from
+        ``all_files`` and put through the same filter and grouping as
+        `rebuild_queue`, and the queue's rows for that shot are made to match.
+        Copying or marking a file leaves it where it was and only changes the
+        handled list, so a check that looked at the file rather than the filter
+        left it on screen and holding the key down copied it again and again.
+        Testing only the files the record names was not enough either: a raw
+        that a move left behind was listed by the next rebuild but not here,
+        and a restored raw was folded into its JPEG even with companions shown
+        as rows.
 
         Returns None when the queue cannot be patched confidently and the
         caller should rebuild it instead; otherwise the queue rows that were
@@ -738,61 +744,60 @@ class Engine:
         if not touched or self.source_root is None:
             return None
         metadata.forget(touched)
-        listed = self._list_touched(touched)
+        known = set(self.all_files)
+        dropped = self._list_touched(touched, known)
         if self.review_mode:
             # That queue is a database query, not a view of these lists.
             return None
-        key = self._sort_key(touched)
-        if key is None:                     # random order has no insert point
-            return None
+        if scanner.sort_key(self.settings.sort_mode) is None:
+            return None                     # random order has no insert point
+
+        queued = set(self.queue_paths)
+        shots: dict[tuple[str, str], Path] = {}
+        for path in touched:
+            # A destination outside the source folder was never listed. A file
+            # that left still counts: the background queue takes its row out
+            # first, and a raw it left behind has to take that row's place.
+            if path in known or path in queued or path in dropped:
+                shots.setdefault(sidecar_mod.group_key(path), path)
+        plans: list[tuple[list[Path], list[Path]]] = []
+        for path in shots.values():
+            plans.append((self._same_shot(path, self.all_files),
+                          self._same_shot(path, self.queue_paths)))
+        members = [member for listed, _rows in plans for member in listed]
+        key = self._sort_key([*touched, *members])
+        spec = self._filter_spec(members)
 
         added: list[tuple[int, Path]] = []
         removed: list[Path] = []
-        spec = self._filter_spec(touched)
-        queued = set(self.queue_paths)
-
-        wanted_paths: list[Path] = []
-        for path in touched:
-            if path in listed:
-                # Whether it should be listed is re-decided every time, in both
-                # directions. Copying or marking a file leaves it exactly where
-                # it was and only changes the handled list, so a check that
-                # looked at the file rather than the filter left it on screen --
-                # and holding the key down copied it again and again.
-                wanted = bool(scanner.apply_filter([path], spec))
-                if wanted:
-                    wanted_paths.append(path)
-                    continue
-                if self.drop_from_queue(path) >= 0:
+        arriving: list[Path] = []
+        for listed, rows in plans:
+            wanted = scanner.queue_rows(listed, spec, self.settings.sidecar)
+            for path in rows:
+                if path not in wanted and self.drop_from_queue(path) >= 0:
                     removed.append(path)
-                    queued.discard(path)
-                continue
-            if self.drop_from_queue(path) >= 0:
-                removed.append(path)
-                queued.discard(path)
-
-        for path in wanted_paths:
-            if path not in queued:
-                where = self._insert_into_queue(path, key)
-                if where >= 0:
-                    added.append((where, path))
-                    queued.add(path)
+            arriving.extend(path for path in wanted if path not in rows)
+        # Every removal before any insertion: the views apply the change in
+        # that order, so each position below has to be counted the same way.
+        for path in arriving:
+            where = self._insert_into_queue(path, key)
+            if where >= 0:
+                added.append((where, path))
 
         self.index = clamp_index(self.index, len(self.queue_paths))
         return {"added": added, "removed": removed}
 
-    def _list_touched(self, touched: Sequence[Path]) -> set[Path]:
-        """Add the touched files `scan` would return, drop the ones that are gone.
+    def _list_touched(self, touched: Sequence[Path], known: set[Path]) -> set[Path]:
+        """Add the touched files `scan` would return; drop the ones that are gone.
 
-        Returns the touched files that are listed now.
+        *known* is the set of ``all_files`` and is kept in step with it.
+        Returns the files that were dropped.
         """
         root = self.source_root
         excluded = scanner.pruned_targets(root, self.settings.target_folders())
-        known = set(self.all_files)
-        listed: set[Path] = set()
+        dropped: set[Path] = set()
         for path in touched:
             if path.exists() and self._belongs(path, root, excluded):
-                listed.add(path)
                 if path not in known:
                     self.all_files.append(path)
                     known.add(path)
@@ -801,8 +806,26 @@ class Engine:
             if path in known:
                 self.all_files.remove(path)
                 known.discard(path)
+                dropped.add(path)
             self._index_forget(path)
-        return listed
+        return dropped
+
+    @staticmethod
+    def _same_shot(path: Path, paths: Sequence[Path]) -> list[Path]:
+        """The entries of *paths* that belong to the same shot as *path*.
+
+        A string prefix is tested before the full key: the key costs several
+        microseconds a file, and on a folder of twenty thousand photographs
+        this runs on every key press.
+        """
+        key = sidecar_mod.group_key(path)
+        folder = os.path.join(os.fspath(path.parent), "")
+        stem = sidecar_mod.base_stem(path).casefold()
+        start = len(folder)
+        return [other for other in paths
+                if (text := os.fspath(other)).startswith(folder)
+                and text[start:].casefold().startswith(stem)
+                and sidecar_mod.group_key(other) == key]
 
     def exclude_targets(self) -> dict | None:
         """Drop files that now sit inside a destination folder.
@@ -957,15 +980,6 @@ class Engine:
         """Place *path* where a full sort would have put it; -1 if not added."""
         if path in self.queue_paths:
             return -1
-        if self.settings.sidecar.enabled:
-            # One row per shot: a restored RAW joins the JPEG already listed.
-            stem = sidecar_mod.base_stem(path).casefold()
-            folder = path.parent
-            for existing in self.queue_paths:
-                if (existing.parent == folder and
-                        sidecar_mod.base_stem(existing).casefold() == stem and
-                        self.settings.sidecar.classify(path, existing) is not None):
-                    return -1
         try:
             value = key(path)
         except OSError:

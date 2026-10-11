@@ -255,20 +255,28 @@ def _matches(path: Path, spec: FilterSpec, pattern) -> bool:
 
 
 def apply_filter(paths: Sequence[Path], spec: FilterSpec, progress: Progress = _noop,
-                 cancel: Cancel = _never) -> list[Path]:
+                 cancel: Cancel = _never, excluded: list[Path] | None = None) -> list[Path]:
+    """The files of *paths* that are still there and pass *spec*.
+
+    *excluded*, when given, collects the files left out because the exclusion
+    list names them, so the caller can take the rest of their shot out too.
+    """
     total = max(1, len(paths))
     out: list[Path] = []
     present = _presence(paths)
+    exclude = spec.exclude
     if spec.narrows_nothing():
         # Nothing to test but "is it still there" and "has it been handled".
-        exclude = spec.exclude
         for index, path in enumerate(paths):
             if cancel():
                 raise Cancelled("cancelled")
             if index % 256 == 0:
                 progress(path.name, int(index * 100 / total))
-            if str(path) not in exclude and present(path):
-                out.append(path)
+            if str(path) not in exclude:
+                if present(path):
+                    out.append(path)
+            elif excluded is not None and present(path):
+                excluded.append(path)
         return out
 
     pattern = spec.compiled_pattern()
@@ -277,8 +285,12 @@ def apply_filter(paths: Sequence[Path], spec: FilterSpec, progress: Progress = _
             raise Cancelled("cancelled")
         if index % 64 == 0:
             progress(path.name, int(index * 100 / total))
-        if present(path) and _matches(path, spec, pattern):
+        if not present(path):
+            continue
+        if _matches(path, spec, pattern):
             out.append(path)
+        elif excluded is not None and str(path) in exclude:
+            excluded.append(path)
     return out
 
 
@@ -343,6 +355,17 @@ def build_queue(paths: Sequence[Path], spec: FilterSpec, rules: sidecar_mod.Side
                 progress: Progress = _noop, cancel: Cancel = _never,
                 capture_time: Callable[[Path], float] | None = None) -> list[Path]:
     """Filter, collapse sidecar groups to one row each, then order."""
-    kept = apply_filter(paths, spec, progress, cancel)
-    collapsed = sidecar_mod.collapse_groups(kept, rules)
-    return sort_paths(collapsed, sort_mode, reverse, ratings, capture_time=capture_time)
+    return sort_paths(queue_rows(paths, spec, rules, progress, cancel), sort_mode, reverse,
+                      ratings, capture_time=capture_time)
+
+
+def queue_rows(paths: Sequence[Path], spec: FilterSpec, rules: sidecar_mod.SidecarRules,
+               progress: Progress = _noop, cancel: Cancel = _never) -> list[Path]:
+    """The rows `build_queue` lists for *paths*, unsorted.
+
+    Shared with the engine's in-place patching, which re-decides the rows of
+    one shot at a time and has to reach the answer a full rebuild would.
+    """
+    handled: list[Path] = []
+    kept = apply_filter(paths, spec, progress, cancel, excluded=handled)
+    return sidecar_mod.collapse_groups(kept, rules, excluded=handled)

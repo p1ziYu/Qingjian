@@ -107,6 +107,29 @@ class SidecarTests(TempCase):
         rules = SidecarRules(hide_from_queue=False)
         self.assertEqual(len(media), len(collapse_groups(media, rules)))
 
+    def test_a_handled_file_takes_its_companions_out_of_the_queue(self):
+        """A shot is one row, so it has to leave the queue as one.
+
+        The handled JPEG was dropped before grouping, which left its raw alone
+        in the group, and the raw became the shot's row.
+        """
+        folder = self.tmp / "shots"
+        jpeg, raw, other = folder / "IMG_1.JPG", folder / "IMG_1.CR2", folder / "IMG_2.JPG"
+        unlinked = folder / "IMG_1.PNG"
+        self.assertEqual([other], collapse_groups([raw, other], SidecarRules(),
+                                                  excluded=[jpeg]))
+        # Only what would travel with the handled file goes with it.
+        rules = SidecarRules(link_same_stem_media=False)
+        self.assertEqual([unlinked, other],
+                         collapse_groups([raw, unlinked, other], rules, excluded=[jpeg]))
+
+    def test_without_linking_a_handled_file_leaves_alone(self):
+        """When companions never travel, the raw was not handled and keeps a row."""
+        folder = self.tmp / "shots"
+        jpeg, raw = folder / "IMG_1.JPG", folder / "IMG_1.CR2"
+        self.assertEqual([raw], collapse_groups([raw], SidecarRules(prompt="never"),
+                                                excluded=[jpeg]))
+
     def test_rules_round_trip_through_a_dict(self):
         rules = SidecarRules(prompt="always", extra_extensions=frozenset({".foo"}))
         again = SidecarRules.from_dict(rules.to_dict())

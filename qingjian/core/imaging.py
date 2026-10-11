@@ -59,13 +59,43 @@ def extract_embedded_jpeg(path: str | Path, search_bytes: int = 16 * 1024 * 1024
                 start = blob.find(_SOI, start + 3)
                 continue
         candidate = blob[start:end + 2]
-        if best is None or len(candidate) > len(best):
+        if (best is None or len(candidate) > len(best)) and _pillow_can_decode(blob, start):
             best = candidate
         start = blob.find(_SOI, end + 2)
     # The largest embedded JPEG wins. Some bodies store only a small preview; a
     # soft picture still beats refusing to show the file, and the perceptual
     # hash is computed at 32 pixels either way.
     return best
+
+
+#: Frame types libjpeg decodes through Pillow: baseline, extended and
+#: progressive, Huffman or arithmetic coded. Not lossless, not hierarchical.
+_DECODABLE_FRAMES = frozenset({0xC0, 0xC1, 0xC2, 0xC9, 0xCA})
+
+
+def _pillow_can_decode(blob: bytes, start: int) -> bool:
+    """False for a JPEG whose frame header says Pillow will refuse it.
+
+    A raw's sensor data can itself be a JPEG: Canon stores it lossless (SOF3)
+    at twelve or fourteen bits. In a small CR2 that is the largest JPEG in the
+    file, and taking it left the file with no preview and no hash. A header
+    that cannot be walked is given the benefit of the doubt, as before.
+    """
+    cursor = start + 2
+    while cursor + 4 < len(blob) and blob[cursor] == 0xFF:
+        marker = blob[cursor + 1]
+        if marker == 0xFF:                       # fill byte before a marker
+            cursor += 1
+            continue
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            return marker in _DECODABLE_FRAMES and blob[cursor + 4] == 8
+        if marker in (0xDA, 0xD9):
+            return True
+        length = int.from_bytes(blob[cursor + 2:cursor + 4], "big")
+        if length < 2:
+            return True
+        cursor += 2 + length
+    return True
 
 
 def _jpeg_end(blob: bytes, start: int) -> int | None:

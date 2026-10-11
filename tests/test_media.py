@@ -905,3 +905,109 @@ class VideoRotationTests(TempCase):
             # Turned clockwise, the stored top-left corner is now the top-right.
             self.assertGreater(image.getpixel((image.width - 5, 4))[0], 200)
             self.assertLess(image.getpixel((4, 4))[0], 50)
+
+
+class RawLayoutTests(TempCase):
+    def test_a_nef_reports_the_raw_size_not_the_thumbnail(self):
+        """Nikon puts the JpgFromRaw preview first among the SubIFDs, without a
+        size of its own, and the raw second. Reading only the first left every
+        NEF at its 160x120 thumbnail, so a burst kept the JPEG over the raw."""
+        preview = g09_jpeg_bytes((1500, 1000))
+        make, date = b"NIKON CORPORATION\0", b"2024:05:01 07:00:00\0"
+
+        def shell(subs, exif_at):
+            return [(0xFE, 4, 1, 1), (0x100, 4, 1, 160), (0x101, 4, 1, 120),
+                    (0x10F, 2, len(make), make), (0x14A, 4, 2, struct.pack("<II", *subs)),
+                    (0x8769, 4, 1, exif_at)]
+
+        def jpg_from_raw(at):
+            return [(0xFE, 4, 1, 1), (0x103, 3, 1, 6), (0x201, 4, 1, at),
+                    (0x202, 4, 1, len(preview))]
+
+        raw = [(0xFE, 4, 1, 0), (0x100, 4, 1, 6048), (0x101, 4, 1, 4024), (0x103, 3, 1, 34713)]
+        first_at = 8 + len(g09_tiff_ifd(shell((0, 0), 0), 8))
+        second_at = first_at + len(g09_tiff_ifd(jpg_from_raw(0), first_at))
+        exif_at = second_at + len(g09_tiff_ifd(raw, second_at))
+        exif = g09_tiff_ifd([(0x9003, 2, len(date), date)], exif_at)
+        nef = self.write(self.tmp / "DSC_0001.NEF", b"II*\0" + struct.pack("<I", 8)
+                         + g09_tiff_ifd(shell((first_at, second_at), exif_at), 8)
+                         + g09_tiff_ifd(jpg_from_raw(exif_at + len(exif)), first_at)
+                         + g09_tiff_ifd(raw, second_at) + exif + preview)
+        jpg = self.write(self.tmp / "DSC_0001.JPG", preview)
+        tags = exifread.read_tiff_exif(nef)
+        self.assertEqual((6048, 4024), (tags["ImageWidth"], tags["ImageLength"]))
+        info = metadata.read(nef, use_cache=False)
+        self.assertEqual((6048, 4024), (info.width, info.height))
+        self.assertFalse(info.captured_is_fallback)
+        groups = dedupe.find_similar([nef, jpg])
+        self.assertEqual(1, len(groups))
+        self.assertEqual(nef, groups[0].keep().path)
+
+    def test_a_small_cr2_is_served_from_its_preview_not_its_sensor_data(self):
+        """Canon stores the sensor data as a lossless JPEG, which Pillow cannot
+        decode. In a small CR2 it is the largest JPEG in the file, so it was
+        picked as the preview and the file silently dropped out of the
+        similar and burst scans."""
+        values = (np.add.outer(np.arange(120), np.arange(180)) % 256).astype(np.uint8)
+        stream = io.BytesIO()
+        Image.fromarray(np.dstack([values, values[::-1], values])).save(stream, "JPEG")
+        preview = stream.getvalue()
+
+        def segment(marker, payload):
+            return b"\xff" + bytes([marker]) + struct.pack(">H", len(payload) + 2) + payload
+
+        huffman = b"\x00" + bytes([0] + [1] * 12 + [0, 0, 0]) + bytes(range(13))
+        sensor = (b"\xff\xd8" + segment(0xC4, huffman)
+                  + segment(0xC3, struct.pack(">BHHB", 14, 100, 200, 2) + b"\x01\x11\x00\x02\x11\x00")
+                  + segment(0xDA, b"\x02\x01\x00\x02\x00\x01\x00\x00")
+                  + bytes(range(250)) * 80 + b"\xff\xd9")
+        self.assertGreater(len(sensor), len(preview))
+        ifd_at = 16
+        bits_at = ifd_at + 2 + 9 * 12 + 4
+        preview_at = bits_at + 6
+
+        def entry(tag, kind, count, value):
+            return struct.pack("<HHI", tag, kind, count) + value
+
+        ifd = struct.pack("<H", 9)
+        ifd += entry(0x100, 3, 1, struct.pack("<HH", 180, 0))
+        ifd += entry(0x101, 3, 1, struct.pack("<HH", 120, 0))
+        ifd += entry(0x102, 3, 3, struct.pack("<I", bits_at))
+        ifd += entry(0x103, 3, 1, struct.pack("<HH", 6, 0))
+        ifd += entry(0x106, 3, 1, struct.pack("<HH", 6, 0))
+        ifd += entry(0x111, 4, 1, struct.pack("<I", preview_at))
+        ifd += entry(0x112, 3, 1, struct.pack("<HH", 1, 0))
+        ifd += entry(0x115, 3, 1, struct.pack("<HH", 3, 0))
+        ifd += entry(0x117, 4, 1, struct.pack("<I", len(preview))) + struct.pack("<I", 0)
+        cr2 = self.write(self.tmp / "IMG_0001.CR2",
+                         b"II*\x00" + struct.pack("<I", ifd_at) + b"CR\x02\x00" + struct.pack("<I", 0)
+                         + ifd + struct.pack("<HHH", 8, 8, 8) + preview + sensor)
+        jpg = self.write(self.tmp / "IMG_0001.JPG", preview)
+        self.assertEqual(preview, imaging.extract_embedded_jpeg(cr2))
+        self.assertEqual(imaging.phash(jpg), imaging.phash(cr2))
+        self.assertEqual((64, 43), imaging.thumbnail(cr2, (64, 64)).size)
+
+    def test_a_rational_crop_size_or_a_listed_subfile_type_keeps_the_rest(self):
+        """DNG allows DefaultCropSize as RATIONAL, and NewSubfileType can come
+        as a list. One int() on either threw away the whole parse, capture
+        date and orientation included."""
+        date = b"2024:05:01 07:00:00\0"
+        for name, odd in (
+                ("crop.dng", (0xC620, 5, 2, struct.pack("<IIII", 6000, 1, 4000, 1))),
+                ("subfile.dng", (0xFE, 4, 2, struct.pack("<II", 0, 0)))):
+            with self.subTest(name=name):
+                shell = [(0x112, 3, 1, 6), (0x8769, 4, 1, 0),
+                         (0xC612, 1, 4, bytes([1, 4, 0, 0])), odd]
+                exif_at = 8 + len(g09_tiff_ifd(shell, 8))
+                shell[1] = (0x8769, 4, 1, exif_at)
+                path = self.write(self.tmp / name, b"II*\0" + struct.pack("<I", 8)
+                                  + g09_tiff_ifd(shell, 8)
+                                  + g09_tiff_ifd([(0x9003, 2, len(date), date)], exif_at)
+                                  + b"\0" * 9000)
+                tags = exifread.read_tiff_exif(path)
+                self.assertEqual("2024:05:01 07:00:00", tags["DateTimeOriginal"])
+                info = metadata.read(path, use_cache=False)
+                self.assertFalse(info.captured_is_fallback)
+                self.assertEqual(6, info.orientation)
+                if name == "crop.dng":
+                    self.assertEqual((6000, 4000), (info.width, info.height))

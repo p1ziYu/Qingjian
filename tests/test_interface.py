@@ -1400,7 +1400,7 @@ class RuntimeMainWindowContractTests(WindowCase):
              mock.patch.object(self.window, "_rebuild_queue",
                                side_effect=AssertionError("unexpected rebuild")):
             self.window._finish_operation(self.engine.current_path(), 0, outcome)
-        absorb.assert_called_once_with(record)
+        absorb.assert_called_once_with(record, unordered=self.settings.background_queue)
         apply.assert_called_once_with(change)
 
     def test_rename_skip_and_unchanged_duplicates_use_their_single_hooks(self):
@@ -1485,7 +1485,7 @@ class RuntimeMainWindowContractTests(WindowCase):
              mock.patch.object(self.window, "_rebuild_queue") as rebuild:
             self.window._finish_operation(
                 self.engine.current_path(), self.engine.index, ops.Outcome(record=record))
-        absorb.assert_called_once_with(record)
+        absorb.assert_called_once_with(record, unordered=self.settings.background_queue)
         apply.assert_called_once_with(change)
         rebuild.assert_not_called()
 

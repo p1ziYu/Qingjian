@@ -1202,6 +1202,7 @@ class PreviewDecodeTests(TempCase):
         window._preview_target.return_value = target
         window.preloader = fetcher
         window._preview_retries = {}
+        window._show_in_full = lambda shown, ready: MainWindow._show_in_full(window, shown, ready)
         fetcher.arrived.connect(lambda name: MainWindow._preview_arrived(window, name))
         with patch.object(preview, "decode_qimage", decode_while_written):
             fetcher.set_wanted([path], target)

@@ -249,7 +249,8 @@ class Planner:
             return Outcome(cancelled=True, message_key="bind.target_folder")
         base = Path(binding.folder).expanduser().resolve()
         master = group.master
-        uses_sequence = "{seq" in binding.path_template or "{seq" in binding.name_template
+        uses_sequence = (template.uses_token(binding.path_template, "seq")
+                         or template.uses_token(binding.name_template, "seq"))
         seq = self.sequence.take(binding) if uses_sequence else self.sequence.peek(binding)
         ctx = self.context_for(master, binding, source_root, seq)
         try:

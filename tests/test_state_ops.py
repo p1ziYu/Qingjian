@@ -599,6 +599,23 @@ class G03PlanningTests(TempCase):
                 engine.classify(binding, source)
         self.assertEqual(before, engine.planner.sequence.peek(binding))
 
+    def test_every_spelling_of_the_sequence_token_advances_it(self):
+        """``{序号}`` and ``{ seq }`` render the number but never moved it on.
+
+        Every file was named 0001, then 0001 (2); with a remembered Replace,
+        each one overwrote the last.
+        """
+        for index, text in enumerate(("{序号:4}", "{ seq :4}")):
+            with self.subTest(template=text):
+                engine = Engine(self.data / f"engine{index}", config.Settings())
+                self.addCleanup(engine.close)
+                out = self.tmp / f"out{index}"
+                binding = config.Binding("1", "copy", str(out), name_template=text)
+                for name in ("A.JPG", "B.JPG"):
+                    engine.classify(binding, self.write(self.tmp / f"src{index}" / name,
+                                                        name.encode()))
+                self.assertEqual(["0001.JPG", "0002.JPG"], self.tree(out))
+
     def test_path_template_sequence_advances(self):
         source = self.tmp / "A.JPG"
         source.write_bytes(b"j")

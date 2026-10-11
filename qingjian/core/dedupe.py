@@ -124,7 +124,8 @@ def identity_key(path: str | Path, digest: str) -> str:
 
 
 def find_exact(paths: Sequence[Path], cache=None, ignored: set[str] | None = None,
-               progress: Progress = _noop, cancel: Cancel = _never) -> list[Group]:
+               progress: Progress = _noop, cancel: Cancel = _never,
+               workers: int = 0) -> list[Group]:
     """Byte-identical files, found without reading the library end to end.
 
     Three narrowing passes. Sizes come from the directory entry. Files that
@@ -153,7 +154,8 @@ def find_exact(paths: Sequence[Path], cache=None, ignored: set[str] | None = Non
         for path in bucket:
             sizes[path] = size
     by_sample: dict[tuple, list[Path]] = defaultdict(list)
-    for path, digest in _mapped(sample_digest, contested, progress, cancel, first=0, span=35):
+    for path, digest in _mapped(sample_digest, contested, progress, cancel, workers,
+                                first=0, span=35):
         # The size comes from the pass that already stat'd it; stat'ing again
         # here meant one file vanishing mid-scan threw the whole scan away.
         if digest is not None:
@@ -175,7 +177,7 @@ def find_exact(paths: Sequence[Path], cache=None, ignored: set[str] | None = Non
 
     by_digest: dict[str, list[Path]] = defaultdict(list)
     with (cache.batch() if cache is not None else nullcontext()):
-        for path, digest in _mapped(full, suspects, progress, cancel, first=35, span=55):
+        for path, digest in _mapped(full, suspects, progress, cancel, workers, first=35, span=55):
             if not digest:
                 continue
             if cache is not None:
@@ -248,7 +250,8 @@ def banded_pairs(hashes: Sequence[int], max_distance: int) -> set[tuple[int, int
 
 def find_similar(paths: Sequence[Path], threshold: float = 0.92, cache=None,
                  ignored: set[str] | None = None, progress: Progress = _noop,
-                 cancel: Cancel = _never, score_quality: bool = True) -> list[Group]:
+                 cancel: Cancel = _never, score_quality: bool = True,
+                 workers: int = 0) -> list[Group]:
     """Group images whose perceptual hashes are within *threshold*."""
     ignored = ignored or set()
     from . import mediatypes
@@ -268,7 +271,7 @@ def find_similar(paths: Sequence[Path], threshold: float = 0.92, cache=None,
     usable: list[Path] = []
     hashes: list[int] = []
     with (cache.batch() if cache is not None else nullcontext()):
-        for path, value in _mapped(hash_of, stills, progress, cancel, first=0, span=85):
+        for path, value in _mapped(hash_of, stills, progress, cancel, workers, first=0, span=85):
             if value is None:
                 continue
             if cache is not None:
@@ -465,7 +468,8 @@ def _ranked_group(mode: str, candidates: list[Candidate]) -> Group:
 
 def find_bursts(paths: Sequence[Path], gap_seconds: float = 2.0, minimum: int = 3,
                 similarity_floor: float = 0.85, cache=None, ignored: set[str] | None = None,
-                progress: Progress = _noop, cancel: Cancel = _never) -> list[Group]:
+                progress: Progress = _noop, cancel: Cancel = _never,
+                workers: int = 0) -> list[Group]:
     """Runs of frames shot in quick succession that also look alike."""
     ignored = ignored or set()
     from . import mediatypes
@@ -490,7 +494,7 @@ def find_bursts(paths: Sequence[Path], gap_seconds: float = 2.0, minimum: int = 
 
     entries = []
     with (cache.batch() if cache is not None else nullcontext()):
-        for path, found in _mapped(timed, stills, progress, cancel, first=0, span=85):
+        for path, found in _mapped(timed, stills, progress, cancel, workers, first=0, span=85):
             if found is None:
                 continue
             when, value = found

@@ -80,8 +80,10 @@ class Engine:
                                verify=self.settings.verification,
                                fast_path=self.settings.fast_path)
         self.state = StateStore(self.data_dir / "state" / "state.db")
-        self.cache = hashcache.HashCache(
-            (self.data_dir / "cache" / "hashes.db") if self.settings.hash_cache else None)
+        self.cache = self._open_cache(self.settings.hash_cache)
+        #: Caches swapped out by Settings, closed with the engine: a duplicate
+        #: scan still running on a worker may hold one.
+        self._retired_caches: list[hashcache.HashCache] = []
         self.planner = ops.Planner(self.store, self.state, self.settings)
         self.queue = OperationQueue(on_event=self._on_queue_event)
         self.queue_listeners: list[Callable[[str, Job], None]] = []
@@ -103,9 +105,13 @@ class Engine:
         log.info("engine ready · version %s · data %s", __version__, self.data_dir)
 
     # ------------------------------------------------------------ setup
+    def _open_cache(self, on_disk: bool) -> hashcache.HashCache:
+        return hashcache.HashCache((self.data_dir / "cache" / "hashes.db") if on_disk else None)
+
     def close(self) -> None:
         self.queue.stop()
-        self.cache.close()
+        for cache in (*self._retired_caches, self.cache):
+            cache.close()
         self.state.close()
 
     def save_settings(self) -> None:
@@ -113,6 +119,11 @@ class Engine:
 
     def apply_settings(self, settings: config.Settings) -> None:
         """Adopt edited settings, re-tuning the pieces that depend on them."""
+        if settings.hash_cache != self.settings.hash_cache:
+            # Read only when the engine was made, so the switch waited for a
+            # restart to keep, or stop keeping, hashes on disk.
+            self._retired_caches.append(self.cache)
+            self.cache = self._open_cache(settings.hash_cache)
         self.settings = settings
         self.planner.settings = settings
         self.store.verify = settings.verification
@@ -1049,14 +1060,18 @@ class Engine:
         paths = list(self.all_files)
         root = str(self.source_root or "")
         ignored = self.state.ignored_keys(root)
+        # "Worker threads" in Settings: the files read side by side while hashing.
+        # It was saved and never read, so a slow share could not be eased.
+        workers = self.settings.workers
         if mode == dedupe.MODE_SIMILAR:
             return dedupe.find_similar(paths, self.settings.similar_threshold, self.cache,
-                                       ignored, progress, cancel)
+                                       ignored, progress, cancel, workers=workers)
         if mode == dedupe.MODE_BURST:
             return dedupe.find_bursts(paths, self.settings.burst_gap_seconds,
                                       self.settings.burst_minimum, cache=self.cache,
-                                      ignored=ignored, progress=progress, cancel=cancel)
-        return dedupe.find_exact(paths, self.cache, ignored, progress, cancel)
+                                      ignored=ignored, progress=progress, cancel=cancel,
+                                      workers=workers)
+        return dedupe.find_exact(paths, self.cache, ignored, progress, cancel, workers=workers)
 
     def ignore_duplicates(self, candidates: Sequence[dedupe.Candidate],
                           root: Path) -> ops.Outcome:

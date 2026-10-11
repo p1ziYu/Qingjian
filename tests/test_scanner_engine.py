@@ -984,6 +984,52 @@ class FarDateTests(TempCase):
         self.assertEqual(3, len(engine.queue_paths))
 
 
+class WorkerSettingTests(TempCase):
+    def test_duplicate_scans_read_with_the_threads_settings_asks_for(self):
+        """"Worker threads" was saved and never read: every scan used its own
+        count, and a slow share could not be eased by turning it down."""
+        from unittest import mock
+        src = self.tmp / "src"
+        for name in "AB":
+            photo(src / f"{name}.JPG")
+        (src / "C.JPG").write_bytes((src / "A.JPG").read_bytes())
+        settings = config.Settings()
+        settings.workers = 3
+        engine = Engine(self.data, settings)
+        self.addCleanup(engine.close)
+        engine.open_folder(src)
+        asked = []
+        real = dedupe._mapped
+
+        def recording(work, items, progress=None, cancel=None, workers=0, **kwargs):
+            asked.append(workers)
+            return real(work, items, progress or (lambda *_: None),
+                        cancel or (lambda: False), workers, **kwargs)
+
+        with mock.patch.object(dedupe, "_mapped", recording):
+            for mode in (dedupe.MODE_EXACT, dedupe.MODE_SIMILAR, dedupe.MODE_BURST):
+                engine.find_duplicates(mode)
+        self.assertTrue(asked)
+        self.assertEqual({3}, set(asked) - {2})     # the keeper scoring keeps its pair
+
+
+class HashCacheSwitchTests(TempCase):
+    def test_turning_the_hash_cache_off_or_on_takes_effect_at_once(self):
+        """The switch was read only when the engine was made."""
+        settings = config.Settings()
+        engine = Engine(self.data, settings)
+        self.addCleanup(engine.close)
+        self.assertIsNotNone(engine.cache.path)
+        off = config.Settings.from_dict(settings.to_dict())
+        off.hash_cache = False
+        engine.apply_settings(off)
+        self.assertIsNone(engine.cache.path)
+        on = config.Settings.from_dict(off.to_dict())
+        on.hash_cache = True
+        engine.apply_settings(on)
+        self.assertEqual(self.data / "cache" / "hashes.db", engine.cache.path)
+
+
 class LockedCaptureTimeTests(TempCase):
     def test_a_capture_time_read_from_a_locked_file_is_not_remembered(self):
         """A photo locked once while the folder was sorted kept its mtime as

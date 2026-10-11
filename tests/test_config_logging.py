@@ -773,8 +773,16 @@ class DiagnosticBundleTests(TempCase):
                                     "or directory: '/srv/ann/a.png'")
         self.assertIn(": [Errno 2] No such file or directory: '<path", line)
         self.assertEqual(2, line.count("<path "), line)
-        line = logsetup.redact_text("move /srv/a.jpg: permission denied, retry with /srv/b")
-        self.assertIn(": permission denied, retry with <path", line)
+        # A space, comma or semicolon may be part of a folder's name, so there
+        # the run is masked whole: a word lost rather than a name given away.
+        for line, names in (("read ~/Trip: Japan;/x.png: gone", ("Japan", "x.png")),
+                            ("read /home/u/a.png:/home/u/b.png", ("b.png", "/u/")),
+                            ("read /home/u/Fam: Smith, /IMG.jpg", ("Smith", "IMG")),
+                            ("read /home/u/Trip: Japan /x.jpg", ("Japan", "x.jpg"))):
+            with self.subTest(line=line):
+                masked = logsetup.redact_text(line)
+                for name in names:
+                    self.assertNotIn(name, masked)
 
     def test_a_folder_name_after_a_dot_is_not_reported_as_an_extension(self):
         """``Wedding.ChenLi`` is a folder, and "chenli" is the name in it."""

@@ -296,8 +296,8 @@ def _mask_matches(pattern: re.Pattern[str], text: str) -> list[tuple[str, bool]]
 #: Characters a Windows name may not hold, at which the Windows forms stop.
 _WINDOWS_FORBIDDEN = frozenset(':*?"<>|')
 _POSIX_RUN = re.compile(r"(?:/(?:[^/\x00\r\n]*[^\s/\x00])?)+")
-#: What stands before a path that begins afresh rather than one that goes on.
-_PATH_OPENERS = frozenset(" \t'\"([{<=,;")
+#: A quote stands before a path that begins afresh, as error messages quote it.
+_PATH_QUOTES = frozenset("'\"")
 
 
 def _posix_tail(text: str, start: int, found: str) -> str:
@@ -316,15 +316,34 @@ def _posix_tail(text: str, start: int, found: str) -> str:
     end = start + len(found)
     line_end = text.find("\n", end)
     rest = text[end:line_end if line_end >= 0 else len(text)]
-    slash = rest.find("/")
-    # The separator has to carry on a name -- "Japan/" -- not start a path of
-    # its own after a space or a quote, as in "...: No such file: '/home/...".
-    if rest[:1] not in _WINDOWS_FORBIDDEN or slash < 1 or rest[slash - 1] in _PATH_OPENERS:
+    if rest[:1].isalnum():
+        # Stopped inside a name: "a.png:/home/..." reads "g:/" as a drive.
+        run = _POSIX_RUN.match(text, start + found.index("/"))
+        stop = run.end() if run is not None else end
+    else:
+        slash = rest.find("/")
+        if rest[:1] not in _WINDOWS_FORBIDDEN or slash < 1 or _starts_afresh(rest, slash):
+            return found
+        # On through the next separator and the path it carries on.
+        run = _POSIX_RUN.match(text, end + slash)
+        stop = run.end() if run is not None else end + slash + 1
+    if stop <= end:
         return found
-    run = _POSIX_RUN.match(text, start + found.index("/"))
-    if run is None or run.end() <= end:
-        return found
-    return _trim_path(text[start:run.end()], text[run.end():run.end() + 1])
+    return _trim_path(text[start:stop], text[stop:stop + 1])
+
+
+def _starts_afresh(rest: str, slash: int) -> bool:
+    """Does the separator at *slash* open a path of its own, not carry on a name?
+
+    Only a quote, or a bracket after a space, says so for certain -- "...: No
+    such file: '/home/..." -- and only then is the reason kept. A space, a
+    comma or a semicolon may as well be part of a folder's name ("Fam: Smith,
+    Jones/"), so there the whole run is masked: a word of the sentence lost
+    rather than a name given away.
+    """
+    before = rest[slash - 1]
+    return before in _PATH_QUOTES or (
+        before in "([{<" and slash >= 2 and rest[slash - 2].isspace())
 
 
 def redact_text(text: str) -> str:

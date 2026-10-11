@@ -581,8 +581,10 @@ class Engine:
         if target is None:
             return ops.Outcome(skipped=True)
         with self.exclusive():
-            outcome = self.planner.plan_rename(self.group_for(target), new_name,
-                                               self.source_root, resolver)
+            # "Never" keeps companions where they are for every action; a rename
+            # that took the raw and XMP along was the one place it did not.
+            outcome = self.planner.plan_rename(self._operation_group(self.group_for(target)),
+                                               new_name, self.source_root, resolver)
             return self._commit(outcome, progress, cancel)
 
     def trash(self, path: str | Path | None = None, progress=_noop, cancel=_never,

@@ -1030,6 +1030,27 @@ class HashCacheSwitchTests(TempCase):
         self.assertEqual(self.data / "cache" / "hashes.db", engine.cache.path)
 
 
+class RenameCompanionTests(TempCase):
+    def test_a_rename_takes_companions_along_only_where_the_setting_links_them(self):
+        """"Never" kept the raw and XMP where they were for every action but a
+        rename, which still renamed them with the JPEG."""
+        from qingjian.core import sidecar
+        for prompt, moved in ((sidecar.PROMPT_NEVER, False), (sidecar.PROMPT_ALWAYS, True)):
+            with self.subTest(prompt=prompt):
+                src = self.tmp / prompt / "src"
+                photo(src / "IMG_1.JPG")
+                (src / "IMG_1.CR2").write_bytes(b"raw")
+                settings = config.Settings()
+                settings.sidecar = SidecarRules(prompt=prompt)
+                engine = Engine(self.tmp / prompt / "data", settings)
+                self.addCleanup(engine.close)
+                engine.open_folder(src)
+                engine.rename("Trip.JPG", src / "IMG_1.JPG")
+                self.assertTrue((src / "Trip.JPG").exists())
+                self.assertEqual(moved, (src / "Trip.CR2").exists())
+                self.assertEqual(not moved, (src / "IMG_1.CR2").exists())
+
+
 class LockedCaptureTimeTests(TempCase):
     def test_a_capture_time_read_from_a_locked_file_is_not_remembered(self):
         """A photo locked once while the folder was sorted kept its mtime as

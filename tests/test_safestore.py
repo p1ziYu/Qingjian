@@ -224,6 +224,23 @@ class PrecheckTests(StoreCase):
         self.assertFalse(self.store.has_pending())
 
 
+    def test_a_replace_whose_photo_vanished_is_refused_before_the_old_file_goes(self):
+        """The replaced file looks like the photo already moved in; the photo is just gone."""
+        stamp = 1_700_000_000_000_000_000
+        photo = self.file("a.bin", b"new content")
+        target = self.write(self.dst / "a.bin", b"old content")
+        for path in (photo, target):
+            os.utime(path, ns=(stamp, stamp))
+        unlink = step_unlink(target, identity(target, VERIFY_FAST))
+        unlink["snapshot"] = self.store.snapshot(target)
+        plan = Plan(forward=[unlink, step_move(photo, target, identity(photo, VERIFY_FAST))])
+        photo.unlink()
+        with self.assertRaises(TransactionError) as caught:
+            self.store.run(plan)
+        self.assertEqual("error.external_change", caught.exception.key)
+        self.assertEqual(b"old content", target.read_bytes())
+        self.assertFalse(self.store.has_pending())
+
     def test_a_target_that_cannot_be_stated_is_refused_before_anything_moves(self):
         """"I cannot tell" is not "nothing is there".
 

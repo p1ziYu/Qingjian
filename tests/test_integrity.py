@@ -264,6 +264,26 @@ class StuckJournalTests(TempCase):
         engine.classify(binding, source / "IMG_2.JPG")
         self.assertTrue((keep / "IMG_2.JPG").is_file())
 
+    def test_undoing_a_replace_whose_restore_copy_is_gone_is_refused_up_front(self):
+        """The photo is as large as the file it replaced, so the restore looked done already.
+
+        But the undo first moves that photo away, so nothing would be there to
+        find: the missing restore copy has to stop the undo before anything moves.
+        """
+        engine, source, keep = self.build()
+        replaced = self.write(keep / "IMG_2.JPG", b"L" * 500)
+        outcome = engine.classify(config.Binding(key="1", action="move", folder=str(keep)),
+                                  source / "IMG_2.JPG",
+                                  resolver=lambda a, b: ops.CONFLICT_REPLACE)
+        for snapshot in outcome.record.snapshots:
+            Path(snapshot).unlink()
+        with self.assertRaises(TransactionError) as caught:
+            engine.undo()
+        self.assertEqual("status.undo_stuck", caught.exception.key)
+        self.assertFalse(engine.has_pending())
+        self.assertEqual(b"K" * 500, replaced.read_bytes(), "the photo was moved back regardless")
+        self.assertFalse((source / "IMG_2.JPG").exists())
+
 
 class ReplaceRecoveryTests(TempCase):
     """Every step ran, the state commit did not: recovery must see that."""

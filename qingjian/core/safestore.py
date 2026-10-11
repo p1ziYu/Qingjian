@@ -730,7 +730,12 @@ class SafeStore:
         for step in plan.forward:
             kind, dst = step["kind"], Path(step["dst"])
             dkey = _path_key(dst)
-            done = self._step_done(step, VERIFY_FAST, stat_of=stat_of)
+            # What stands at a path an earlier step empties is gone by the time
+            # this step runs, so it cannot show this step as done. Undoing a
+            # Replace moves the photo away, then restores from the restore copy;
+            # a photo as large as the file it replaced passed for that restore
+            # and the missing restore copy surfaced only half-way through.
+            done = dkey not in gone and self._step_done(step, VERIFY_FAST, stat_of=stat_of)
             if kind in (MOVE, COPY):
                 src = Path(step["src"])
                 skey = _path_key(src)

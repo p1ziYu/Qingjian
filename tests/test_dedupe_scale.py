@@ -477,6 +477,77 @@ class ScoringFailureTests(TempCase):
             self.assertIsNone(cache.get(path, "sharpness"))
 
 
+class GroupingTests(TempCase):
+    """Which frames end up together must not depend on luck."""
+
+    def test_a_burst_in_one_second_is_the_same_whatever_finishes_first(self):
+        """EXIF dates have one-second resolution, so every frame of a burst ties
+        on time and the run was built in the order the workers finished."""
+        import random
+
+        import numpy as np
+        from PIL import Image, ImageFilter
+
+        noise = np.random.default_rng(11).integers(0, 256, (600, 3000), dtype=np.uint8)
+        blurred = np.asarray(Image.fromarray(noise).filter(ImageFilter.GaussianBlur(40)),
+                             dtype=np.float64)
+        blurred = (blurred - blurred.min()) / (blurred.max() - blurred.min()) * 255
+        pan = Image.fromarray(blurred.astype(np.uint8)).convert("RGB")
+        exif = Image.Exif()
+        exif.get_ifd(0x8769)[0x9003] = "2024:05:01 10:00:00"
+        folder = self.tmp / "burst"
+        folder.mkdir()
+        paths = []
+        for index in range(6):
+            path = folder / f"DSC_{index:04d}.JPG"
+            pan.crop((index * 14, 0, index * 14 + 600, 600)).save(path, exif=exif, quality=92)
+            paths.append(path)
+        cache = HashCache(None)
+
+        def shuffled(seed):
+            def mapped(work, items, *_args, **_kwargs):
+                order = list(items)
+                random.Random(seed).shuffle(order)
+                return [(item, work(item)) for item in order]
+            return mapped
+
+        outcomes = set()
+        for seed in range(16):
+            with patch.object(dedupe, "_mapped", shuffled(seed)):
+                groups = dedupe.find_bursts(paths, minimum=3, cache=cache)
+            outcomes.add(tuple(tuple(m.path.name for m in g.members) for g in groups))
+        self.assertEqual(1, len(outcomes), outcomes)
+        self.assertTrue(next(iter(outcomes)), "no burst was found at all")
+
+    def test_a_slow_pan_is_not_chained_into_one_group(self):
+        """Near-match is not transitive. In a slow pan every frame is close to
+        the next, and joining every close pair joined the first frame to the
+        last: a group whose members did not look like the frame it kept."""
+        folder = self.tmp / "pan"
+        folder.mkdir()
+        paths = [self.write(folder / f"pan_{index}.jpg", os.urandom(9000)) for index in range(6)]
+        # Each hash three bits from the next, so only neighbours are within the
+        # five bits a 0.92 threshold allows.
+        hashes = {path: (1 << (3 * index)) - 1 for index, path in enumerate(paths)}
+
+        def read(path):
+            return SimpleNamespace(size=9000, width=1200 if path == paths[2] else 1000,
+                                   height=800, captured_is_fallback=True, timestamp=lambda: 0.0)
+
+        with patch.object(dedupe.metadata, "read", side_effect=read), \
+                patch.object(dedupe.imaging, "phash", side_effect=lambda path: hashes[path]), \
+                patch.object(dedupe.imaging, "quality_score",
+                             return_value={"sharpness": 50.0, "blown": 0.0, "crushed": 0.0}):
+            groups = dedupe.find_similar(paths, 0.92)
+        self.assertTrue(groups)
+        for group in groups:
+            for member in group.members:
+                self.assertGreaterEqual(member.similarity, 0.92,
+                                        f"{member.path.name} vs {group.keep().path.name}")
+        self.assertIn({paths[1], paths[2], paths[3]},
+                      [{m.path for m in g.members} for g in groups])
+
+
 class G10DialogLifetimeTests(unittest.TestCase):
     def test_timed_out_pool_is_not_destroyed_with_dialog(self):
         from PySide6.QtCore import QCoreApplication, QEvent

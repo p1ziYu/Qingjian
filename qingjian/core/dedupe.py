@@ -301,12 +301,33 @@ def find_similar(paths: Sequence[Path], threshold: float = 0.92, cache=None,
             if ignored:
                 candidates = [c for c in candidates
                               if identity_key(c.path, c.digest or "") not in ignored]
-            if len(candidates) < 2:
-                continue
-            groups.append(_ranked_group(MODE_SIMILAR, candidates))
+            for chosen in _around_keepers(candidates, distance):
+                groups.append(_ranked_group(MODE_SIMILAR, chosen))
     progress("", 100)
     groups.sort(key=lambda g: -g.reclaimable_bytes())
     return groups
+
+
+def _around_keepers(candidates: list[Candidate], max_distance: int) -> list[list[Candidate]]:
+    """Cut a cluster of near matches into groups that each match their keeper.
+
+    Near-match is not transitive. In a slow pan every frame is close to the
+    next, so joining every close pair joined the first frame to the last, and
+    the group offered to delete frames that looked nothing like the one it
+    kept. Each group here is grown round the best frame left, which is the one
+    it will keep, and takes only the frames within the threshold of it.
+    """
+    remaining = list(candidates)
+    out: list[list[Candidate]] = []
+    while len(remaining) > 1:
+        keeper = remaining[_best_index(remaining)]
+        close = [c for c in remaining if c is keeper
+                 or imaging.hamming(keeper.phash or 0, c.phash or 0) <= max_distance]
+        if len(close) > 1:
+            out.append(close)
+        taken = {id(c) for c in close}
+        remaining = [c for c in remaining if id(c) not in taken]
+    return out
 
 
 def _digest_for_ignore(path: Path, cache, ignored: set[str], cancel: Cancel,
@@ -437,7 +458,12 @@ def find_bursts(paths: Sequence[Path], gap_seconds: float = 2.0, minimum: int = 
                 cache.put_by_key(keys[path], phash=value)
             entries.append((when, path, value))
 
-    entries.sort(key=lambda item: item[0])
+    # EXIF dates have one-second resolution, so the frames of a burst tie on
+    # time. Sorted on time alone they kept the order the workers finished in,
+    # and each frame is only compared with the one before it: the same folder
+    # gave a different burst on every scan. The name breaks the tie, and a
+    # camera numbers its frames in shooting order.
+    entries.sort(key=lambda item: (item[0], str(item[1])))
     groups: list[Group] = []
     run: list[tuple[float, Path, int]] = []
 

@@ -795,6 +795,34 @@ class G09MediaTests(TempCase):
         self.addCleanup(cache.close)
         self.assertIsNone(cache.get(path, 'captured'))
 
+    def test_capture_times_and_zero_scores_from_before_are_read_again(self):
+        """A file locked during a scan kept its mtime as its capture time, and
+        one that could not be decoded kept a sharpness of 0, until it changed."""
+        path = self.root / 'IMG_0001.JPG'
+        path.write_bytes(b'jpeg')
+        db = self.root / 'v2.sqlite'
+        from qingjian.core.hashcache import SCHEMA
+        from qingjian.core.imaging import ALGORITHM_VERSION
+        stat = path.stat()
+        connection = sqlite3.connect(db)
+        try:
+            connection.executescript(SCHEMA)
+            connection.executemany("INSERT INTO cache_meta(key,value) VALUES(?,?)",
+                                   [('algorithm', str(ALGORITHM_VERSION)), ('captured', '2')])
+            connection.execute('INSERT INTO entries(path,size,mtime_ns,captured,sharpness,updated) '
+                               'VALUES(?,?,?,?,?,?)',
+                               (str(path), stat.st_size, stat.st_mtime_ns, 123.0, 0.0, 0.0))
+            connection.execute('INSERT INTO entries(path,size,mtime_ns,sharpness,updated) '
+                               'VALUES(?,?,?,?,?)', ('sharp.jpg', 1, 1, 42.0, 0.0))
+            connection.commit()
+        finally:
+            connection.close()
+        cache = HashCache(db)
+        self.addCleanup(cache.close)
+        self.assertIsNone(cache.get(path, 'captured'))
+        self.assertIsNone(cache.get(path, 'sharpness'))
+        self.assertEqual(42.0, cache.get_by_key(('sharp.jpg', 1, 1), 'sharpness'))
+
     def test_f050_f056_hashcache_migration_and_replace(self):
         path = self.root / 'media.bin'
         path.write_bytes(b'A' * 100)

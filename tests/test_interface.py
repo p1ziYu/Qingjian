@@ -1865,6 +1865,47 @@ class BackgroundQueueTests(WindowCase):
         self.until(lambda: current.exists(), "the old name did not come back")
         self.assertFalse(target.exists())
 
+    def test_filing_from_the_review_grid_keeps_the_next_pick(self):
+        """The review list is a query, and asking it again after every filing
+        refilled the grid: the tile picked while the job ran was let go."""
+        from qingjian.core import config
+        self.engine.send_to_review(list(self.engine.queue_paths), root=self.source)
+        self.window.toggle_review()
+        self.window._set_view(config.VIEW_GRID)
+        self.app.processEvents()
+        grid = self.window.grid
+        first, second = (str(path) for path in self.engine.queue_paths[2:4])
+        grid.clearSelection()
+        grid._rows[first].setSelected(True)
+        grid.setCurrentItem(grid._rows[first])
+        rebuilds = []
+        real = self.window._rebuild_queue
+        self.patch(self.window, "_rebuild_queue", lambda: rebuilds.append(1) or real())
+        self.window.classify_index(0)
+        grid.clearSelection()
+        grid._rows[second].setSelected(True)
+        grid.setCurrentItem(grid._rows[second])
+        self.assertTrue(self.settled())
+        self.until(lambda: not self.window._inflight, "the filing never landed")
+        self.app.processEvents()
+        self.assertEqual([], rebuilds)
+        self.assertEqual([second], grid.selected_paths())
+        self.assertNotIn(Path(first), self.engine.queue_paths)
+
+    def test_f2_in_review_keeps_the_new_name_in_the_review_list(self):
+        from unittest import mock
+        self.engine.send_to_review(list(self.engine.queue_paths), root=self.source)
+        self.window.toggle_review()
+        current = self.engine.current_path()
+        target = current.with_name("renamed.JPG")
+        with mock.patch("qingjian.ui.mainwindow.get_text", return_value=("renamed.JPG", True)):
+            self.press(Qt.Key.Key_F2)
+            self.until(lambda: target.exists(), "the file was not renamed")
+        self.app.processEvents()
+        self.assertTrue(self.engine.review_mode)
+        self.assertIn(target, self.engine.queue_paths)
+        self.assertNotIn(current, self.engine.queue_paths)
+
     def test_f2_in_random_order_keeps_the_new_name_in_the_list(self):
         """Random order has no place to insert a file, and with the background
         queue only the old row was taken out: the photo was on disk under its

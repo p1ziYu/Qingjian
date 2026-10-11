@@ -1940,15 +1940,19 @@ class MainWindow(QMainWindow):
             # disk and nowhere on screen.
             change = self.engine.absorb(outcome.record,
                                         unordered=self.settings.background_queue)
-            if change is None and self._inflight:
-                # The review list is a query, and asked again now it would list
-                # the photos still out with the queue a second time. Their rows
-                # go; the next rebuild, from a file list absorb kept current,
-                # brings back anything this record made.
+            if change is None and self.settings.background_queue:
+                # The review list is a query. Asked again after every filing it
+                # refilled both views, which threw away the tile picked while
+                # the job ran, and with jobs still out it would list them a
+                # second time. Only the rows that went are taken out; a rename,
+                # the one filing that leaves a new name in the list, asks again
+                # once nothing is out.
                 removed = [touched for touched in self.engine.touched_paths(outcome.record)
                            if not touched.exists() and self.engine.drop_from_queue(touched) >= 0]
                 if removed:
                     self._apply_change({"removed": removed, "added": []})
+                if outcome.record.action == "rename" and not self._inflight:
+                    self._rebuild_queue()
                 self._update_slip()
             elif change is None:
                 self._rebuild_queue()

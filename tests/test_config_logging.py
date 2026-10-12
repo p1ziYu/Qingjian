@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import zipfile
 import json
 from pathlib import Path
@@ -19,13 +20,13 @@ class ConfigTests(TempCase):
             "current_profile": "P",
         }), encoding="utf-8")
         settings = config.load(path)
-        self.assertEqual(4, settings.workers)
+        self.assertEqual(config.WORKERS, settings.workers)
         self.assertEqual(config.Settings().quota.max_bytes, settings.quota.max_bytes)
         self.assertEqual(1, settings.bindings[0].sequence_start)
         from unittest.mock import patch
         with patch.object(config.Settings, "from_dict", side_effect=TypeError("bad shape")):
             settings = config.load(path)
-        self.assertEqual(4, settings.workers)
+        self.assertEqual(config.WORKERS, settings.workers)
         self.assertTrue(path.with_suffix(".broken.json").exists())
 
     def test_defaults_are_sane(self):
@@ -56,12 +57,94 @@ class ConfigTests(TempCase):
         self.assertEqual("system", settings.language)
         self.assertTrue((self.data / "settings.broken.json").exists())
 
+    def test_a_settings_file_with_a_byte_order_mark_is_read_not_reset(self):
+        """Notepad and PowerShell 5 write one, so a file someone fixed by hand
+        was treated as damaged and every setting in it was thrown away."""
+        path = self.data / "settings.json"
+        path.write_bytes(b"\xef\xbb\xbf" + json.dumps({"workers": 6}).encode("utf-8"))
+        self.assertEqual(6, config.load(path).workers)
+        self.assertFalse(path.with_suffix(".broken.json").exists())
+
+    def test_a_second_damaged_file_does_not_overwrite_the_first_backup(self):
+        """The backup is the only copy of the settings the reset threw away."""
+        path = self.data / "settings.json"
+        for text in ('{"first": ', '{"second": ', '{"third": '):
+            path.write_text(text, encoding="utf-8")
+            config.load(path)
+        self.assertEqual(['{"first": ', '{"second": ', '{"third": '],
+                         [(self.data / name).read_text(encoding="utf-8") for name in (
+                             "settings.broken.json", "settings.broken.2.json",
+                             "settings.broken.3.json")])
+
+    def test_a_reset_can_be_noted_until_there_is_a_log_to_write_it_to(self):
+        """Start-up reads the settings before logging exists, so a warning
+        logged there reached only stderr, which the frozen build hides."""
+        path = self.data / "settings.json"
+        path.write_text("{ nope", encoding="utf-8")
+        notes: list[str] = []
+        config.load(path, notes=notes)
+        self.assertEqual(1, len(notes))
+        self.assertIn("settings unreadable", notes[0])
+        self.assertIn("settings.broken.json", notes[0])
+
+    def test_a_read_only_settings_file_does_not_fail_every_save(self):
+        """Windows will not replace a file whose read-only attribute is set,
+        and the start-up write probe only ever makes files of its own, so a
+        settings.json restored with the attribute on passed it and then
+        refused every save. Staged here the way Windows reads the attribute."""
+        import stat
+        from unittest.mock import patch
+        path = self.data / "settings.json"
+        config.save(config.Settings(), path)
+        os.chmod(path, stat.S_IREAD)
+        self.addCleanup(lambda: path.exists() and os.chmod(path, stat.S_IREAD | stat.S_IWRITE))
+        real = config.atomic_json
+
+        def like_windows(target, value):
+            if not Path(target).stat().st_mode & stat.S_IWRITE:
+                raise PermissionError(13, "Access is denied", str(target))
+            real(target, value)
+
+        settings = config.Settings()
+        settings.workers = 9
+        with patch.object(config, "atomic_json", like_windows):
+            config.save(settings, path)
+        self.assertEqual(9, config.load(path).workers)
+
+    def test_a_settings_link_leaves_the_file_it_points_at_alone(self):
+        """The link is what a save replaces; the file behind it is not ours to
+        make writable."""
+        import stat
+        target = self.data / "elsewhere.json"
+        target.write_text("{}", encoding="utf-8")
+        os.chmod(target, stat.S_IREAD)
+        self.addCleanup(os.chmod, target, stat.S_IREAD | stat.S_IWRITE)
+        link = self.data / "settings.json"
+        try:
+            link.symlink_to(target)
+        except (OSError, NotImplementedError):
+            self.skipTest("symbolic links cannot be made here")
+        config._clear_read_only(link)
+        self.assertFalse(target.stat().st_mode & stat.S_IWRITE)
+
+    @unittest.skipUnless(os.name == "nt", "the read-only attribute is a Windows rule")
+    def test_a_read_only_settings_file_is_replaced_on_windows(self):
+        import stat
+        path = self.data / "settings.json"
+        config.save(config.Settings(), path)
+        os.chmod(path, stat.S_IREAD)
+        self.addCleanup(lambda: path.exists() and os.chmod(path, stat.S_IREAD | stat.S_IWRITE))
+        settings = config.Settings()
+        settings.workers = 9
+        config.save(settings, path)
+        self.assertEqual(9, config.load(path).workers)
+
     def test_unknown_values_fall_back(self):
         settings = config.Settings.from_dict({"density": "enormous", "verification": "magic",
                                               "workers": "many", "similar_threshold": 5})
         self.assertEqual("standard", settings.density)
         self.assertEqual("full", settings.verification)
-        self.assertEqual(4, settings.workers)
+        self.assertEqual(config.WORKERS, settings.workers)
         self.assertLessEqual(settings.similar_threshold, 1.0)
 
     def test_similarity_threshold_is_clamped_to_index_capability(self):
@@ -295,6 +378,39 @@ class AppDirsTests(TempCase):
             self.assertEqual(root, appdirs.stranded_data(denied))
             self.assertIsNone(appdirs.stranded_data(denied))   # told once, not nagged
 
+    def test_with_no_home_directory_the_start_up_falls_back_rather_than_dying(self):
+        """``Path.home()`` raises when there is neither a home variable nor an
+        account entry -- a service account, a container under an arbitrary
+        uid. Only the first lookup was guarded: the fallback list asked again,
+        so the start-up died, and so did one whose own ``--data-dir`` worked,
+        because the stranded-data check asks too."""
+        from unittest.mock import patch
+
+        def homeless():
+            raise RuntimeError("Could not determine home directory.")
+
+        temp = self.tmp / "temp"
+        os.environ.pop(appdirs.ENV_VAR)
+        with patch.object(appdirs, "fallback_roots", self.real_fallback_roots), \
+             patch.object(appdirs, "_platform_data_root", homeless), \
+             patch.object(appdirs, "portable_dir", lambda: None), \
+             patch.object(appdirs.tempfile, "gettempdir", lambda: str(temp)):
+            self.assertEqual((temp / "qingjian-data", None), appdirs.usable_data_dir())
+            os.environ[appdirs.ENV_VAR] = str(self.data)
+            self.assertEqual((self.data, None), appdirs.usable_data_dir())
+            self.assertIsNone(appdirs.stranded_data(self.data))
+
+    def test_a_launch_from_explorer_is_told_the_data_directory_only_when_it_needs_one(self):
+        """A plain launch finds the per-user directory, or the area it was moved
+        aside to, by itself; anything else came from ``--data-dir``."""
+        from unittest.mock import patch
+        default = self.plain_launch(self.tmp / "appdata")
+        spare = self.tmp / "spare"
+        with patch.object(appdirs, "fallback_roots", lambda: [spare]):
+            self.assertIsNone(appdirs.launch_data_dir(default))
+            self.assertIsNone(appdirs.launch_data_dir(appdirs._relocated(spare, default)))
+            self.assertEqual(self.data, appdirs.launch_data_dir(self.data))
+
     def test_the_temporary_directory_is_marked_as_one_the_system_may_empty(self):
         import tempfile
         self.assertTrue(appdirs.is_volatile(Path(tempfile.gettempdir()) / "qingjian-data"))
@@ -425,7 +541,7 @@ class DiagnosticBundleTests(TempCase):
         self.assertTrue(environment["python"])
 
         # Settings that are not paths survive untouched; paths keep their shape.
-        self.assertEqual(4, settings["workers"])
+        self.assertEqual(config.WORKERS, settings["workers"])
         self.assertEqual("soft", settings["recycle_mode"])
         self.assertRegex(settings["source_folder"], r"depth=\d+")
         bindings = settings["profiles"][settings["current_profile"]]
@@ -456,6 +572,22 @@ class DiagnosticBundleTests(TempCase):
 
         # Two paths in one sentence stay two masks rather than merging into one.
         self.assertEqual(3, log_text.count("<path "))
+
+    def test_a_library_under_the_account_folder_keeps_one_tag(self):
+        # On Windows the library sits under C:\Users\<account>, and the log
+        # strikes the account out before it masks the path; the settings must
+        # be tagged from the same text or the two never meet.
+        from unittest import mock
+        with mock.patch.object(logsetup, "_account_names", return_value=(self.ACCOUNT,)):
+            self._populate()
+            bundle = logsetup.diagnostic_bundle(self.tmp / "bundle.zip", self.data)
+        with zipfile.ZipFile(bundle) as archive:
+            settings = json.loads(archive.read("settings.json"))
+            log_text = archive.read("logs/qingjian.log").decode("utf-8")
+        tags = re.findall(r"id=[0-9a-f]+", log_text)
+        self.assertIn(re.search(r"id=[0-9a-f]+", settings["source_folder"]).group(0), tags)
+        folder = settings["profiles"][settings["current_profile"]][0]["folder"]
+        self.assertIn(re.search(r"id=[0-9a-f]+", folder).group(0), tags)
 
     def test_the_settings_page_lists_exactly_what_the_zip_contains(self):
         self._populate()
@@ -618,8 +750,115 @@ class DiagnosticBundleTests(TempCase):
         self.assertEqual("qingjian.log", index[0]["name"])       # still says which
         self.assertNotIn("settings.json", settings["unreadable"])
 
+    def test_a_mask_is_never_masked_again(self):
+        """The rooted Windows form masks a POSIX path as ``<path drive=/ ...>``,
+        and the POSIX pattern then started again at that ``/`` and ran on
+        through the rest of the line -- taking with it the very reason the line
+        was logged for."""
+        masked = logsetup.redact_text("could not move /srv/Chen/a.jpg into /srv/Keep Nana: denied")
+        self.assertTrue(masked.startswith("could not move <path drive=/ "), masked)
+        self.assertTrue(masked.endswith(": denied"), masked)
+        self.assertEqual(2, masked.count("<path "), masked)
+        self.assertNotIn("drive=<path", masked)
+        # A member masked twice -- the database summary is -- reads as once.
+        self.assertEqual(masked, logsetup.redact_text(masked))
+        # A match too short to be a path is passed over, not cut out with the
+        # words in front of it.
+        self.assertEqual("keep this //.", logsetup.redact_text("keep this //."))
+
+    def test_a_mac_folder_name_with_a_colon_is_masked_to_the_end(self):
+        """The Windows forms stop at a character a Windows name cannot hold,
+        and a Mac folder may be called "Trip: Japan". The rest of the path went
+        out as words, and the mask in front of it kept the POSIX form away."""
+        for line, names in (
+                ("could not read /Users/chen/Trip: Japan/ChenLi.jpg", ("Japan", "ChenLi")),
+                ("could not read ~/Pictures/Wedding: Chen & Li/IMG_1.jpg", ("Chen & Li", "IMG_1")),
+                ("could not read /mnt/photos/Chen|Li/x.jpg", ("Li/x",)),
+                ("could not read /home/chen/What?/ChenLi.jpg", ("ChenLi",))):
+            with self.subTest(line=line):
+                masked = logsetup.redact_text(line)
+                self.assertTrue(masked.startswith("could not read <path drive="), masked)
+                self.assertEqual(1, masked.count("<path "), masked)
+                for name in names:
+                    self.assertNotIn(name, masked)
+        # A path that ends at the colon is still a path and a reason, even with
+        # another path after it.
+        self.assertTrue(logsetup.redact_text("moved /srv/Keep/a.jpg: denied")
+                        .endswith(": denied"))
+        line = logsetup.redact_text("cannot read /srv/ann/a.png: [Errno 2] No such file "
+                                    "or directory: '/srv/ann/a.png'")
+        self.assertIn(": [Errno 2] No such file or directory: '<path", line)
+        self.assertEqual(2, line.count("<path "), line)
+        # A space, comma or semicolon may be part of a folder's name, so there
+        # the run is masked whole: a word lost rather than a name given away.
+        for line, names in (("read ~/Trip: Japan;/x.png: gone", ("Japan", "x.png")),
+                            ("read /home/u/a.png:/home/u/b.png", ("b.png", "/u/")),
+                            ("read /home/u/Fam: Smith, /IMG.jpg", ("Smith", "IMG")),
+                            ("read /home/u/Trip: Japan /x.jpg", ("Japan", "x.jpg"))):
+            with self.subTest(line=line):
+                masked = logsetup.redact_text(line)
+                for name in names:
+                    self.assertNotIn(name, masked)
+
+    def test_a_folder_name_after_a_dot_is_not_reported_as_an_extension(self):
+        """``Wedding.ChenLi`` is a folder, and "chenli" is the name in it."""
+        for folder, word in ((r"D:\Photos\Wedding.ChenLi", "chenli"),
+                             (r"E:\Keep\Mr.Zhang", "zhang"),
+                             (r"C:\Users\john.smith", "smith")):
+            with self.subTest(folder=folder):
+                masked = logsetup.redact_settings({
+                    "source_folder": folder, "current_profile": "P",
+                    "profiles": {"P": [{"key": "1", "folder": folder}]}})
+                self.assertNotIn(word, json.dumps(masked).lower())
+                self.assertNotIn(word, logsetup.redact_text(f"opened {folder}").lower())
+        # A file's own type is still worth saying, and says nothing about anyone.
+        self.assertIn("ext=.jpg", logsetup.redact_text(r"moved D:\Keep\IMG_0001.JPG"))
+        self.assertIn("ext=.cr2", logsetup.redact_text(r"moved D:\Keep\IMG_0001.CR2"))
+        self.assertIn("ext=.json", logsetup.redact_text(r"read C:\Data\settings.json"))
+
+    def test_a_data_directory_on_a_share_is_opened_by_a_uri_sqlite_accepts(self):
+        """``as_uri`` names a share's server as the authority, and so does what
+        ``resolve()`` makes of a mapped drive; sqlite refuses any authority but
+        an empty one, so a data directory on a NAS was never summarised."""
+        from pathlib import PureWindowsPath
+        share = PureWindowsPath(r"\\CHEN-NAS\family\Qingjian\state\state.db")
+        self.assertEqual("file:////CHEN-NAS/family/Qingjian/state/state.db?mode=ro",
+                         logsetup._read_only_uri(share))
+        local = PureWindowsPath(r"C:\Users\a b\state.db")
+        self.assertEqual("file:///C:/Users/a%20b/state.db?mode=ro",
+                         logsetup._read_only_uri(local))
+
+    @unittest.skipIf(os.name == "nt", "a share-shaped URI can be staged locally only on POSIX")
+    def test_a_share_shaped_uri_really_opens_the_database(self):
+        """On POSIX ``//tmp`` is ``/tmp``, so a URI naming the first folder as its
+        server stands in for a share and must still be read."""
+        from unittest.mock import patch
+        from urllib.parse import quote
+        self._populate()
+        target = (self.data / "state" / "state.db").resolve()
+        as_share = lambda path: "file:/" + quote(path.as_posix())    # noqa: E731
+        with patch.object(type(target), "as_uri", as_share):
+            summary = logsetup.state_summary(self.data / "state" / "state.db")
+        self.assertNotIn("unreadable", summary)
+        self.assertEqual(1, summary["rows"]["records"])
+
+    def test_sqlite_naming_the_server_does_not_put_it_in_the_bundle(self):
+        """"invalid uri authority: CHEN-NAS" holds no path for a mask to find."""
+        import sqlite3
+        from unittest.mock import patch
+        self._populate()
+        refused = sqlite3.OperationalError("invalid uri authority: CHEN-NAS")
+        with patch.object(logsetup.sqlite3, "connect", side_effect=refused):
+            bundle = logsetup.diagnostic_bundle(self.tmp / "share.zip", self.data)
+        blob = self._blob(bundle)
+        self.assertFalse("CHEN-NAS" in blob, "the server's name survived into the bundle")
+        with zipfile.ZipFile(bundle) as archive:
+            summary = json.loads(archive.read("state-summary.json"))
+        self.assertEqual("invalid uri authority", summary["unreadable"])
+
 
 class PlatformTests(TempCase):
+    @unittest.skipUnless(sys.platform == "win32", "the recycle-bin queries are Windows APIs")
     def test_recycle_policy_percent_can_be_stricter_than_volume_limit(self):
         import ctypes
         from types import SimpleNamespace
@@ -645,6 +884,7 @@ class PlatformTests(TempCase):
             policy.return_value = None
             self.assertFalse(platform_.can_recycle(self.tmp / "photo.jpg", 1))
 
+    @unittest.skipUnless(sys.platform == "win32", "the recycle-bin queries are Windows APIs")
     def test_recycle_policy_registry_states_fail_closed(self):
         import winreg
         from unittest.mock import Mock, patch
@@ -667,6 +907,7 @@ class PlatformTests(TempCase):
                  (5, winreg.REG_DWORD))):
             self.assertEqual((5, False), platform_._recycle_policy())
 
+    @unittest.skipUnless(sys.platform == "win32", "the recycle-bin queries are Windows APIs")
     def test_can_recycle_checks_fixed_volume_query_and_actual_capacity(self):
         import ctypes
         from types import SimpleNamespace
@@ -702,6 +943,7 @@ class PlatformTests(TempCase):
             shell.SHQueryRecycleBinW.return_value = 0
             self.assertFalse(platform_.can_recycle(self.tmp / "photo.jpg", 1))
 
+    @unittest.skipUnless(sys.platform == "win32", "the recycle-bin queries are Windows APIs")
     def test_recycle_limit_reads_current_user_volume_setting(self):
         import ctypes
         import winreg
@@ -774,6 +1016,45 @@ class PlatformTests(TempCase):
         self.assertFalse(platform_.folder_menu_installed(registry=registry))
         platform_.set_folder_menu(False, registry=registry)     # a second removal is harmless
 
+    def test_the_folder_menu_reaches_the_library_this_copy_was_started_on(self):
+        """Explorer knows nothing of the command line this copy was started
+        with, so a folder opened from the menu by someone using ``--data-dir``
+        started a second window on another library."""
+        registry = FakeRegistry()
+        command = platform_.launch_command(True, r"C:\Apps\MediaSorter.exe", "main.py",
+                                           r"E:\Q Data")
+        self.assertEqual([r"C:\Apps\MediaSorter.exe", "--data-dir", r"E:\Q Data"], command)
+        platform_.set_folder_menu(True, "Open with Qingjian", command, registry=registry)
+        self.assertEqual('"C:\\Apps\\MediaSorter.exe" "--data-dir" "E:\\Q Data" "%1"',
+                         registry.keys[self.SHELL + r"\command"][""])
+        self.assertEqual(r"C:\Apps\MediaSorter.exe", registry.keys[self.SHELL]["Icon"])
+        self.assertEqual([r"C:\Apps\MediaSorter.exe"],
+                         platform_.launch_command(True, r"C:\Apps\MediaSorter.exe", "main.py"))
+
+    def test_a_folder_menu_part_is_quoted_the_way_windows_reads_it_back(self):
+        """A data directory at the root of a drive ends in a backslash, which
+        would otherwise escape the closing quote and swallow the folder after it."""
+        import subprocess
+        for part in (r"E:\Q Data", "E:\\Q Data\\", r"C:\Program Files\Qingjian\Q.exe"):
+            with self.subTest(part=part):
+                self.assertEqual(subprocess.list2cmdline([part]), platform_.command_line([part]))
+        self.assertEqual('"E:\\\\" "%1"', platform_.command_line(["E:\\", "%1"]))
+
+    def test_a_folder_menu_left_by_another_copy_does_not_read_as_on(self):
+        """A portable folder that moved leaves an entry starting a program
+        that is gone. Reading it as on kept the switch claiming a menu that did
+        not work, and saving with the switch on never wrote it again."""
+        registry = FakeRegistry()
+        gone = [r"F:\Portable\MediaSorter.exe"]
+        platform_.set_folder_menu(True, "Open with Qingjian", gone, registry=registry)
+        self.assertTrue(platform_.folder_menu_installed(registry=registry))     # it is there
+        self.assertFalse(platform_.folder_menu_installed([r"D:\Moved\MediaSorter.exe"],
+                                                         registry=registry))
+        self.assertFalse(platform_.folder_menu_installed([*gone, "--data-dir", r"E:\QData"],
+                                                         registry=registry))
+        self.assertTrue(platform_.folder_menu_installed(gone, registry=registry))
+        self.assertTrue(platform_.folder_menu_installed([gone[0].upper()], registry=registry))
+
     def test_a_source_checkout_launches_without_a_console_window(self):
         folder = self.tmp / "python"
         self.write(folder / "python.exe", b"")
@@ -809,6 +1090,11 @@ class FakeRegistry:
 
     def SetValueEx(self, key, name, reserved, kind, value):  # noqa: N802 - winreg naming
         self.keys[key][name] = value
+
+    def QueryValueEx(self, key, name):          # noqa: N802 - winreg naming
+        if name not in self.keys[key]:
+            raise FileNotFoundError(name)
+        return self.keys[key][name], self.REG_SZ
 
     def CloseKey(self, key):                    # noqa: N802 - winreg naming
         pass

@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFil
                                QVBoxLayout, QWidget)
 
 from .. import __display_name__
-from ..core import config, metadata, naming, ops, platform_, scanner
+from ..core import config, mediatypes, metadata, naming, ops, platform_, scanner
 from ..core.imaging import decodes_slowly
 from ..core.engine import Engine, human_size
 from ..core.i18n import LANGUAGE_CODES, get_language, set_language, tr
@@ -109,7 +109,9 @@ class MainWindow(QMainWindow):
         self._binding_shortcuts: list[QShortcut] = []
         self._fixed_shortcuts: list[QShortcut] = []
         self._arrow_shortcuts: list[QShortcut] = []
-        self._inflight: dict[str, tuple[Path, int]] = {}
+        #: job id -> (path, row it was taken from, whether that was the review
+        #: list), oldest first: the queue finishes jobs in the order they came.
+        self._inflight: dict[str, tuple[Path, int, bool]] = {}
         #: The copy that drops into an envelope, its animation and where it lands.
         #: Made once: a widget created per key press is polished against the
         #: whole stylesheet every time.
@@ -126,6 +128,8 @@ class MainWindow(QMainWindow):
         self.preloader.arrived.connect(self._preview_arrived)
         #: Heavy decodes re-asked for after a resize, so one cannot loop.
         self._preview_retries: dict[str, int] = {}
+        #: The file the preview last loaded in full, and its identity then.
+        self._shown: tuple | None = None
         set_language(self.settings.language)
 
         self.setWindowTitle(f"{__display_name__} · {tr('app.tagline')}")
@@ -885,22 +889,23 @@ class MainWindow(QMainWindow):
         if folder:
             self.open_folder(Path(folder))
 
-    def open_folder(self, folder: Path, restore: bool = False) -> None:
+    def open_folder(self, folder: Path, restore: bool = False) -> bool:
+        """Scan *folder* onto the counter. False only when the scan never started."""
         if self._busy:
-            return
+            return False
         if not self._drain_queue():
-            return
+            return False
         try:
             self._with_progress(tr("scan.scanning"),
                                 lambda progress, cancel: self.engine.open_folder(
                                     folder, progress, cancel))
         except Cancelled:
             self._after_queue_change("")
-            return
+            return True
         except Exception as error:      # noqa: BLE001 - report every scan failure
             self._report(error)
             self._after_queue_change("")
-            return
+            return True
         self.preloader.clear()
         self._conflict_defaults.clear()
         self._update_slip()
@@ -908,26 +913,30 @@ class MainWindow(QMainWindow):
         if restore and self.settings.last_path:
             self.engine.go_to(self.settings.last_path)
         self._after_queue_change(tr("scan.complete", count=len(self.engine.all_files)))
+        return True
 
-    def rescan(self) -> None:
+    def rescan(self) -> bool:
+        """Read the folder again. True only when the list was rebuilt from it."""
         if self._busy or not self.engine.source_root:
-            return
+            return False
         if not self._drain_queue():
-            return
+            return False
         try:
             self._with_progress(tr("scan.scanning"),
                                 lambda progress, cancel: self.engine.rescan(progress, cancel))
         except (TransactionError, OSError) as error:
             self._report(error)
-            return
+            return False
         except Cancelled:
-            return
+            return False
         self._conflict_defaults.clear()
         self._after_queue_change(tr("scan.complete", count=len(self.engine.all_files)))
+        return True
 
-    def _rebuild_queue(self) -> None:
+    def _rebuild_queue(self) -> bool:
+        """Filter and sort the list again. False when it was left as it was."""
         if self._busy:
-            return
+            return False
         try:
             if len(self.engine.all_files) > 2000:
                 # Filtering and date-sorting a big library takes long enough
@@ -938,11 +947,12 @@ class MainWindow(QMainWindow):
             else:
                 self.engine.rebuild_queue()
         except Cancelled:
-            return
+            return False
         except OSError as error:
             self._report(error)
-            return
+            return False
         self._after_queue_change("")
+        return True
 
     def _after_queue_change(self, message: str) -> None:
         self._update_slip()
@@ -1023,6 +1033,10 @@ class MainWindow(QMainWindow):
 
     # ============================================================== cursor
     def step(self, offset: int) -> None:
+        # S and F2 wait for the queue before they act; an arrow pressed during
+        # that wait used to move what they acted on.
+        if self._blocked():
+            return
         if self.engine.step(offset) is not None:
             self._refresh_view()
 
@@ -1032,6 +1046,8 @@ class MainWindow(QMainWindow):
         Key repeats arrive thirty times a second and a full render decodes a
         photograph, so holding the key used to be switched off altogether.
         """
+        if self._blocked():
+            return
         if not self._arrows.repeating:
             self.step(offset)
             return
@@ -1065,6 +1081,7 @@ class MainWindow(QMainWindow):
             thumb_key = self.thumbs.key(path, HOLD_EDGE)
             pixmap = self.thumbs.peek(path, HOLD_EDGE, key=thumb_key)
         if pixmap is not None:
+            self._shown = None              # a stand-in; `_settle` loads the file
             self.preview.show_still(path, pixmap)
         else:
             # Decode on a worker. Only the last few items stay wanted, so a long
@@ -1078,6 +1095,7 @@ class MainWindow(QMainWindow):
         """A held-key thumbnail landed. Show it if the flip has not gone far past it."""
         if edge != HOLD_EDGE or not self._settle_pending or path not in self._flipped:
             return
+        self._shown = None
         self.preview.show_still(Path(path), pixmap)
 
     def _settle(self) -> None:
@@ -1112,6 +1130,22 @@ class MainWindow(QMainWindow):
         self.grid_selected.setText(tr("side.bulk_subtitle", count=count) if count > 1
                                    else tr("grid.selected", count=count))
         self.grid_selected.setVisible(bool(count))
+        if self.view_mode == config.VIEW_GRID:
+            self._show_tags()
+
+    def _show_tags(self) -> None:
+        """The stars and sticker show the marks of what clicking them would change.
+
+        In the grid that is the selection. They used to show the hidden
+        cursor's marks there, and a click toggles against what is shown: star
+        three on an unrated tile cleared it when the cursor had three stars.
+        Several chosen at once show none, so a click sets them all alike.
+        """
+        targets = self._targets()
+        rating, label = (self.engine.state.tag(str(targets[0])) if len(targets) == 1
+                         else (0, ""))
+        self.rating.set_value(rating)
+        self.labels.set_value(label)
 
     def _refresh_view(self, scroll_strip: bool = True) -> None:
         # A full render supersedes whatever a held arrow key left pending.
@@ -1151,19 +1185,17 @@ class MainWindow(QMainWindow):
             wanted = [path] + ([queue[(index + step) % total]
                                  for step in (1, 2, -1)] if total > 1 else [])
             self.preloader.set_wanted(wanted, target)
-            preview_key = self.preloader.key(path, target)
-            ready = self.preloader.take(path, target, key=preview_key)
-            if ready is None and decodes_slowly(path):
-                # A large PNG or TIFF cannot be scaled while it is decoded, so it
-                # would hold the window for seconds. Show its name, decode on a
-                # worker, and swap the picture in when it lands.
-                self.preview.show_loading(path, path.name, tr("scan.reading"))
-                self.preloader.request(path, target, key=preview_key)
-            else:
-                ok, error = self.preview.show_path(path, ready)
-                if not ok:
-                    self.status(tr("status.preview_failed", name=path.name, error=error),
-                                "warning")
+            if not self._still_showing(path):
+                preview_key = self.preloader.key(path, target)
+                ready = self.preloader.take(path, target, key=preview_key)
+                if ready is None and decodes_slowly(path):
+                    # A large PNG or TIFF cannot be scaled while it is decoded, so
+                    # it would hold the window for seconds. Show its name, decode
+                    # on a worker, and swap the picture in when it lands.
+                    self.preview.show_loading(path, path.name, tr("scan.reading"))
+                    self.preloader.request(path, target, key=preview_key)
+                else:
+                    self._show_in_full(path, ready)
             self._prefetch_neighbours()
         else:
             self.preloader.set_wanted([], self._preview_target())
@@ -1188,9 +1220,7 @@ class MainWindow(QMainWindow):
         else:
             self.sidecar_badge.setVisible(False)
 
-        rating, label = self.engine.state.tag(str(path))
-        self.rating.set_value(rating)
-        self.labels.set_value(label)
+        self._show_tags()
         if scroll_strip and self.view_mode == config.VIEW_SINGLE:
             self.filmstrip.follow(self.engine.index)
         self._update_actions()
@@ -1225,10 +1255,47 @@ class MainWindow(QMainWindow):
                                        error=""))
             return
         self._preview_retries.pop(path, None)
-        ok, error = self.preview.show_path(current, ready)
+        self._show_in_full(current, ready)
+
+    def _show_in_full(self, path: Path, ready) -> None:
+        ok, error = self.preview.show_path(path, ready)
+        self._shown = (path, self._identity(path)) if ok else None
         if not ok:
-            self.status(tr("status.preview_failed", name=Path(path).name, error=error),
-                        "warning")
+            self.status(tr("status.preview_failed", name=path.name, error=error), "warning")
+
+    @staticmethod
+    def _identity(path: Path) -> tuple | None:
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        return (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+    def _still_showing(self, path: Path) -> bool:
+        """True when *path* is up in full already, so a refresh need not load it.
+
+        A finished background job, a language switch and the settings dialog
+        all refresh the view. Loading the file again each time sent a playing
+        video back to the start, started a paused one and turned a turned photo
+        back. A file let go for a move, or replaced under the same name, is
+        loaded again.
+        """
+        preview = self.preview
+        if preview.current_path != path or self._shown is None or self._shown[0] != path:
+            return False
+        identity = self._identity(path)
+        if identity is None or identity != self._shown[1]:
+            return False
+        page = preview.stack.currentIndex()
+        if mediatypes.is_video(path):
+            # Playing, or stepped to a frame on the image page, the video is up
+            # only while the player still holds it: once a move let go of it,
+            # skipping the reload left Space with nothing to play.
+            return (page in (preview.VIDEO, preview.IMAGE)
+                    and not preview.player.source().isEmpty())
+        if page == preview.ANIMATED:
+            return preview.animated.movie() is not None
+        return page == preview.IMAGE and not preview.image.current_pixmap().isNull()
 
     def _preview_target(self) -> QSize:
         surface = self.preview.image
@@ -1303,10 +1370,14 @@ class MainWindow(QMainWindow):
             current = self.engine.current_path()
             if current is not None:
                 self.grid.show_path(current)
+            self._show_tags()
             self.grid.setFocus()
 
     def _change_view(self, mode: str) -> None:
-        self._set_view(mode)
+        # The switch reports a click on the view already showing as well, and
+        # going through `_set_view` again jumped to where the grid was left.
+        if mode != self.view_mode:
+            self._set_view(mode)
 
     def _toggle_view(self) -> None:
         if self._blocked():
@@ -1319,39 +1390,61 @@ class MainWindow(QMainWindow):
 
     # =========================================================== filtering
     def _filter_changed(self) -> None:
-        if not self._drain_queue():
-            return
-        self.settings.filter_mode = str(self.filter_combo.currentData() or "all")
-        self.engine.save_settings()
-        self._rebuild_queue()
+        self._change_listing("filter_mode", str(self.filter_combo.currentData() or "all"))
 
     def _sort_changed(self) -> None:
-        if not self._drain_queue():
-            return
-        self.settings.sort_mode = str(self.sort_combo.currentData() or "name")
-        self.engine.save_settings()
-        self._rebuild_queue()
+        self._change_listing("sort_mode", str(self.sort_combo.currentData() or "name"))
 
     def _reverse_changed(self, checked: bool) -> None:
-        if not self._drain_queue():
-            return
-        self.settings.sort_reverse = bool(checked)
-        self.engine.save_settings()
-        self._rebuild_queue()
+        self._change_listing("sort_reverse", bool(checked))
+
+    def _change_listing(self, name: str, value) -> None:
+        """Adopt a filter or sort choice, or take it back if the list cannot follow.
+
+        A rebuild that was cancelled, failed or never got past the queue left
+        the control and the saved setting on the new choice over the old list.
+        Undo then tested a photo it put back against a filter the list was
+        never built with, and it came back on disk but not on screen.
+        """
+        previous = getattr(self.settings, name)
+        if self._drain_queue():
+            setattr(self.settings, name, value)
+            self.engine.save_settings()
+            if self._rebuild_queue():
+                return
+            setattr(self.settings, name, previous)
+            self.engine.save_settings()
+        self._show_listing()
+
+    def _show_listing(self) -> None:
+        """Show the list settings in force on their controls, holding their signals."""
+        controls = (self.filter_combo, self.sort_combo, self.reverse_button,
+                    self.recursive_check)
+        for control in controls:
+            control.blockSignals(True)
+        try:
+            for combo, value in ((self.filter_combo, self.settings.filter_mode),
+                                 (self.sort_combo, self.settings.sort_mode)):
+                combo.setCurrentIndex(max(0, combo.findData(value)))
+            self.reverse_button.setChecked(self.settings.sort_reverse)
+            self.recursive_check.setChecked(self.settings.recursive)
+        finally:
+            for control in controls:
+                control.blockSignals(False)
 
     def _recursive_changed(self, checked: bool) -> None:
-        if self._blocked():
-            # Put the box back without coming straight back in here.
-            self.recursive_check.blockSignals(True)
-            self.recursive_check.setChecked(self.settings.recursive)
-            self.recursive_check.blockSignals(False)
-            return
-        if not self._drain_queue():
+        if self._blocked() or not self._drain_queue():
+            self._show_listing()
             return
         self.settings.recursive = bool(checked)
         self.engine.save_settings()
         if checked:
-            self.rescan()            # subfolders have to be read to be listed
+            # Subfolders have to be read to be listed. A scan that did not
+            # finish leaves the flat list, and the box and setting with it.
+            if self.engine.source_root and not self.rescan():
+                self.settings.recursive = False
+                self.engine.save_settings()
+                self._show_listing()
             return
         # Turning it off only ever removes files, and they are already in hand.
         change = self.engine.drop_subfolders()
@@ -1363,6 +1456,10 @@ class MainWindow(QMainWindow):
 
     def toggle_review(self) -> None:
         if self._blocked() or not self.engine.source_root:
+            return
+        # A photo still being filed is on disk and in the library, so a list
+        # built now shows it again, and filing it twice makes a numbered copy.
+        if not self._drain_queue():
             return
         self.engine.set_review_mode(not self.engine.review_mode)
         self._after_queue_change(tr("status.enter_review") if self.engine.review_mode
@@ -1379,6 +1476,9 @@ class MainWindow(QMainWindow):
 
     def _switch_preset(self, name: str) -> None:
         if name and name in self.settings.profiles:
+            if not self._drain_queue():         # it rebuilds the list; see toggle_review
+                self._refresh_presets()
+                return
             self._conflict_defaults.clear()
             self.settings.current_profile = name
             self.engine.save_settings()
@@ -1430,6 +1530,7 @@ class MainWindow(QMainWindow):
                     == QMessageBox.StandardButton.Yes:
                 self.settings.profiles.pop(self.settings.current_profile, None)
                 self.settings.current_profile = next(iter(self.settings.profiles))
+                self._conflict_defaults.clear()     # as on any switch of preset
                 self.engine.save_settings()
                 self._refresh_presets()
                 self._install_binding_shortcuts()
@@ -1559,7 +1660,10 @@ class MainWindow(QMainWindow):
         flight = self._take_off() if len(targets) == 1 else None
         filed = False
         for path in targets:
-            filed = self._classify_one(binding, Path(path)) or filed
+            started = self._classify_one(binding, Path(path))
+            if started is None:
+                break               # Cancel in a prompt is for the whole selection
+            filed = started or filed
         if filed:
             self._bag(index, flight)
 
@@ -1655,8 +1759,12 @@ class MainWindow(QMainWindow):
         current = self.engine.current_path()
         return [current] if current is not None else []
 
-    def _classify_one(self, binding: config.Binding, path: Path) -> bool:
-        """File one item. True when an operation was started for it."""
+    def _classify_one(self, binding: config.Binding, path: Path) -> bool | None:
+        """File one item. True when an operation was started for it.
+
+        None when the user cancelled a prompt, which stops the rest of a grid
+        selection; False when only this item was passed over.
+        """
         group = self.engine._operation_group(self.engine.group_for(path))
         rules = self.settings.sidecar
         if group.sidecars and rules.enabled and binding.action in ("move", "copy", "favorite"):
@@ -1667,7 +1775,7 @@ class MainWindow(QMainWindow):
                                        remember=rules.prompt == PROMPT_ONCE)
                 accepted = self._run_dialog(dialog) == QDialog.DialogCode.Accepted
                 if not accepted:
-                    return False
+                    return None
                 chosen = set(dialog.chosen())
                 group.members = [m for m in group.members if m.path in chosen]
                 if dialog.remembered():
@@ -1711,7 +1819,7 @@ class MainWindow(QMainWindow):
                 else:
                     decision, remember = ConflictDialog.ask(self, conflict_source, conflict_target)
                     if decision == ops.CONFLICT_CANCEL:
-                        return False
+                        return None
                     if remember:
                         self._conflict_defaults[folder_key] = decision
                 if decision == ops.CONFLICT_SKIP:
@@ -1768,7 +1876,7 @@ class MainWindow(QMainWindow):
         # place whenever a grid selection spans more than the current item.
         position = self._detach(path)
         job = self.engine.enqueue(label, work, {"path": str(path), "index": position})
-        self._inflight[job.id] = (path, position)
+        self._inflight[job.id] = (path, position, self.engine.review_mode)
 
     def _detach(self, path: Path) -> int:
         """Take the item out of the queue at once; return the row it held.
@@ -1784,7 +1892,33 @@ class MainWindow(QMainWindow):
         self._refresh_view()
         return position
 
-    def _finish_operation(self, path: Path, index: int, outcome) -> None:
+    def _return_row(self, later: list[str], position: int) -> int:
+        """The row a failed item goes back to, in the list as it is now.
+
+        *position* is the row it held when it was taken out, and the jobs in
+        *later* took their rows out after it, from a list without it. Each of
+        those that sat in front of it moves it up one; each at or behind it is
+        one further down once it is back. Using *position* as it stood put a
+        run of failures back in reverse.
+        """
+        for key in later:
+            entry = self._inflight.get(key)
+            if entry is None or entry[1] < 0:           # it never had a row
+                continue
+            if entry[1] < position:
+                position -= 1
+            else:
+                self._inflight[key] = (entry[0], entry[1] + 1, entry[2])
+        return position
+
+    def _finish_operation(self, path: Path, index: int, outcome,
+                          follow: Path | None = None) -> None:
+        """Report a finished operation and patch the views with what it changed.
+
+        *follow* is a file the cursor goes to as soon as the lists hold it, so
+        the views are drawn once, on it, rather than first on whatever slid
+        into the place it left.
+        """
         remembered_replace = path in self._remembered_replace_paths
         self._remembered_replace_paths.discard(path)
         if outcome is None or outcome.cancelled:
@@ -1806,21 +1940,31 @@ class MainWindow(QMainWindow):
             # and `_apply_change` is what takes them out of both views -- going
             # through `_detach` would not, because absorb has already removed
             # the path from the queue it looks in.
-            change = self.engine.absorb(outcome.record)
-            if change is None:
-                if not self.settings.background_queue:
+            # Random order has no insertion point. With the background queue a
+            # rebuild would reshuffle it under the user and list the photos
+            # still out a second time, so a file the record made -- a rename --
+            # goes to the end. Dropping only the rows that went left it on
+            # disk and nowhere on screen.
+            change = self.engine.absorb(outcome.record,
+                                        unordered=self.settings.background_queue)
+            if follow is not None:
+                self.engine.go_to(follow)
+            if change is None and self.settings.background_queue:
+                # The review list is a query. Asked again after every filing it
+                # refilled both views, which threw away the tile picked while
+                # the job ran, and with jobs still out it would list them a
+                # second time. Only the rows that went are taken out; a rename,
+                # the one filing that leaves a new name in the list, asks again
+                # once nothing is out.
+                removed = [touched for touched in self.engine.touched_paths(outcome.record)
+                           if not touched.exists() and self.engine.drop_from_queue(touched) >= 0]
+                if removed:
+                    self._apply_change({"removed": removed, "added": []})
+                if outcome.record.action == "rename" and not self._inflight:
                     self._rebuild_queue()
-                else:
-                    # Random and review queues have no stable insertion point.
-                    removed = []
-                    for touched in self.engine.touched_paths(outcome.record):
-                        if not touched.exists():
-                            if touched in self.engine.all_files:
-                                self.engine.all_files.remove(touched)
-                            if self.engine.drop_from_queue(touched) >= 0:
-                                removed.append(touched)
-                    if removed:
-                        self._apply_change({"removed": removed, "added": []})
+                self._update_slip()
+            elif change is None:
+                self._rebuild_queue()
                 self._update_slip()
             else:
                 self._apply_change(change)
@@ -1840,9 +1984,12 @@ class MainWindow(QMainWindow):
             return
         # _inflight is the record this thread owns; job.context is written by
         # the worker and is only a fallback for a job we did not enqueue.
+        later = list(self._inflight)
+        later = later[later.index(job.id) + 1:] if job.id in self._inflight else []
         entry = self._inflight.pop(job.id, None)
+        review = self.engine.review_mode
         if entry is not None:
-            path, position = entry
+            path, position, review = entry
         elif job.context.get("path"):
             path = Path(job.context["path"])
             position = int(job.context.get("index", -1))
@@ -1854,8 +2001,13 @@ class MainWindow(QMainWindow):
             self._schedule_open_pending(50)
             return
         self._remembered_replace_paths.discard(path)
-        if path.exists() and path not in self.engine.queue_paths:
+        # Only into the list it was filed from: a photo from the main list put
+        # into the review list would be sorted as if it had been sent there.
+        if (review == self.engine.review_mode and path.exists()
+                and path not in self.engine.queue_paths):
             # Put the item back exactly where it was so nothing is lost.
+            if position >= 0:
+                position = self._return_row(later, position)
             where = (len(self.engine.queue_paths) if position < 0
                      else min(position, len(self.engine.queue_paths)))
             self.engine.insert_at(path, where)
@@ -1903,10 +2055,12 @@ class MainWindow(QMainWindow):
             return
         if self._guard_unseen_key_action():
             return
-        if not self._drain_queue():
-            return
+        # What was on screen when the key was pressed: waiting for the queue
+        # runs events, and whatever is current afterwards nobody chose.
         targets = self._targets()
         if not targets or self.engine.review_mode:
+            return
+        if not self._drain_queue():
             return
         for path in targets:
             self._detach(Path(path))
@@ -1918,9 +2072,7 @@ class MainWindow(QMainWindow):
             return
         if self._guard_unseen_key_action():
             return
-        if not self._drain_queue():
-            return
-        path: Path | None
+        path: Path | None          # chosen before the wait, as in skip_current
         if self.view_mode == config.VIEW_GRID:
             targets = self._targets()
             if len(targets) != 1:
@@ -1932,15 +2084,24 @@ class MainWindow(QMainWindow):
             path = self.engine.current_path()
         if path is None:
             return
+        if not self._drain_queue():
+            return
         name, ok = get_text(self, tr("rename"), tr("info.filename"), text=path.name)
         if not ok or not name.strip():
             return
         try:
             new_name = naming.ensure_suffix(name.strip(), path.suffix)
             naming.validate_filename(new_name)
+            if new_name == path.name:
+                return          # unchanged; it used to offer to replace the file with itself
             target = path.with_name(new_name)
             decision = ""
-            if target.exists():
+            # A change of case only: on Windows the new spelling "exists"
+            # because it is this very file, which is no conflict to ask about.
+            exists = target.exists()
+            respelled = (exists and new_name.casefold() == path.name.casefold()
+                         and self.engine.planner._same_path(path, target, True))
+            if exists and not respelled:
                 decision, _remember = ConflictDialog.ask(self, path, target)
                 if decision in (ops.CONFLICT_CANCEL, ops.CONFLICT_SKIP):
                     return
@@ -1956,9 +2117,19 @@ class MainWindow(QMainWindow):
             return
         if released and (outcome is None or outcome.cancelled or outcome.skipped):
             self._refresh_view()
+        # The renamed photo is still the one being looked at. Re-sorted under
+        # its new name it left the neighbour in its place, and the Delete or
+        # key pressed next went to that neighbour.
+        record = getattr(outcome, "record", None)
+        renamed = Path(record.destination) if record is not None and record.destination else None
         # `_finish_operation` owns the absorb in synchronous mode; doing it here
         # as well patched the views twice for one rename.
-        self._finish_operation(path, self.engine.index, outcome)
+        self._finish_operation(path, self.engine.index, outcome, follow=renamed)
+        if renamed is not None and self.engine.go_to(renamed):
+            if self.view_mode == config.VIEW_GRID:
+                self.grid.clearSelection()
+                self.grid.show_path(renamed)
+            self._refresh_view()
 
     def trash_current(self) -> None:
         if self._blocked():
@@ -2024,6 +2195,14 @@ class MainWindow(QMainWindow):
                 dialog.close()
                 dialog.deleteLater()
             self._busy = was_busy
+        if not was_busy and self._close_requested:
+            # The window was asked to close while this waited. Only a progress
+            # dialog used to look at that afterwards, so the window closed at
+            # some later scan instead. Closing comes first, and whatever the
+            # wait was for is not started behind it.
+            self._close_requested = False
+            QTimer.singleShot(0, self.close)
+            return False
         return not self.engine.queue.pending
 
     def _transition(self, action, message: str) -> None:
@@ -2037,12 +2216,16 @@ class MainWindow(QMainWindow):
             outcome = self._with_progress(
                 message, lambda progress, cancel: action(progress, cancel))
         except (TransactionError, OSError) as error:
+            # The file let go above is still the one on screen; a video was
+            # left blank, and Space then played nothing.
+            self._refresh_view()
             if getattr(error, "key", "") == "status.undo_stuck":
                 self.status(tr("status.undo_stuck"), "warning")
                 return
             self._report(error)
             return
         except Cancelled:
+            self._refresh_view()
             return
         record = getattr(outcome, "record", None)
         # The record names the files that moved, so there is no reason to walk
@@ -2152,6 +2335,10 @@ class MainWindow(QMainWindow):
         self.recover_button.setVisible(self.engine.has_pending())
         if choice and self.engine.source_root:
             self.rescan()
+        elif choice and not self.engine.has_pending():
+            # At startup nothing is open yet: the folder held back for the
+            # recovery is opened now, as after one that finished.
+            self._open_initial_folder()
 
     def _ask_recover_exit(self, message: str, can_rollback: bool) -> str:
         box = QMessageBox(QMessageBox.Icon.Warning, tr("error.title"),
@@ -2214,6 +2401,15 @@ class MainWindow(QMainWindow):
         if self._blocked():
             return
         path = self.engine.current_path()
+        if self.view_mode == config.VIEW_GRID:
+            # As with the keys, the hidden cursor is nobody's choice here. Of
+            # several chosen tiles, the one the grid's own cursor is on.
+            chosen = self.grid.selected_paths()
+            if not chosen:
+                self.status(tr("status.nothing_chosen"), "warning")
+                return
+            focused = self.grid.current_path()
+            path = Path(focused if focused in chosen else chosen[0])
         if path is None:
             return
         rows = [[label, value] for label, value in self.engine.info_rows(path)]
@@ -2314,6 +2510,8 @@ class MainWindow(QMainWindow):
         updated.source_folder = self.settings.source_folder
         self.settings = updated
         self.engine.apply_settings(updated)
+        # Read only when the window was built, so a new budget waited for a restart.
+        self.thumbs.set_budget(updated.thumb_cache_mb)
         set_language(updated.language)
         theme.apply(QApplication.instance(), updated.density)
         height = self._envelope_height()
@@ -2365,15 +2563,23 @@ class MainWindow(QMainWindow):
             self._open_pending()
 
     def _open_pending(self) -> None:
-        if (self._pending_open is None or self._busy or
-                QApplication.activeModalWidget() is not None):
+        if self._pending_open is None or self._closed:
             return
-        if self.engine.queue.pending:
-            self._schedule_open_pending(50)
+        if (self._busy or self.engine.queue.pending or
+                QApplication.activeModalWidget() is not None or
+                QApplication.activePopupWidget() is not None):
+            # Something else holds the window. Only some prompts looked for a
+            # parked hand-over once they closed, so after the others it fired
+            # at some unrelated moment much later. Asking again shortly opens
+            # it as soon as whatever is in the way has gone.
+            self._schedule_open_pending(100)
             return
         target = self._pending_open
-        self.open_folder(target)
-        if self._pending_open == target and self.engine.source_root == target:
+        # A scan that ran answers the request, whether it opened, failed or was
+        # cancelled. Waiting until the folder on the counter equalled the one
+        # handed over never ended for a mapped drive or a link, which open
+        # under their resolved name, and a failure came back after every F5.
+        if self.open_folder(target) and self._pending_open == target:
             self._pending_open = None
 
     def _schedule_open_pending(self, delay: int = 0) -> None:
@@ -2416,6 +2622,11 @@ class MainWindow(QMainWindow):
             pass
 
     def closeEvent(self, event) -> None:          # noqa: N802 - Qt naming
+        if self._closed:
+            # A close asked for again during the wait below arrives once more
+            # after it; everything has been let go already.
+            event.accept()
+            return
         if self._busy:
             self._close_requested = True
             event.ignore()
@@ -2429,7 +2640,7 @@ class MainWindow(QMainWindow):
             # `wait_idle` alone froze the window for up to half a minute with
             # nothing on screen. Drain the same way undo does, so the last file
             # being moved is visible and the window keeps painting.
-            if not self._drain_queue():
+            if not self._drain_queue() and self.engine.queue.pending:
                 # Still working after the wait: closing here would abandon a
                 # transaction part-way, so let the user decide rather than
                 # deciding for them.

@@ -39,6 +39,28 @@ class StateTests(TempCase):
         self.assertEqual({"/a/3.jpg"}, self.state.done_paths())
         self.assertEqual((4, "green"), self.state.tag("/a/1.jpg"))
 
+    def test_a_record_with_a_damaged_payload_still_moves_between_stacks(self):
+        """Such a payload reads as empty everywhere else, but the step lists an
+        undo carries were written into it with json_set, which refused it: that
+        record stayed on top of history and every undo failed."""
+        delta = empty_delta()
+        delta["records_add"].append(self.record().to_dict())
+        self.state.apply(delta)
+        for damaged in ("{broken", "[1, 2]", ""):
+            with self.subTest(payload=damaged):
+                self.state._db.execute("UPDATE records SET payload=? WHERE id='r1'", (damaged,))
+                self.state._db.commit()
+                move = empty_delta()
+                move["records_move"].append({"id": "r1", "to": STACK_REDO,
+                                             "forward": [{"kind": "move"}], "inverse": []})
+                self.state.apply(move)
+                self.assertEqual(1, self.state.counts()["redo"])
+                self.assertEqual([{"kind": "move"}],
+                                 self.state.top(STACK_REDO).payload["forward"])
+                back = empty_delta()
+                back["records_move"].append({"id": "r1", "to": STACK_HISTORY})
+                self.state.apply(back)
+
     def test_failed_apply_does_not_queue_snapshots_as_orphans(self):
         redo = self.record(id="redo", stack=STACK_REDO)
         redo_data = redo.to_dict()
@@ -267,6 +289,14 @@ class ConflictTests(PlannerCase):
         self.commit(self.planner.plan_undo(self.state.top(STACK_HISTORY)))
         self.assertEqual(b"OLD", (self.keep / "solo_01.JPG").read_bytes())
         self.assertTrue(self.source.exists())
+
+    def test_keeping_both_keeps_a_number_that_is_part_of_the_name(self):
+        source = self.write(self.root / "Day4" / "Wedding (2019).JPG", b"NEW")
+        self.write(self.keep / "Wedding (2019).JPG", b"OLD")
+        outcome = self.commit(self.planner.plan_folder_action(
+            "move", self.planner.group_for(source), self.binding(), source_root=self.root))
+        self.assertEqual("Wedding (2019) (2).JPG", Path(outcome.record.destination).name)
+        self.assertEqual(b"OLD", (self.keep / "Wedding (2019).JPG").read_bytes())
 
     def test_skip_does_nothing_at_all(self):
         self.write(self.keep / "solo_01.JPG", b"OLD")
@@ -598,6 +628,23 @@ class G03PlanningTests(TempCase):
             with self.assertRaises(TransactionError):
                 engine.classify(binding, source)
         self.assertEqual(before, engine.planner.sequence.peek(binding))
+
+    def test_every_spelling_of_the_sequence_token_advances_it(self):
+        """``{序号}`` and ``{ seq }`` render the number but never moved it on.
+
+        Every file was named 0001, then 0001 (2); with a remembered Replace,
+        each one overwrote the last.
+        """
+        for index, text in enumerate(("{序号:4}", "{ seq :4}")):
+            with self.subTest(template=text):
+                engine = Engine(self.data / f"engine{index}", config.Settings())
+                self.addCleanup(engine.close)
+                out = self.tmp / f"out{index}"
+                binding = config.Binding("1", "copy", str(out), name_template=text)
+                for name in ("A.JPG", "B.JPG"):
+                    engine.classify(binding, self.write(self.tmp / f"src{index}" / name,
+                                                        name.encode()))
+                self.assertEqual(["0001.JPG", "0002.JPG"], self.tree(out))
 
     def test_path_template_sequence_advances(self):
         source = self.tmp / "A.JPG"

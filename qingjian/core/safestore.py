@@ -162,6 +162,11 @@ def _extended_path(path: Path) -> Path:
     return Path("\\\\?\\" + text)
 
 
+def _staged_path(dst: Path, stage: str) -> Path:
+    """The hidden sibling a copy to *dst* is written to first, owned by one run."""
+    return _extended_path(dst.with_name(f".qingjian-{stage}-{dst.name}.part"))
+
+
 def _unlink_source(src: Path, landed: Path | None = None) -> None:
     """Remove the source of a finished move, even when the camera protected it.
 
@@ -300,6 +305,38 @@ def _fast_matches(info, expected: dict | None) -> bool:
     if want_mtime is not None:
         return info.st_mtime_ns == want_mtime
     return True
+
+
+#: The coarsest clock a volume keeps: FAT rounds a modification time to two seconds.
+_COARSEST_CLOCK_NS = 2_000_000_000
+
+
+def _rounded_landing(path: str | Path, expected: dict | None) -> dict | None:
+    """What *path* holds, if it is *expected* but for a clock that rounded its time.
+
+    A move is planned to land with its source's identity, and so it does,
+    except on a card whose clock keeps two seconds or ten milliseconds: there
+    a run killed after the move landed could never be recovered, because the
+    file it left never matched the plan's guess. Size has to agree exactly, and
+    a known hash still has to match.
+    """
+    if not expected or expected.get("size") is None or expected.get("mtime_ns") is None:
+        return None
+    info = _stat_or_none(path)
+    if (info is None or info.st_size != expected["size"]
+            or abs(info.st_mtime_ns - expected["mtime_ns"]) > _COARSEST_CLOCK_NS):
+        return None
+    if expected.get("hash") and fingerprint(path) != expected["hash"]:
+        return None
+    return dict(expected, size=info.st_size, mtime_ns=info.st_mtime_ns)
+
+
+def _landed_as(path: str | Path, expected: dict) -> dict | None:
+    """*expected*, with the size and time *path* holds now."""
+    info = _stat_or_none(path)
+    if info is None:
+        return None
+    return dict(expected, size=info.st_size, mtime_ns=info.st_mtime_ns)
 
 
 def identity_matches(path: str | Path, expected: dict | None, verify: str = VERIFY_FULL,
@@ -653,9 +690,29 @@ class SafeStore:
                     # The record goes in first: a snapshot nothing points at is
                     # a restore copy the user can never find or reclaim.
                     save_state(delta)
+            self._drop_partials(payload)
             log.warning("journal %s abandoned (rollback=%s)", payload.get("stage_id"), rollback)
             self.journal_path.unlink(missing_ok=True)
             return True
+
+    @staticmethod
+    def _drop_partials(payload: dict) -> None:
+        """Remove what a run killed mid-copy staged, in whatever subfolder it went to.
+
+        Sweeping folders finds only their top level, and a path template puts a
+        photo in T/2026/08. The journal names every path a step or its rollback
+        writes to, and the run's stage id, so each staged name is known exactly:
+        one unlink per path, no listing, and never a file another run owns.
+        """
+        stage = str(payload.get("stage_id") or "")
+        if not stage:
+            return
+        steps = [*(payload.get("forward") or []), *(payload.get("inverse") or [])]
+        for path in {step[end] for step in steps for end in ("src", "dst") if step.get(end)}:
+            try:
+                _staged_path(Path(path), stage).unlink(missing_ok=True)
+            except OSError:
+                continue
 
     def _rollback(self, payload: dict, progress: Progress) -> None:
         """Undo the steps that already ran. Not journalled: it only ever shrinks the prefix."""
@@ -665,13 +722,29 @@ class SafeStore:
         inverse = list(payload.get("inverse") or [])
         done = 0
         for index, step in enumerate(forward):
+            if step["kind"] in (MOVE, COPY):
+                # The inverse has to expect what landed, or it refuses to undo it:
+                # a card's clock may have rounded it, and a run stopped before a
+                # move deleted its source never taught the inverse at all.
+                landed = self._landing(step)
+                # A move counts only once its source has gone -- or been filled
+                # again by a later step, as undoing a Replace does -- or its copy
+                # has proved the bytes: a file of the right size and time that
+                # turned up at the target is not this run's to move back.
+                if landed is not None and (
+                        step["kind"] == COPY or self._moved_or_copied(step)
+                        or self._landed_later(Path(step["src"]), forward[index + 1:])):
+                    step["result"] = landed
+                    self._sync_inverse(payload, index, step)
+            elif (step["kind"] == WRITE and (step.get("result") or {}).get("hash")
+                    and identity_matches(step["dst"], step["result"], VERIFY_FULL)):
+                step["landed"] = _landed_as(step["dst"], step["result"])
+                self._sync_inverse(payload, index, step)
             if self._step_done(step, verify, forward[index + 1:]):
                 done = index + 1
                 continue
-            if (step["kind"] == MOVE
-                    and identity_matches(Path(step["dst"]),
-                                         step.get("result") or step.get("src_id"), VERIFY_FAST)
-                    and Path(step["src"]).exists()):
+            if (step["kind"] == MOVE and Path(step["src"]).exists()
+                    and self._landing(step) is not None and self._moved_or_copied(step)):
                 done = index + 1        # a cross-volume move that copied but could not unlink
             break
         steps = (inverse[len(inverse) - done:] if len(inverse) == len(forward)
@@ -730,7 +803,12 @@ class SafeStore:
         for step in plan.forward:
             kind, dst = step["kind"], Path(step["dst"])
             dkey = _path_key(dst)
-            done = self._step_done(step, VERIFY_FAST, stat_of=stat_of)
+            # What stands at a path an earlier step empties is gone by the time
+            # this step runs, so it cannot show this step as done. Undoing a
+            # Replace moves the photo away, then restores from the restore copy;
+            # a photo as large as the file it replaced passed for that restore
+            # and the missing restore copy surfaced only half-way through.
+            done = dkey not in gone and self._step_done(step, VERIFY_FAST, stat_of=stat_of)
             if kind in (MOVE, COPY):
                 src = Path(step["src"])
                 skey = _path_key(src)
@@ -794,14 +872,20 @@ class SafeStore:
         """Is this step already in effect? Stat only, except WRITE, which uses *verify*.
 
         *stat_of* lets a caller that checks many steps share one stat per path.
+        A path a *later* step refilled counts as emptied; proving a WRITE there
+        reads it, but only a rollback passes *later*, never the precheck.
         """
         info = stat_of or _stat_or_none
         kind, dst, result = step["kind"], Path(step["dst"]), step.get("result")
         if kind == MOVE:
-            return (_fast_matches(info(dst), result or step.get("src_id"))
-                    and info(step["src"]) is None)
+            expected = result or step.get("src_id")
+            emptied = (info(step["src"]) is None
+                       or self._landed_later(Path(step["src"]), later))
+            return emptied and (_fast_matches(info(dst), expected)
+                                or _rounded_landing(dst, expected) is not None)
         if kind == COPY:
-            return _fast_matches(info(dst), result or step.get("src_id"))
+            return (_fast_matches(info(dst), result or step.get("src_id"))
+                    or (info(dst) is not None and self._landing(step) is not None))
         if kind == WRITE:
             return bool(result) and identity_matches(dst, result, verify)
         if kind == UNLINK:
@@ -820,7 +904,7 @@ class SafeStore:
                 self._touched = False
                 if self._run_step(step, verify, stage, progress, steps[index + 1:]):
                     mutated = True
-                if step["kind"] in (MOVE, COPY):
+                if step["kind"] in (MOVE, COPY, WRITE):
                     self._sync_inverse(payload, index, step)
         except BaseException as error:
             mutated = mutated or self._touched
@@ -856,7 +940,7 @@ class SafeStore:
         The temporary carries this transaction's stage id so it is owned by
         exactly one run and is never matched by a wildcard.
         """
-        staged = _extended_path(dst.with_name(f".qingjian-{stage}-{dst.name}.part"))
+        staged = _staged_path(dst, stage)
         staged.unlink(missing_ok=True)
         try:
             info = copy_verified(source, staged, progress, _NEVER, verify)
@@ -889,14 +973,27 @@ class SafeStore:
         copies, so both are written. A record may carry fewer steps than the journal
         does, so each list pair is lined up against its own forward, and only once
         the step at *index* is confirmed to be the step that just ran.
+
+        A record that undo or redo moves between stacks carries its lists in the
+        move, because the redo after a copy back from such a volume has to expect
+        the clock that copy got, not the one the photo had before it ever left.
         """
-        landed = step.get("result")
+        # A restore keeps its expected content in ``result`` and what it landed
+        # beside it: the clock of the drive the restore copy sits on may have
+        # rounded the time, and redo deletes that file again.
+        landed = step.get("landed") if step["kind"] == WRITE else step.get("result")
         if not landed:
             return
         pairs = [(payload.get("forward") or [], payload.get("inverse") or [])]
-        for record in (payload.get("state") or {}).get("records_add") or []:
+        state = payload.get("state") or {}
+        for record in state.get("records_add") or []:
             body = record.get("payload") or {}
             pairs.append((body.get("forward") or [], body.get("inverse") or []))
+        for move in state.get("records_move") or []:
+            # Undo runs a record's inverse and redo its forward. Both pairings are
+            # offered; the step check below keeps only the one this run is.
+            forward, inverse = move.get("forward") or [], move.get("inverse") or []
+            pairs += [(forward, inverse), (inverse, forward)]
         for forward, inverse in pairs:
             if len(forward) <= index:
                 continue
@@ -904,31 +1001,99 @@ class SafeStore:
             if any(twin.get(field) != step.get(field) for field in ("kind", "src", "dst")):
                 continue                    # this list describes some other step
             if twin is not step:
-                twin["result"] = dict(landed)
+                twin["landed" if step["kind"] == WRITE else "result"] = dict(landed)
             if len(inverse) != len(forward):
                 continue
             mirror = inverse[len(inverse) - 1 - index]
-            if step["kind"] == MOVE and mirror.get("kind") == MOVE:
+            # Lined up by position, so the path has to agree as well: a mirror
+            # that undoes some other step must never be taught this one's file.
+            if (step["kind"] == MOVE and mirror.get("kind") == MOVE
+                    and _path_key(mirror.get("src", "")) == _path_key(step["dst"])):
                 mirror["src_id"] = dict(landed)
-            elif step["kind"] == COPY and mirror.get("kind") == UNLINK:
+            elif (step["kind"] == COPY and mirror.get("kind") == UNLINK
+                    and _path_key(mirror.get("dst", "")) == _path_key(step["dst"])):
+                mirror["expect"] = dict(landed)
+            elif (step["kind"] == WRITE and mirror.get("kind") == UNLINK
+                    and _path_key(mirror.get("dst", "")) == _path_key(step["dst"])):
+                # The hash as well: with full verification, redo reads the file
+                # before deleting it, so an edit made in place since the undo,
+                # same size and time, is refused rather than lost.
                 mirror["expect"] = dict(landed)
 
-    @staticmethod
-    def _landed_later(dst: Path, later: Sequence[dict]) -> bool:
+    def _landed_later(self, dst: Path, later: Sequence[dict],
+                      kinds: Sequence[str] = (MOVE, COPY, WRITE)) -> bool:
         """Did a later step already put its own file at *dst*?
 
         An UNLINK followed by a MOVE onto the same path leaves no trace of itself
         once the move has landed. Looking forward costs nothing; a per-step done
         marker in the journal would cost one fsync on every move.
+
+        The first later step aimed at *dst* answers; one not in *kinds* answers no.
+        Undoing a Replace ends in a WRITE from the restore copy, whose hash is
+        known, so the file it restored is proved by content -- a size alone would
+        take any file of that size for it.
         """
         key = _path_key(dst)
         for step in later:
-            if step["kind"] not in (MOVE, COPY) or _path_key(step["dst"]) != key:
+            if step["kind"] not in (MOVE, COPY, WRITE) or _path_key(step["dst"]) != key:
                 continue
-            if not identity_matches(dst, step.get("result") or step.get("src_id"), VERIFY_FAST):
+            if step["kind"] not in kinds:
                 return False
-            return step["kind"] != MOVE or not Path(step["src"]).exists()
+            if step["kind"] == WRITE:
+                restored = step.get("result") or {}
+                return bool(restored.get("hash")) and identity_matches(dst, restored, VERIFY_FULL)
+            if self._landing(step) is None:
+                return False
+            return step["kind"] != MOVE or self._moved_or_copied(step)
         return False
+
+    @staticmethod
+    def _landing(step: dict) -> dict | None:
+        """What a MOVE or COPY left at its target: as recorded, or as a card rounded it.
+
+        None when its target does not hold it. A copy's source is still there,
+        so a rounded copy has to prove it holds the source's bytes; a move's is
+        proved where the source is weighed against it.
+        """
+        dst = Path(step["dst"])
+        expected = step.get("result") or step.get("src_id")
+        if not expected:
+            return None
+        if identity_matches(dst, expected, VERIFY_FAST):
+            return expected
+        landed = _rounded_landing(dst, expected)
+        if landed is None or step["kind"] != COPY:
+            return landed
+        src = Path(step["src"])
+        try:
+            return landed if src.is_file() and _same_content(src, dst, step.get("result")) else None
+        except OSError:
+            return None
+
+    def _moved_or_copied(self, step: dict) -> bool:
+        """Has this MOVE put its file at its target, even if the source is still there?
+
+        A move that copies -- across volumes, or on one with the fast path off --
+        can land its copy and then fail to delete the source: a viewer holds it
+        open, or the run is killed. The copy has to prove it holds the source's
+        bytes; a target that held those very bytes before the run began is the
+        same file for every purpose, so taking it for the copy changes nothing.
+        Taken for not having run, a Replace that stopped there could neither be
+        finished nor rolled back, and rolling it back discarded the only copy
+        of the file it replaced.
+        """
+        src, dst = Path(step["src"]), Path(step["dst"])
+        if not src.exists():
+            return True
+        if not step.get("result") or (self.fast_path and same_volume(src, dst.parent)):
+            return False
+        try:
+            if os.path.samefile(src, dst):
+                return False
+        except OSError:
+            return False
+        return (identity_matches(src, step.get("src_id"), VERIFY_FAST)
+                and _same_content(src, dst, step.get("result")))
 
     def _run_step(self, step: dict, verify: str, stage: str, progress: Progress,
                   later: Sequence[dict] = ()) -> bool:
@@ -946,17 +1111,31 @@ class SafeStore:
             if dst.parent.name == TRASH_DIR and src.parent.name != TRASH_DIR:
                 self._prepare_trash_folder(dst.parent)
             done_at_dst = identity_matches(dst, result, VERIFY_FAST)
-            if done_at_dst and not src.exists():
+            if not done_at_dst:
+                landed = _rounded_landing(dst, result)
+                if landed is not None:
+                    # What the far clock kept, so the inverse expects it too. A
+                    # source still there has to prove the copy below, as ever.
+                    step["result"] = result = landed
+                    done_at_dst = True
+            # Undoing a Replace moves the photo back and then restores the file it
+            # replaced at the very path it left: what stands there on a replay is
+            # that file, not a source the move failed to remove. Asked only once
+            # the target is in place, so a normal run never hashes its source.
+            if done_at_dst and (not src.exists() or self._landed_later(src, later)):
                 # An impostor of the same size and mtime is not "already restored".
                 if result and result.get("hash") and fingerprint(dst) != result["hash"]:
                     raise TransactionError("error.changed_midway", str(dst), path=str(dst))
                 return False                            # already done
             if done_at_dst and src.exists():
                 # Crashed between writing the target and removing the source. A rename
-                # is atomic, so on one volume this state is impossible and the source
-                # must be kept; across volumes the target has to prove it holds the
-                # bytes before the source is deleted.
-                if (same_volume(src, dst.parent)
+                # is atomic, so where the move is one this state is impossible and the
+                # source must be kept; a copy -- across volumes, or on one with the
+                # fast path switched off -- has to prove the target holds the bytes
+                # before the source is deleted, and a second name for the very same
+                # file proves nothing.
+                if ((self.fast_path and same_volume(src, dst.parent))
+                        or os.path.samefile(src, dst)
                         or not identity_matches(src, step.get("src_id"), VERIFY_FAST)
                         or not _same_content(src, dst, result)):
                     raise TransactionError("error.changed_midway", str(src), path=str(src))
@@ -991,6 +1170,11 @@ class SafeStore:
             if identity_matches(dst, result or step.get("src_id"), VERIFY_FAST):
                 return False
             if dst.exists():
+                landed = self._landing(step)
+                if landed is not None:
+                    # A card's clock rounded the copy; the inverse learns that.
+                    step["result"] = landed
+                    return False
                 raise TransactionError("error.changed_midway", str(dst), path=str(dst))
             if not identity_matches(src, step.get("src_id"), VERIFY_FAST):
                 raise TransactionError("error.external_change", str(src), path=str(src))
@@ -1003,6 +1187,7 @@ class SafeStore:
             snapshot = step.get("snapshot") or {}
             source = Path(snapshot.get("file", ""))
             if result and identity_matches(dst, result, verify):
+                step["landed"] = _landed_as(dst, result)
                 return False
             if not source.is_file():
                 raise TransactionError("error.snapshot_missing", str(source), path=str(source))
@@ -1011,12 +1196,18 @@ class SafeStore:
             if dst.exists() and not identity_matches(dst, step.get("expect"), verify):
                 raise TransactionError("error.changed_midway", str(dst), path=str(dst))
             dst.parent.mkdir(parents=True, exist_ok=True)
-            self._staged_copy(source, dst, stage, verify, progress)
+            step["landed"] = self._staged_copy(source, dst, stage, verify, progress)
             self._touched = True
             return True
 
         if kind == UNLINK:
             if not dst.exists():
+                return False
+            # Asked before *expect*: a photo that replaced one of the same size and
+            # mtime matches it too, and deleting it again on replay deletes the only
+            # copy. A move proves it landed by its source being gone; a copy leaves
+            # its source, so it can only answer below, once *expect* has failed.
+            if self._landed_later(dst, later, (MOVE,)):
                 return False
             if not identity_matches(dst, step.get("expect"), verify):
                 if self._landed_later(dst, later):

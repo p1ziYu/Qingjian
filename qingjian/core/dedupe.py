@@ -19,6 +19,8 @@ from math import floor
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
+import numpy as np
+
 from . import imaging, metadata
 from .work import mapped as _mapped
 from .safestore import Cancelled, fingerprint, sample_digest
@@ -122,7 +124,8 @@ def identity_key(path: str | Path, digest: str) -> str:
 
 
 def find_exact(paths: Sequence[Path], cache=None, ignored: set[str] | None = None,
-               progress: Progress = _noop, cancel: Cancel = _never) -> list[Group]:
+               progress: Progress = _noop, cancel: Cancel = _never,
+               workers: int = 0) -> list[Group]:
     """Byte-identical files, found without reading the library end to end.
 
     Three narrowing passes. Sizes come from the directory entry. Files that
@@ -151,7 +154,8 @@ def find_exact(paths: Sequence[Path], cache=None, ignored: set[str] | None = Non
         for path in bucket:
             sizes[path] = size
     by_sample: dict[tuple, list[Path]] = defaultdict(list)
-    for path, digest in _mapped(sample_digest, contested, progress, cancel, first=0, span=35):
+    for path, digest in _mapped(sample_digest, contested, progress, cancel, workers,
+                                first=0, span=35):
         # The size comes from the pass that already stat'd it; stat'ing again
         # here meant one file vanishing mid-scan threw the whole scan away.
         if digest is not None:
@@ -173,7 +177,7 @@ def find_exact(paths: Sequence[Path], cache=None, ignored: set[str] | None = Non
 
     by_digest: dict[str, list[Path]] = defaultdict(list)
     with (cache.batch() if cache is not None else nullcontext()):
-        for path, digest in _mapped(full, suspects, progress, cancel, first=35, span=55):
+        for path, digest in _mapped(full, suspects, progress, cancel, workers, first=35, span=55):
             if not digest:
                 continue
             if cache is not None:
@@ -246,7 +250,8 @@ def banded_pairs(hashes: Sequence[int], max_distance: int) -> set[tuple[int, int
 
 def find_similar(paths: Sequence[Path], threshold: float = 0.92, cache=None,
                  ignored: set[str] | None = None, progress: Progress = _noop,
-                 cancel: Cancel = _never, score_quality: bool = True) -> list[Group]:
+                 cancel: Cancel = _never, score_quality: bool = True,
+                 workers: int = 0) -> list[Group]:
     """Group images whose perceptual hashes are within *threshold*."""
     ignored = ignored or set()
     from . import mediatypes
@@ -266,7 +271,7 @@ def find_similar(paths: Sequence[Path], threshold: float = 0.92, cache=None,
     usable: list[Path] = []
     hashes: list[int] = []
     with (cache.batch() if cache is not None else nullcontext()):
-        for path, value in _mapped(hash_of, stills, progress, cancel, first=0, span=85):
+        for path, value in _mapped(hash_of, stills, progress, cancel, workers, first=0, span=85):
             if value is None:
                 continue
             if cache is not None:
@@ -301,12 +306,71 @@ def find_similar(paths: Sequence[Path], threshold: float = 0.92, cache=None,
             if ignored:
                 candidates = [c for c in candidates
                               if identity_key(c.path, c.digest or "") not in ignored]
-            if len(candidates) < 2:
-                continue
-            groups.append(_ranked_group(MODE_SIMILAR, candidates))
+            for chosen in _around_keepers(candidates, distance, cancel):
+                groups.append(_ranked_group(MODE_SIMILAR, chosen))
     progress("", 100)
     groups.sort(key=lambda g: -g.reclaimable_bytes())
     return groups
+
+
+def _around_keepers(candidates: list[Candidate], max_distance: int,
+                    cancel: Cancel = _never) -> list[list[Candidate]]:
+    """Cut a cluster of near matches into groups that each match their keeper.
+
+    Near-match is not transitive. In a slow pan every frame is close to the
+    next, so joining every close pair joined the first frame to the last, and
+    the group offered to delete frames that looked nothing like the one it
+    kept. Each group here is grown round the best frame left, which is the one
+    it will keep, and takes only the frames within the threshold of it.
+
+    A frame whose every near match went to a group round another keeper -- the
+    web copy of an edited copy of an original -- would then be in no group at
+    all, though it is plainly a near-copy. It joins the group of its nearest
+    match: one step from a member, never a chain.
+
+    The distances are taken a keeper against the whole cluster at a time, and
+    the keepers in one ranking, so a timelapse of ten thousand frames costs a
+    fraction of a second rather than several seconds after the bar says done.
+    """
+    count = len(candidates)
+    if count < 2:
+        return []
+    order = sorted(range(count), reverse=True,
+                   key=lambda i: (candidates[i].pixels, candidates[i].sharpness,
+                                  candidates[i].size, -len(str(candidates[i].path))))
+    values = np.array([c.phash or 0 for c in candidates], dtype=np.uint64)
+    left = np.ones(count, dtype=bool)
+    home = np.full(count, -1)
+    groups: list[list[int]] = []
+    for index in order:
+        if not left[index]:
+            continue
+        if cancel():
+            raise Cancelled("cancelled")
+        members = np.flatnonzero(left & (_bits(values ^ values[index]) <= max_distance))
+        left[members] = False
+        if len(members) > 1:
+            home[members] = len(groups)
+            groups.append(members.tolist())
+    grouped = home >= 0
+    for index in np.flatnonzero(~grouped):
+        distances = np.where(grouped, _bits(values ^ values[index]), max_distance + 1)
+        nearest = int(np.argmin(distances))
+        if distances[nearest] <= max_distance:
+            groups[home[nearest]].append(int(index))
+    return [[candidates[i] for i in sorted(members)] for members in groups]
+
+
+#: Set bits in each byte value, for counting them where numpy cannot.
+_BYTE_BITS = np.array([bin(value).count("1") for value in range(256)], dtype=np.uint8)
+
+
+def _bits(values: np.ndarray) -> np.ndarray:
+    """Set bits in each of *values*, a uint64 array."""
+    counter = getattr(np, "bitwise_count", None)        # numpy 2 and later
+    if counter is not None:
+        return counter(values).astype(np.int64)
+    return _BYTE_BITS[values.view(np.uint8)].reshape(-1, 8).sum(axis=1, dtype=np.int64)
 
 
 def _digest_for_ignore(path: Path, cache, ignored: set[str], cancel: Cancel,
@@ -350,14 +414,19 @@ def _build_candidates(paths: list[Path], hashes: list[int], cache, score_quality
                 if cancel():
                     raise Cancelled("cancelled")
                 score = imaging.quality_score(path)
-                sharp = score["sharpness"]
-                if cache is not None:
-                    cache.put_by_key(keys[path], sharpness=sharp, blown=score.get("blown", 0.0),
+                if score is None:
+                    # Not decodable just now. Unknown is neither blurry nor
+                    # worth remembering: the next scan scores it again.
+                    score = {}
+                elif cache is not None:
+                    cache.put_by_key(keys[path], sharpness=score["sharpness"],
+                                     blown=score.get("blown", 0.0),
                                      crushed=score.get("crushed", 0.0))
+                sharp = float(score.get("sharpness", 0.0))
             else:
                 score = cached
                 sharp = float(cached["sharpness"])
-            defect = imaging.looks_unusable(score)
+            defect = imaging.looks_unusable(score) if score else ""
         return Candidate(path=path, size=info.size, width=info.width, height=info.height,
                          sharpness=sharp, captured=info.timestamp(),
                          digest=digest, phash=value, defect=defect)
@@ -399,7 +468,8 @@ def _ranked_group(mode: str, candidates: list[Candidate]) -> Group:
 
 def find_bursts(paths: Sequence[Path], gap_seconds: float = 2.0, minimum: int = 3,
                 similarity_floor: float = 0.85, cache=None, ignored: set[str] | None = None,
-                progress: Progress = _noop, cancel: Cancel = _never) -> list[Group]:
+                progress: Progress = _noop, cancel: Cancel = _never,
+                workers: int = 0) -> list[Group]:
     """Runs of frames shot in quick succession that also look alike."""
     ignored = ignored or set()
     from . import mediatypes
@@ -424,7 +494,7 @@ def find_bursts(paths: Sequence[Path], gap_seconds: float = 2.0, minimum: int = 
 
     entries = []
     with (cache.batch() if cache is not None else nullcontext()):
-        for path, found in _mapped(timed, stills, progress, cancel, first=0, span=85):
+        for path, found in _mapped(timed, stills, progress, cancel, workers, first=0, span=85):
             if found is None:
                 continue
             when, value = found
@@ -432,7 +502,12 @@ def find_bursts(paths: Sequence[Path], gap_seconds: float = 2.0, minimum: int = 
                 cache.put_by_key(keys[path], phash=value)
             entries.append((when, path, value))
 
-    entries.sort(key=lambda item: item[0])
+    # EXIF dates have one-second resolution, so the frames of a burst tie on
+    # time. Sorted on time alone they kept the order the workers finished in,
+    # and each frame is only compared with the one before it: the same folder
+    # gave a different burst on every scan. The name breaks the tie, and a
+    # camera numbers its frames in shooting order.
+    entries.sort(key=lambda item: (item[0], str(item[1])))
     groups: list[Group] = []
     run: list[tuple[float, Path, int]] = []
 

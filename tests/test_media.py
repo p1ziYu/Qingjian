@@ -301,7 +301,7 @@ class G06Task2Tests(TestCase):
     def setUp(self):
         self.temp = TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         os.environ["QINGJIAN_DATA_DIR"] = str(self.root / "data")
 
     def test_f086_sharing_violation_retries_move(self):
@@ -386,7 +386,7 @@ class G06Task6Tests(TestCase):
     def setUp(self):
         self.temp = TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         os.environ["QINGJIAN_DATA_DIR"] = str(self.root / "data")
 
     def test_f017_previous_frame_at_end_stops_after_one_window(self):
@@ -795,6 +795,34 @@ class G09MediaTests(TempCase):
         self.addCleanup(cache.close)
         self.assertIsNone(cache.get(path, 'captured'))
 
+    def test_capture_times_and_zero_scores_from_before_are_read_again(self):
+        """A file locked during a scan kept its mtime as its capture time, and
+        one that could not be decoded kept a sharpness of 0, until it changed."""
+        path = self.root / 'IMG_0001.JPG'
+        path.write_bytes(b'jpeg')
+        db = self.root / 'v2.sqlite'
+        from qingjian.core.hashcache import SCHEMA
+        from qingjian.core.imaging import ALGORITHM_VERSION
+        stat = path.stat()
+        connection = sqlite3.connect(db)
+        try:
+            connection.executescript(SCHEMA)
+            connection.executemany("INSERT INTO cache_meta(key,value) VALUES(?,?)",
+                                   [('algorithm', str(ALGORITHM_VERSION)), ('captured', '2')])
+            connection.execute('INSERT INTO entries(path,size,mtime_ns,captured,sharpness,updated) '
+                               'VALUES(?,?,?,?,?,?)',
+                               (str(path), stat.st_size, stat.st_mtime_ns, 123.0, 0.0, 0.0))
+            connection.execute('INSERT INTO entries(path,size,mtime_ns,sharpness,updated) '
+                               'VALUES(?,?,?,?,?)', ('sharp.jpg', 1, 1, 42.0, 0.0))
+            connection.commit()
+        finally:
+            connection.close()
+        cache = HashCache(db)
+        self.addCleanup(cache.close)
+        self.assertIsNone(cache.get(path, 'captured'))
+        self.assertIsNone(cache.get(path, 'sharpness'))
+        self.assertEqual(42.0, cache.get_by_key(('sharp.jpg', 1, 1), 'sharpness'))
+
     def test_f050_f056_hashcache_migration_and_replace(self):
         path = self.root / 'media.bin'
         path.write_bytes(b'A' * 100)
@@ -859,3 +887,475 @@ class G09MediaTests(TempCase):
                 gray = imaging._gray_array(path, 64)
                 self.assertEqual(0.0, float(gray.min()))
                 self.assertEqual(255.0, float(gray.max()))
+
+
+# Media decoding, raw layout, metadata and preview regressions.
+
+
+class VideoRotationTests(TempCase):
+    def portrait_clip(self, matrix=(0, 0x10000, 0, -0x10000, 0, 0, 0, 0, 0x40000000),
+                      name: str = "portrait.mp4"):
+        """A clip coded landscape whose track header says "turn me clockwise".
+
+        That is how a phone held upright records: the sensor writes the frames
+        on their side and the display matrix in ``tkhd`` turns them for showing.
+        """
+        av = video._av()
+        if av is None or "mpeg4" not in av.codecs_available:
+            self.skipTest("PyAV with an MPEG-4 encoder is not installed")
+        path = self.tmp / name
+        with av.open(str(path), "w") as container:
+            stream = container.add_stream("mpeg4", rate=25)
+            stream.width, stream.height, stream.pix_fmt = 64, 48, "yuv420p"
+            for number in range(5):
+                pixels = np.zeros((48, 64, 3), dtype=np.uint8)
+                pixels[:16, :16] = 255                  # a marker in the stored top-left
+                frame = av.VideoFrame.from_ndarray(pixels, format="rgb24")
+                frame.pts = number
+                for packet in stream.encode(frame):
+                    container.mux(packet)
+            for packet in stream.encode():
+                container.mux(packet)
+        data = path.read_bytes()
+        identity = struct.pack(">9i", 0x10000, 0, 0, 0, 0x10000, 0, 0, 0, 0x40000000)
+        turned = struct.pack(">9i", *matrix)
+        at = data.index(identity, data.index(b"tkhd"))
+        path.write_bytes(data[:at] + turned + data[at + len(turned):])
+        return path
+
+    def test_a_portrait_phone_clip_is_decoded_upright(self):
+        """The grid poster and a stepped frame used to come out on their side."""
+        path = self.portrait_clip()
+        self.assertEqual(90, metadata.read(path, use_cache=False).rotation)
+        poster = video.cover(path)
+        stepped, _when = video.frame_at(path, 0.0, 1)
+        for image in (poster, stepped):
+            self.assertEqual((48, 64), image.size)
+            # Turned clockwise, the stored top-left corner is now the top-right.
+            self.assertGreater(image.getpixel((image.width - 5, 4))[0], 200)
+            self.assertLess(image.getpixel((4, 4))[0], 50)
+
+
+    def test_a_mirrored_clip_is_mirrored_not_turned_over(self):
+        """PyAV reads a mirroring matrix as half a turn, and the clip stood on
+        its head; it is the left and right that change places."""
+        path = self.portrait_clip((-0x10000, 0, 0, 0, 0x10000, 0, 0, 0, 0x40000000),
+                                  "mirrored.mp4")
+        image = video.cover(path)
+        self.assertEqual((64, 48), image.size)
+        self.assertGreater(image.getpixel((image.width - 5, 4))[0], 200)
+        self.assertLess(image.getpixel((image.width - 5, image.height - 5))[0], 50)
+        self.assertLess(image.getpixel((4, 4))[0], 50)
+
+
+class RawLayoutTests(TempCase):
+    def test_a_nef_reports_the_raw_size_not_the_thumbnail(self):
+        """Nikon puts the JpgFromRaw preview first among the SubIFDs, without a
+        size of its own, and the raw second. Reading only the first left every
+        NEF at its 160x120 thumbnail, so a burst kept the JPEG over the raw."""
+        preview = g09_jpeg_bytes((1500, 1000))
+        make, date = b"NIKON CORPORATION\0", b"2024:05:01 07:00:00\0"
+
+        def shell(subs, exif_at):
+            return [(0xFE, 4, 1, 1), (0x100, 4, 1, 160), (0x101, 4, 1, 120),
+                    (0x10F, 2, len(make), make), (0x14A, 4, 2, struct.pack("<II", *subs)),
+                    (0x8769, 4, 1, exif_at)]
+
+        def jpg_from_raw(at):
+            return [(0xFE, 4, 1, 1), (0x103, 3, 1, 6), (0x201, 4, 1, at),
+                    (0x202, 4, 1, len(preview))]
+
+        raw = [(0xFE, 4, 1, 0), (0x100, 4, 1, 6048), (0x101, 4, 1, 4024), (0x103, 3, 1, 34713)]
+        first_at = 8 + len(g09_tiff_ifd(shell((0, 0), 0), 8))
+        second_at = first_at + len(g09_tiff_ifd(jpg_from_raw(0), first_at))
+        exif_at = second_at + len(g09_tiff_ifd(raw, second_at))
+        exif = g09_tiff_ifd([(0x9003, 2, len(date), date)], exif_at)
+        nef = self.write(self.tmp / "DSC_0001.NEF", b"II*\0" + struct.pack("<I", 8)
+                         + g09_tiff_ifd(shell((first_at, second_at), exif_at), 8)
+                         + g09_tiff_ifd(jpg_from_raw(exif_at + len(exif)), first_at)
+                         + g09_tiff_ifd(raw, second_at) + exif + preview)
+        jpg = self.write(self.tmp / "DSC_0001.JPG", preview)
+        tags = exifread.read_tiff_exif(nef)
+        self.assertEqual((6048, 4024), (tags["ImageWidth"], tags["ImageLength"]))
+        info = metadata.read(nef, use_cache=False)
+        self.assertEqual((6048, 4024), (info.width, info.height))
+        self.assertFalse(info.captured_is_fallback)
+        groups = dedupe.find_similar([nef, jpg])
+        self.assertEqual(1, len(groups))
+        self.assertEqual(nef, groups[0].keep().path)
+
+    def test_a_small_cr2_is_served_from_its_preview_not_its_sensor_data(self):
+        """Canon stores the sensor data as a lossless JPEG, which Pillow cannot
+        decode. In a small CR2 it is the largest JPEG in the file, so it was
+        picked as the preview and the file silently dropped out of the
+        similar and burst scans."""
+        values = (np.add.outer(np.arange(120), np.arange(180)) % 256).astype(np.uint8)
+        stream = io.BytesIO()
+        Image.fromarray(np.dstack([values, values[::-1], values])).save(stream, "JPEG")
+        preview = stream.getvalue()
+
+        def segment(marker, payload):
+            return b"\xff" + bytes([marker]) + struct.pack(">H", len(payload) + 2) + payload
+
+        huffman = b"\x00" + bytes([0] + [1] * 12 + [0, 0, 0]) + bytes(range(13))
+        sensor = (b"\xff\xd8" + segment(0xC4, huffman)
+                  + segment(0xC3, struct.pack(">BHHB", 14, 100, 200, 2) + b"\x01\x11\x00\x02\x11\x00")
+                  + segment(0xDA, b"\x02\x01\x00\x02\x00\x01\x00\x00")
+                  + bytes(range(250)) * 80 + b"\xff\xd9")
+        self.assertGreater(len(sensor), len(preview))
+        ifd_at = 16
+        bits_at = ifd_at + 2 + 9 * 12 + 4
+        preview_at = bits_at + 6
+
+        def entry(tag, kind, count, value):
+            return struct.pack("<HHI", tag, kind, count) + value
+
+        ifd = struct.pack("<H", 9)
+        ifd += entry(0x100, 3, 1, struct.pack("<HH", 180, 0))
+        ifd += entry(0x101, 3, 1, struct.pack("<HH", 120, 0))
+        ifd += entry(0x102, 3, 3, struct.pack("<I", bits_at))
+        ifd += entry(0x103, 3, 1, struct.pack("<HH", 6, 0))
+        ifd += entry(0x106, 3, 1, struct.pack("<HH", 6, 0))
+        ifd += entry(0x111, 4, 1, struct.pack("<I", preview_at))
+        ifd += entry(0x112, 3, 1, struct.pack("<HH", 1, 0))
+        ifd += entry(0x115, 3, 1, struct.pack("<HH", 3, 0))
+        ifd += entry(0x117, 4, 1, struct.pack("<I", len(preview))) + struct.pack("<I", 0)
+        cr2 = self.write(self.tmp / "IMG_0001.CR2",
+                         b"II*\x00" + struct.pack("<I", ifd_at) + b"CR\x02\x00" + struct.pack("<I", 0)
+                         + ifd + struct.pack("<HHH", 8, 8, 8) + preview + sensor)
+        jpg = self.write(self.tmp / "IMG_0001.JPG", preview)
+        self.assertEqual(preview, imaging.extract_embedded_jpeg(cr2))
+        self.assertEqual(imaging.phash(jpg), imaging.phash(cr2))
+        self.assertEqual((64, 43), imaging.thumbnail(cr2, (64, 64)).size)
+
+    def test_a_rational_crop_size_or_a_listed_subfile_type_keeps_the_rest(self):
+        """DNG allows DefaultCropSize as RATIONAL, and NewSubfileType can come
+        as a list. One int() on either threw away the whole parse, capture
+        date and orientation included."""
+        date = b"2024:05:01 07:00:00\0"
+        for name, odd in (
+                ("crop.dng", (0xC620, 5, 2, struct.pack("<IIII", 6000, 1, 4000, 1))),
+                ("subfile.dng", (0xFE, 4, 2, struct.pack("<II", 0, 0)))):
+            with self.subTest(name=name):
+                shell = [(0x112, 3, 1, 6), (0x8769, 4, 1, 0),
+                         (0xC612, 1, 4, bytes([1, 4, 0, 0])), odd]
+                exif_at = 8 + len(g09_tiff_ifd(shell, 8))
+                shell[1] = (0x8769, 4, 1, exif_at)
+                path = self.write(self.tmp / name, b"II*\0" + struct.pack("<I", 8)
+                                  + g09_tiff_ifd(shell, 8)
+                                  + g09_tiff_ifd([(0x9003, 2, len(date), date)], exif_at)
+                                  + b"\0" * 9000)
+                tags = exifread.read_tiff_exif(path)
+                self.assertEqual("2024:05:01 07:00:00", tags["DateTimeOriginal"])
+                info = metadata.read(path, use_cache=False)
+                self.assertFalse(info.captured_is_fallback)
+                self.assertEqual(6, info.orientation)
+                if name == "crop.dng":
+                    self.assertEqual((6000, 4000), (info.width, info.height))
+
+
+class TransientReadTests(TempCase):
+    def test_a_file_that_cannot_be_opened_just_now_is_not_remembered(self):
+        """A sharing violation, a virus scanner or a cloud file not yet on the
+        disk is a moment, not a fact about the file. Remembering the mtime it
+        fell back to kept the photo sorted by the wrong date for good."""
+        path = self.tmp / "IMG_0001.jpg"
+        exif = Image.Exif()
+        exif.get_ifd(0x8769)[0x9003] = "2015:07:04 12:00:00"
+        Image.new("RGB", (64, 64)).save(path, exif=exif)
+
+        def locked(*_args, **_kwargs):
+            raise PermissionError(13, "The process cannot access the file because "
+                                      "it is being used by another process")
+
+        with patch.object(Image, "open", locked):
+            self.assertIsNone(metadata.capture_time(path, strict=True))
+            # Without strict, sorting still gets a number to sort by.
+            self.assertIsInstance(metadata.capture_time(path), float)
+        info = metadata.read(path)
+        self.assertFalse(info.captured_is_fallback)
+        self.assertEqual(datetime(2015, 7, 4, 12), info.captured)
+        self.assertEqual(info.timestamp(), metadata.capture_time(path, strict=True))
+        # A file that is simply not a picture is a fact, and is remembered.
+        broken = self.write(self.tmp / "broken.jpg", b"\xff\xd8\xff" + b"\x00" * 200)
+        self.assertIs(metadata.read(broken), metadata.read(broken))
+        self.assertIsNotNone(metadata.capture_time(broken, strict=True))
+
+    def test_a_frame_that_cannot_be_decoded_has_no_quality_score(self):
+        """Scored as zero it was cached as blurry until the file next changed."""
+        junk = self.write(self.tmp / "junk.jpg", b"nope" * 3000)
+        self.assertIsNone(imaging.quality_score(junk))
+
+
+class MetadataReadingTests(TempCase):
+    def test_exposures_between_a_third_and_one_second_read_as_decimals(self):
+        """0.8 s is not 1/1, and neither 0.4 s nor 0.6 s is 1/2."""
+        cases = {(8, 10): "0.8s", (4, 10): "0.4s", (6, 10): "0.6s", (3, 10): "0.3s",
+                 (1, 2): "1/2", (1, 3): "1/3", (1, 4): "1/4", (10, 600): "1/60",
+                 (1, 250): "1/250", (13, 10): "1.3s", (2, 1): "2s"}
+        for value, expected in cases.items():
+            with self.subTest(value=value):
+                self.assertEqual(expected, metadata.format_shutter(value))
+
+    def test_a_capture_date_before_1970_still_sorts_by_that_date(self):
+        """On Windows a naive datetime before 1970 has no timestamp(): it raises.
+        A scanned 1965 negative then sorted by the day it was scanned."""
+        real = metadata.datetime
+
+        class WindowsDatetime(real):
+            def timestamp(self):
+                if self.tzinfo is None and self.year < 1970:
+                    raise OSError(22, "Invalid argument")
+                return super().timestamp()
+
+        path = self.tmp / "scan_1965.jpg"
+        exif = Image.Exif()
+        exif.get_ifd(0x8769)[0x9003] = "1965:07:04 12:00:00"
+        Image.new("RGB", (64, 64)).save(path, exif=exif)
+        with patch.object(metadata, "datetime", WindowsDatetime):
+            quick = metadata.capture_only(path)
+            full = metadata.capture_time(path)
+        self.assertIsNotNone(quick)
+        self.assertLess(quick, 0)
+        self.assertEqual(quick, full)
+
+
+from PySide6.QtCore import Qt
+from PySide6.QtTest import QTest
+from PIL import ImageOps
+
+from qingjian.ui import thumbs
+
+
+def _settle(rounds=6):
+    for _ in range(rounds):
+        APP.processEvents()
+        QTest.qWait(15)
+
+
+class PreviewDecodeTests(TempCase):
+    def corners(self, size, colour_at):
+        width, height = size
+        points = {"top-left": (3, 3), "top-right": (width - 4, 3),
+                  "bottom-left": (3, height - 4), "bottom-right": (width - 4, height - 4)}
+        return {name for name, point in points.items()
+                if colour_at(point)[2] > 150 and colour_at(point)[0] < 100}
+
+    def test_png_and_webp_orientation_matches_the_thumbnail(self):
+        """Qt applies EXIF orientation to JPEG and TIFF but not to PNG or WebP,
+        so those turned on screen when a held arrow key was let go."""
+        source = Image.new("RGB", (400, 200), (200, 10, 10))
+        source.paste((0, 0, 255), (0, 0, 100, 50))
+        cases = [("PNG", "png", o) for o in range(1, 9)]
+        cases += [("WEBP", "webp", o) for o in range(1, 9)]
+        cases += [("TIFF", "tif", 6), ("JPEG", "jpg", 6), ("JPEG", "jpg", 8)]
+        for fmt, ext, orientation in cases:
+            with self.subTest(format=fmt, orientation=orientation):
+                exif = Image.Exif()
+                exif[0x112] = orientation
+                path = self.tmp / f"o{orientation}.{ext}"
+                options = {"lossless": True} if fmt == "WEBP" else {}
+                source.save(path, fmt, exif=exif.tobytes(), **options)
+                with Image.open(path) as opened:
+                    expected = ImageOps.exif_transpose(opened).convert("RGB")
+                image, error = preview.decode_qimage(path, QSize(1400, 1000))
+                self.assertEqual("", error)
+                self.assertEqual(expected.size, (image.width(), image.height()))
+                self.assertEqual(
+                    self.corners(expected.size, expected.getpixel),
+                    self.corners(expected.size,
+                                 lambda point: image.pixelColor(*point).getRgb()[:3]))
+
+    def test_a_png_turned_after_its_pixels_or_in_xmp_alone_shows_turned(self):
+        """Pillow reads a PNG's chunks only up to its pixels, and the eXIf a
+        camera app writes after them, or an orientation kept in XMP alone, went
+        unseen: the thumbnail turned the picture and the preview did not."""
+        from PIL import PngImagePlugin
+        picture = Image.new("RGB", (100, 60), "blue")
+        exif = Image.Exif()
+        exif[0x0112] = 6
+        early = self.tmp / "early.png"
+        picture.save(early, exif=exif.tobytes())
+        data, at, chunks = early.read_bytes(), 8, []
+        while at < len(data):
+            size = struct.unpack(">I", data[at:at + 4])[0]
+            chunks.append(data[at:at + 12 + size])
+            at += 12 + size
+        late = self.write(self.tmp / "late.png", data[:8] + b"".join(
+            [c for c in chunks if c[4:8] != b"eXIf"][:-1]
+            + [c for c in chunks if c[4:8] == b"eXIf"] + chunks[-1:]))
+        xmp = self.tmp / "xmp.png"
+        text = PngImagePlugin.PngInfo()
+        text.add_itxt("XML:com.adobe.xmp",
+                      '<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/'
+                      '1999/02/22-rdf-syntax-ns#"><rdf:Description xmlns:tiff="http://ns.adobe.com'
+                      '/tiff/1.0/" tiff:Orientation="6"/></rdf:RDF></x:xmpmeta>')
+        picture.save(xmp, pnginfo=text)
+        for path in (late, xmp):
+            with self.subTest(path=path.name):
+                metadata.clear_cache()
+                self.assertEqual(6, metadata.read(path).orientation)
+                image, _error = preview.decode_qimage(path, QSize(1400, 1000))
+                self.assertEqual((60, 100), (image.width(), image.height()))
+                self.assertEqual((60, 100), imaging.thumbnail(path, (320, 320)).size)
+
+    def test_a_png_s_later_chunks_are_read_the_way_pillow_reads_them(self):
+        """The last of each kind wins, compressed XMP counts, and the date the
+        sort uses is the date everything else shows."""
+        import zlib
+        from datetime import datetime
+
+        def chunk(kind: bytes, body: bytes) -> bytes:
+            return struct.pack(">I", len(body)) + kind + body + struct.pack(
+                ">I", zlib.crc32(kind + body))
+
+        def exif(orientation: int, date: str = "") -> bytes:
+            block = Image.Exif()
+            block[0x0112] = orientation
+            if date:
+                block.get_ifd(0x8769)[0x9003] = date
+            return block.tobytes()
+
+        base = self.tmp / "plain.png"
+        Image.new("RGB", (100, 60), "blue").save(base)
+        data = base.read_bytes()
+        head, tail = data[:-12], data[-12:]                 # tail is IEND
+        xmp = (b'<x:xmpmeta><rdf:Description tiff:Orientation="6"/></x:xmpmeta>')
+        cases = {
+            "two_exif.png": (chunk(b"eXIf", exif(6)) + chunk(b"eXIf", exif(8)), 8),
+            "ztxt_xmp.png": (chunk(b"zTXt", b"XML:com.adobe.xmp\0\0" + zlib.compress(xmp)), 6),
+            "itxt_compressed.png": (chunk(b"iTXt", b"XML:com.adobe.xmp\0\1\0\0\0"
+                                          + zlib.compress(xmp)), 6),
+            "dated.png": (chunk(b"eXIf", exif(1, "2001:02:03 04:05:06")), 1),
+        }
+        for name, (extra, want) in cases.items():
+            with self.subTest(name=name):
+                path = self.write(self.tmp / name, head + extra + tail)
+                metadata.clear_cache()
+                self.assertEqual(want, metadata.read(path).orientation)
+                upright = imaging.thumbnail(path, (320, 320)).size == (100, 60)
+                self.assertEqual(want in (1, 2, 3, 4), upright)
+        # Further from the end than one read reaches, and with an earlier
+        # eXIf in front of the pixels: a decode takes the last in the file.
+        cases = {
+            "far.png": (chunk(b"eXIf", exif(6)) + chunk(b"tEXt", b"Note\0" + b"x" * 90_000), 6),
+            "trailer.png": (chunk(b"eXIf", exif(6)), 6),
+        }
+        for name, (extra, want) in cases.items():
+            with self.subTest(name=name):
+                trailer = b"\0" * 70_000 if name == "trailer.png" else b""
+                path = self.write(self.tmp / name, head + extra + tail + trailer)
+                metadata.clear_cache()
+                self.assertEqual(want, metadata.read(path).orientation)
+        both = self.tmp / "both.png"
+        Image.new("RGB", (100, 60), "blue").save(both, exif=exif(1))
+        data = both.read_bytes()
+        both = self.write(both, data[:-12] + chunk(b"eXIf", exif(6)) + data[-12:])
+        metadata.clear_cache()
+        self.assertEqual(6, metadata.read(both).orientation)
+        self.assertEqual((60, 100), imaging.thumbnail(both, (320, 320)).size)
+        dated = self.tmp / "dated.png"
+        taken = datetime(2001, 2, 3, 4, 5, 6)
+        self.assertEqual(taken, metadata.read(dated).captured)
+        self.assertEqual(taken.timestamp(), metadata.capture_only(dated))
+
+    def test_a_16_bit_greyscale_thumbnail_is_scaled_not_clipped(self):
+        """Pillow clips wide greyscale into eight bits, so a 16-bit scan's
+        thumbnail came out almost white while the preview was right."""
+        values = np.tile(np.linspace(0, 65535, 600), (40, 1)).astype(np.uint16)
+        for ext in ("png", "tif"):
+            with self.subTest(format=ext):
+                path = self.tmp / f"grey16.{ext}"
+                Image.fromarray(values).save(path)
+                image = thumbs.pil_to_qimage(imaging.thumbnail(path, (200, 200)))
+                samples = [image.pixelColor(x, 5).red() for x in (0, 50, 100, 150, 199)]
+                for got, want in zip(samples, (0, 64, 128, 192, 255), strict=True):
+                    self.assertLessEqual(abs(got - want), 3, samples)
+
+    def test_a_32_bit_greyscale_of_eight_bit_values_keeps_its_tones(self):
+        """Mode "I" is a 32-bit container, and a TIFF of plain 0..255 values
+        comes in as one. Scaled as sixteen bits it rendered nearly black."""
+        values = np.tile(np.linspace(0, 255, 600), (40, 1)).astype(np.int32)
+        image = thumbs.pil_to_qimage(Image.fromarray(values))      # int32: mode "I"
+        samples = [image.pixelColor(x, 5).red() for x in (0, 150, 300, 450, 599)]
+        for got, want in zip(samples, (0, 64, 128, 191, 255), strict=True):
+            self.assertLessEqual(abs(got - want), 3, samples)
+
+    def test_an_animation_is_fitted_to_the_pane_it_is_shown_in(self):
+        """The animation used to be scaled while its page was still hidden: the
+        first GIF always came out 640x480, and one opened after the window was
+        resized kept the old size and was cropped."""
+        frames = [Image.new("RGB", (400, 300), colour)
+                  for colour in ((255, 0, 0), (0, 255, 0), (0, 0, 255))]
+        gif = self.tmp / "anim.gif"
+        frames[0].save(gif, save_all=True, append_images=frames[1:], duration=100, loop=0)
+        still = self.tmp / "still.jpg"
+        Image.new("RGB", (400, 300)).save(still)
+        pane = preview.MediaPreview()
+        self.addCleanup(pane.close)
+        self.addCleanup(pane.release)
+        pane.resize(1000, 700)
+        pane.show()
+        _settle()
+
+        def assert_fitted():
+            fitted = QSize(400, 300).scaled(pane.animated.size(),
+                                            Qt.AspectRatioMode.KeepAspectRatio)
+            self.assertEqual(fitted, pane._movie.scaledSize())
+
+        for size in (QSize(1000, 700), QSize(1400, 900), QSize(700, 450)):
+            with self.subTest(size=size):
+                pane.show_path(still)
+                _settle()
+                pane.resize(size)
+                _settle()
+                pane.show_path(gif)
+                _settle()
+                assert_fitted()
+        pane.resize(900, 640)
+        _settle()
+        assert_fitted()
+
+    def test_a_file_that_changes_while_it_is_decoded_does_not_stay_on_reading(self):
+        """A sync client or an import still writing the file changes it under
+        the decode. The stale picture is rightly thrown away, but nothing was
+        reported either, so the window showed "Reading…" for good."""
+        path = self.tmp / "growing.png"
+        Image.new("RGB", (300, 200), (1, 2, 3)).save(path)
+        real = preview.decode_qimage
+        writes = []
+
+        def decode_while_written(source, target):
+            result = real(source, target)
+            if not writes:
+                writes.append(source)
+                with open(source, "ab") as stream:
+                    stream.write(b"\0")
+            return result
+
+        fetcher = preview.PreviewPrefetcher()
+        self.addCleanup(fetcher.shutdown)
+        target = QSize(1400, 1000)
+        # The window as it stands, waiting on the placeholder for this file.
+        window = MagicMock()
+        window.engine.current_path.return_value = path
+        window.preview.EMPTY = 0
+        window.preview.stack.currentIndex.return_value = 0
+        window.preview.show_path.return_value = (True, "")
+        window._preview_target.return_value = target
+        window.preloader = fetcher
+        window._preview_retries = {}
+        window._show_in_full = lambda shown, ready: MainWindow._show_in_full(window, shown, ready)
+        fetcher.arrived.connect(lambda name: MainWindow._preview_arrived(window, name))
+        with patch.object(preview, "decode_qimage", decode_while_written):
+            fetcher.set_wanted([path], target)
+            fetcher.request(path, target)
+            deadline = time.monotonic() + 3
+            while not window.preview.show_path.called and time.monotonic() < deadline:
+                QTest.qWait(10)
+        self.assertEqual([path], writes)
+        window.preview.show_empty.assert_not_called()
+        self.assertTrue(window.preview.show_path.called, "left on the placeholder")
+        shown, pixmap = window.preview.show_path.call_args.args
+        self.assertEqual(path, shown)
+        self.assertFalse(pixmap.isNull())

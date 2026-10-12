@@ -185,6 +185,17 @@ def _registry(registry):
     return winreg
 
 
+def command_line(parts) -> str:
+    """*parts* as one command line, every part quoted the way Windows reads it back.
+
+    A backslash is literal except before a quote, so one that ends a part --
+    the ``E:\\`` of a data directory at the root of a drive -- is doubled, or
+    it would escape the closing quote and run the part on into the next.
+    """
+    return " ".join('"' + part + "\\" * (len(part) - len(part.rstrip("\\"))) + '"'
+                    for part in map(str, parts))
+
+
 def set_folder_menu(enabled: bool, label: str = "", command=(), registry=None) -> None:
     """Add or remove "Open with Qingjian" on folders in Explorer, for this user."""
     reg = _registry(registry)
@@ -197,8 +208,7 @@ def set_folder_menu(enabled: bool, label: str = "", command=(), registry=None) -
                     continue
             continue
         values = ((key, {"": label, "Icon": command[0]}),
-                  (key + "\\command",
-                   {"": " ".join(f'"{part}"' for part in [*command, placeholder])}))
+                  (key + "\\command", {"": command_line([*command, placeholder])}))
         for path, entries in values:
             handle = reg.CreateKey(reg.HKEY_CURRENT_USER, path)
             try:
@@ -208,25 +218,47 @@ def set_folder_menu(enabled: bool, label: str = "", command=(), registry=None) -
                 reg.CloseKey(handle)
 
 
-def folder_menu_installed(registry=None) -> bool:
+def folder_menu_installed(command=(), registry=None) -> bool:
+    """Whether Explorer's folder menu is there -- and, given *command*, runs it.
+
+    Being there is not enough to call it on: a portable folder that has since
+    moved leaves an entry that starts a program which no longer exists, and
+    one written by another copy opens another library. Reading either as on
+    left the switch claiming a menu that did not work, and saving with it on
+    never wrote it again.
+    """
     try:
         reg = _registry(registry)
-        reg.CloseKey(reg.OpenKey(reg.HKEY_CURRENT_USER, FOLDER_MENU_KEYS[0][0] + "\\command"))
+        for key, placeholder in FOLDER_MENU_KEYS:
+            handle = reg.OpenKey(reg.HKEY_CURRENT_USER, key + "\\command")
+            try:
+                value, _kind = reg.QueryValueEx(handle, "") if command else ("", None)
+            finally:
+                reg.CloseKey(handle)
+            if command and str(value).casefold() != \
+                    command_line([*command, placeholder]).casefold():
+                return False
     except (ImportError, OSError):
         return False
     return True
 
 
-def launch_command(frozen: bool, executable: str, script: str) -> list[str]:
+def launch_command(frozen: bool, executable: str, script: str,
+                   data_dir: str | Path | None = None) -> list[str]:
     """What Explorer should run to open a folder in this program.
 
     A source checkout runs under pythonw.exe when there is one, so a folder
-    opened from the menu does not bring a console window with it.
+    opened from the menu does not bring a console window with it. *data_dir*
+    is passed on when this run was given one: Explorer knows nothing of the
+    command line this copy was started with, so without it the menu started a
+    second window on another library.
     """
     if frozen:
-        return [executable]
-    windowed = Path(executable).with_name("pythonw.exe")
-    return [str(windowed if windowed.is_file() else Path(executable)), script]
+        command = [executable]
+    else:
+        windowed = Path(executable).with_name("pythonw.exe")
+        command = [str(windowed if windowed.is_file() else Path(executable)), script]
+    return command + (["--data-dir", str(data_dir)] if data_dir else [])
 
 
 def reveal(path: str | Path) -> bool:

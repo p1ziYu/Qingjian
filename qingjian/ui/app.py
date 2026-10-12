@@ -17,7 +17,7 @@ from PySide6.QtWidgets import QApplication
 from .. import __app_name__, __display_name__, __organization__, __version__
 from ..core import appdirs, config, logsetup
 from ..core.engine import Engine
-from ..core.i18n import set_language, tr
+from ..core.i18n import normalize_language, set_language, tr
 from ..core.logsetup import get_logger
 from . import icons, theme
 from .prompts import critical, warning
@@ -79,8 +79,15 @@ def doorbell_name(data_dir: Path) -> str:
     return "qingjian-" + hashlib.sha1(key).hexdigest()[:16]
 
 
-def hand_over(name: str, folder: str, timeout_ms: int = 1500) -> bool:
-    """Give *folder* to the copy already running. False when nothing answers.
+def hand_over(name: str, folder: str, timeout_ms: int = 1500,
+              answer_ms: int | None = None) -> bool | None:
+    """Give *folder* to the copy already running.
+
+    True once that copy acknowledges it; ``None`` when nothing answers the
+    door at all; False when the folder went out but no acknowledgement came
+    back within *answer_ms* (*timeout_ms* unless given). Only ``None`` is
+    worth ringing again for: a copy that has the folder opens it however long
+    it takes to say so.
 
     Waits for that copy to acknowledge before hanging up. A local socket closed
     straight after writing loses its message before the other side reads it,
@@ -89,21 +96,32 @@ def hand_over(name: str, folder: str, timeout_ms: int = 1500) -> bool:
     socket = QLocalSocket()
     socket.connectToServer(name)
     if not socket.waitForConnected(timeout_ms):
-        return False
+        return None
     socket.write(folder.encode("utf-8") + b"\n")
     socket.flush()
-    acknowledged = socket.waitForReadyRead(timeout_ms) and bytes(socket.readAll()).startswith(b"ok")
+    wait = timeout_ms if answer_ms is None else answer_ms
+    acknowledged = socket.waitForReadyRead(wait) and bytes(socket.readAll()).startswith(b"ok")
     socket.disconnectFromServer()
     return acknowledged
 
 
 def _hand_over_with_retry(name: str, folder: str, timeout: float = 4.0,
                           interval: float = 0.15) -> bool:
-    """Wait briefly for a first instance that has its lock but not its listener."""
+    """Wait briefly for a first instance that has its lock but not its listener.
+
+    Only reaching it is retried. Once the folder is written, what is left of
+    the time goes to waiting for the answer: each attempt used to give up on
+    it after 150 ms and write the folder again, so a copy busy for a second
+    opened it four times, and one busy for five was handed it fourteen times
+    and still reported as not answering.
+    """
     deadline = time.monotonic() + timeout
     while True:
-        if hand_over(name, folder, timeout_ms=max(50, int(interval * 1000))):
-            return True
+        left = int((deadline - time.monotonic()) * 1000)
+        answered = hand_over(name, folder, timeout_ms=max(50, int(interval * 1000)),
+                             answer_ms=max(1500, left))
+        if answered is not None:
+            return answered
         if time.monotonic() >= deadline:
             return False
         time.sleep(interval)
@@ -305,21 +323,48 @@ class Doorbell(QObject):
         self._server.close()
 
 
+#: Qt's own options that take the next argument as their value. Qt reads them
+#: from the same command line, so their value is not the folder to open: with
+#: ``-platform offscreen`` the run used to go looking for a folder "offscreen".
+_QT_VALUE_OPTIONS = frozenset({
+    "-platform", "-platformpluginpath", "-platformtheme", "-plugin", "-session",
+    "-qwindowgeometry", "-qwindowicon", "-qwindowtitle", "-style", "-stylesheet",
+    "-display", "-geometry", "-title", "-icon",
+})
+
+
+def _unquoted(item: str) -> str:
+    """Undo Windows reading a backslash before a closing quote as an escape.
+
+    Explorer hands over ``"E:\\"`` for a drive, and a typed ``--data-dir "E:\\Q
+    Data\\"`` arrives the same way: the closing quote comes through as part of
+    the argument, ``E:\\Q Data"``, and the backslash before it is gone.
+    """
+    return item[:-1] + "\\" if item.endswith('"') else item
+
+
 def _parse(argv: list[str]) -> dict:
     options = {"data_dir": None, "language": "", "folder": "", "version": False}
     rest = list(argv[1:])
     while rest:
         item = rest.pop(0)
+        # "--data-dir=D:\QData" is the other usual spelling. It used to be
+        # dropped without a word, and the run then used the real library --
+        # the one thing --data-dir is there to rule out.
+        name, equals, value = item.partition("=")
         if item in ("--version", "-V"):
             options["version"] = True
-        elif item == "--data-dir" and rest:
-            options["data_dir"] = Path(rest.pop(0))
-        elif item == "--lang" and rest:
-            options["language"] = rest.pop(0)
+        elif name in ("--data-dir", "--lang") and (equals or rest):
+            value = value if equals else rest.pop(0)
+            if name == "--data-dir" and value:
+                options["data_dir"] = Path(_unquoted(value))
+            elif name == "--lang" and value:
+                options["language"] = normalize_language(value)
+        elif (item[1:] if item.startswith("--") else item) in _QT_VALUE_OPTIONS:
+            if rest:
+                rest.pop(0)
         elif not item.startswith("-"):
-            if item.endswith('"'):
-                item = item[:-1] + "\\"
-            options["folder"] = item
+            options["folder"] = _unquoted(item)
     return options
 
 
@@ -352,7 +397,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # Loaded before the lock is taken, because every message below this line
     # has to come out in the user's own language.
-    settings = config.load()
+    notes: list[str] = []
+    settings = config.load(notes=notes)
     if options["language"]:
         settings.language = options["language"]
     set_language(settings.language)
@@ -361,9 +407,12 @@ def main(argv: list[str] | None = None) -> int:
     # its console: a start-up event logged before this line reaches nothing but
     # `logging.lastResort`, so the one fact that explains such a session would
     # be missing from the very bundle the user is asked to attach. `configure`
-    # is safe to call twice and the engine calls it again below.
+    # is safe to call twice and the engine calls it again below. Settings that
+    # had to be reset could only be noted until now; they are logged here.
     logsetup.configure(settings.logging_enabled, settings.log_days,
                        directory=data_root / "logs")
+    for note in notes:
+        log.warning("%s", note)
 
     # One instance per data directory: two copies sorting the same library
     # would race on the journal.

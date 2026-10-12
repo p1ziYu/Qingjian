@@ -1,7 +1,9 @@
 import importlib
+import importlib.util
 import inspect
 import os
 import sys
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from base import TempCase, unittest
@@ -19,6 +21,41 @@ class EntryPointTests(unittest.TestCase):
             self.assertEqual(17, script_entry.main())
             self.assertEqual(17, module_entry.main())
         self.assertEqual([["--json"], ["--json"]], calls)
+
+
+@unittest.skipUnless(importlib.util.find_spec("PySide6"), "PySide6 is not installed")
+class StartupArgumentTests(unittest.TestCase):
+    @staticmethod
+    def parse(*args):
+        from qingjian.ui.app import _parse
+        return _parse(["MediaSorter.exe", *args])
+
+    def test_the_equals_spelling_of_an_option_is_honoured(self):
+        """``--data-dir=D:\\QData`` was dropped without a word, and the run then
+        used the real library -- the one thing ``--data-dir`` is there to rule out."""
+        self.assertEqual(Path(r"D:\QData"), self.parse(r"--data-dir=D:\QData")["data_dir"])
+        self.assertEqual("en", self.parse("--lang=en")["language"])
+
+    def test_a_data_directory_keeps_its_closing_backslash(self):
+        """``--data-dir "E:\\Q Data\\"`` arrives as ``E:\\Q Data"``: Windows reads
+        a backslash before the closing quote as escaping it. Only the folder to
+        open used to be repaired, so the run looked for a directory ending in a quote."""
+        self.assertEqual(Path("E:\\Q Data\\"),
+                         self.parse("--data-dir", 'E:\\Q Data"')["data_dir"])
+
+    def test_the_value_of_a_qt_option_is_not_the_folder_to_open(self):
+        """Qt reads its own options from the same command line."""
+        for args in (("-platform", "offscreen"), ("--platform", "offscreen"),
+                     ("-style", "fusion"), ("-stylesheet", "dark.qss")):
+            with self.subTest(args=args):
+                self.assertEqual("", self.parse(*args)["folder"])
+        self.assertEqual(r"D:\Pics", self.parse("-platform", "offscreen", r"D:\Pics")["folder"])
+        self.assertEqual(r"D:\Pics", self.parse("-style=fusion", r"D:\Pics")["folder"])
+
+    def test_a_language_from_the_command_line_is_one_the_settings_page_offers(self):
+        """It is kept in the settings, which offer nothing called "EN" or "auto"."""
+        self.assertEqual("en", self.parse("--lang", "EN")["language"])
+        self.assertEqual("system", self.parse("--lang", "auto")["language"])
 
 
 class StartupLocaleTests(TempCase):
@@ -114,6 +151,36 @@ class SelfcheckTests(TempCase):
         source = inspect.getsource(selfcheck._check_core.__wrapped__)
         self.assertIn('("JPG", "CR2", "XMP")', source)
         self.assertIn("undo left files", source)
+
+    def test_no_check_rests_on_an_assert_statement(self):
+        """``python -O`` strips every one, and a check made of them passes
+        whatever the program did."""
+        import ast
+        tree = ast.parse(inspect.getsource(selfcheck))
+        self.assertEqual([], [node.lineno for node in ast.walk(tree)
+                              if isinstance(node, ast.Assert)])
+
+    def test_a_check_still_fails_under_python_minus_o(self):
+        """Run optimised, the core check passed with no duplicates found at all."""
+        import subprocess
+        from base import ROOT
+        script = self.tmp / "optimised.py"
+        script.write_text(
+            "import sys\n"
+            "from pathlib import Path\n"
+            "from unittest.mock import patch\n"
+            "from qingjian import selfcheck\n"
+            "from qingjian.core.engine import Engine\n"
+            "work = Path(sys.argv[1])\n"
+            "with patch.object(Engine, 'find_duplicates', lambda self, *args, **kwargs: []):\n"
+            "    selfcheck._check_core(work / 'library', work / 'data')\n"
+            "print(selfcheck.RESULTS[-1][1], selfcheck.RESULTS[-1][2])\n", encoding="utf-8")
+        result = subprocess.run([sys.executable, "-O", str(script), str(self.tmp)],
+                                capture_output=True, text=True, timeout=120,
+                                env=dict(os.environ, PYTHONPATH=str(ROOT)))
+        self.assertTrue(result.stdout.startswith("False AssertionError: expected one "
+                                                 "duplicate group, got 0"),
+                        result.stdout + result.stderr)
 
     def test_scale_and_duplicates_have_result_count_assertions(self):
         scale = inspect.getsource(selfcheck._check_scale.__wrapped__)

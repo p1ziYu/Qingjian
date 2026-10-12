@@ -4,12 +4,14 @@ from __future__ import annotations
 import os
 import random
 import re
+import stat
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Sequence
 
 from . import mediatypes, metadata, sidecar as sidecar_mod
+from .platform_ import IS_WINDOWS
 from .safestore import Cancelled
 
 Progress = Callable[[str, int], None]
@@ -53,6 +55,58 @@ def pruned_targets(root: str | Path, targets: Sequence[str | Path]) -> list[Path
     return kept
 
 
+#: Folders a volume keeps for itself, in any letter case. Opening a whole drive
+#: walked into its recycle bin and listed every deleted photograph there -- the
+#: $R copies and the $I stubs that share their extension -- as if still in place.
+_SYSTEM_FOLDERS = frozenset({
+    "$recycle.bin",                                  # the Windows bin
+    "system volume information",                     # restore points, indexing
+    ".trashes",                                      # macOS on a removable drive
+})
+#: Names a person may give a folder of their own -- "Recycled" for a craft
+#: project -- so they count only at the root of a drive, where the bins of old
+#: Windows and of a Linux desktop are kept.
+_ROOT_FOLDERS = frozenset({"recycler", "recycled", ".trash"})
+
+#: Hidden and system together is how Windows marks a folder of its own. System
+#: alone is not enough: Explorer can set it on any folder given a custom icon.
+_PROTECTED = stat.FILE_ATTRIBUTE_HIDDEN | stat.FILE_ATTRIBUTE_SYSTEM
+
+
+def system_folder(name: str, parent: Path | None = None) -> bool:
+    """Whether a folder called *name*, in *parent*, belongs to the system or to us."""
+    folded = name.casefold()
+    if (name.startswith(".qingjian") or folded in _SYSTEM_FOLDERS
+            or folded.startswith(".trash-")):    # a freedesktop bin on a stick
+        return True
+    if folded not in _ROOT_FOLDERS or parent is None:
+        return False
+    try:
+        return parent == Path(parent.anchor) or os.path.ismount(parent)
+    except (OSError, ValueError):
+        return False
+
+
+def stray_file(name: str) -> bool:
+    """Whether a file called *name* is never a photograph, whatever its extension.
+
+    ``._IMG_0001.JPG`` is the resource fork a Mac leaves beside every file it
+    writes to a non-Mac disk, and a partial copy is ours, still in flight.
+    """
+    return name.startswith("._") or (name.startswith(".qingjian-") and name.endswith(".part"))
+
+
+def _protected(entry: os.DirEntry) -> bool:
+    if not IS_WINDOWS:
+        return False
+    try:
+        # Answered from the listing on Windows, so this costs no system call.
+        attributes = entry.stat(follow_symlinks=False).st_file_attributes
+    except (OSError, AttributeError):
+        return False
+    return attributes & _PROTECTED == _PROTECTED
+
+
 def scan(root: str | Path, recursive: bool = False, excluded: Sequence[Path] = (),
          progress: Progress = _noop, cancel: Cancel = _never) -> list[Path]:
     """Every media file under *root*, skipping targets, symlinks and junctions.
@@ -89,15 +143,15 @@ def scan(root: str | Path, recursive: bool = False, excluded: Sequence[Path] = (
                         if entry.is_symlink() or entry.is_junction():
                             continue
                         if entry.is_dir(follow_symlinks=False):
-                            if recursive and not name.startswith(".qingjian") \
-                                    and not is_blocked(here / name):
+                            if recursive and not system_folder(name, here) \
+                                    and not _protected(entry) and not is_blocked(here / name):
                                 subfolders.append(here / name)
                             continue
                         if not entry.is_file(follow_symlinks=False):
                             continue
                     except OSError:
                         continue
-                    if name.startswith(".qingjian-") and name.endswith(".part"):
+                    if stray_file(name):
                         continue
                     if os.path.splitext(name)[1].lower() not in mediatypes.MEDIA_EXTENSIONS:
                         continue
@@ -255,20 +309,28 @@ def _matches(path: Path, spec: FilterSpec, pattern) -> bool:
 
 
 def apply_filter(paths: Sequence[Path], spec: FilterSpec, progress: Progress = _noop,
-                 cancel: Cancel = _never) -> list[Path]:
+                 cancel: Cancel = _never, excluded: list[Path] | None = None) -> list[Path]:
+    """The files of *paths* that are still there and pass *spec*.
+
+    *excluded*, when given, collects the files left out because the exclusion
+    list names them, so the caller can take the rest of their shot out too.
+    """
     total = max(1, len(paths))
     out: list[Path] = []
     present = _presence(paths)
+    exclude = spec.exclude
     if spec.narrows_nothing():
         # Nothing to test but "is it still there" and "has it been handled".
-        exclude = spec.exclude
         for index, path in enumerate(paths):
             if cancel():
                 raise Cancelled("cancelled")
             if index % 256 == 0:
                 progress(path.name, int(index * 100 / total))
-            if str(path) not in exclude and present(path):
-                out.append(path)
+            if str(path) not in exclude:
+                if present(path):
+                    out.append(path)
+            elif excluded is not None and present(path):
+                excluded.append(path)
         return out
 
     pattern = spec.compiled_pattern()
@@ -277,8 +339,12 @@ def apply_filter(paths: Sequence[Path], spec: FilterSpec, progress: Progress = _
             raise Cancelled("cancelled")
         if index % 64 == 0:
             progress(path.name, int(index * 100 / total))
-        if present(path) and _matches(path, spec, pattern):
+        if not present(path):
+            continue
+        if _matches(path, spec, pattern):
             out.append(path)
+        elif excluded is not None and str(path) in exclude:
+            excluded.append(path)
     return out
 
 
@@ -343,6 +409,17 @@ def build_queue(paths: Sequence[Path], spec: FilterSpec, rules: sidecar_mod.Side
                 progress: Progress = _noop, cancel: Cancel = _never,
                 capture_time: Callable[[Path], float] | None = None) -> list[Path]:
     """Filter, collapse sidecar groups to one row each, then order."""
-    kept = apply_filter(paths, spec, progress, cancel)
-    collapsed = sidecar_mod.collapse_groups(kept, rules)
-    return sort_paths(collapsed, sort_mode, reverse, ratings, capture_time=capture_time)
+    return sort_paths(queue_rows(paths, spec, rules, progress, cancel), sort_mode, reverse,
+                      ratings, capture_time=capture_time)
+
+
+def queue_rows(paths: Sequence[Path], spec: FilterSpec, rules: sidecar_mod.SidecarRules,
+               progress: Progress = _noop, cancel: Cancel = _never) -> list[Path]:
+    """The rows `build_queue` lists for *paths*, unsorted.
+
+    Shared with the engine's in-place patching, which re-decides the rows of
+    one shot at a time and has to reach the answer a full rebuild would.
+    """
+    handled: list[Path] = []
+    kept = apply_filter(paths, spec, progress, cancel, excluded=handled)
+    return sidecar_mod.collapse_groups(kept, rules, excluded=handled)

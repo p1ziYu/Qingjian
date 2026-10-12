@@ -208,9 +208,19 @@ def fallback_roots() -> list[Path]:
     temporary directory, which stays writable even on a machine whose profile
     is locked down but which the system may empty, so it is named last and
     never used without saying so.
+
+    With no home directory at all there is no application data directory to
+    name, and ``Path.home()`` raises rather than answering; the temporary
+    directory is then the only fallback, rather than a start-up that dies --
+    even one whose own ``--data-dir`` works, since :func:`stranded_data` asks
+    here too.
     """
-    return [_platform_data_root(),
-            Path(tempfile.gettempdir()) / f"{__app_name__.lower()}-data"]
+    roots = []
+    try:
+        roots.append(_platform_data_root())
+    except (OSError, RuntimeError, KeyError):       # no home directory at all
+        pass
+    return roots + [Path(tempfile.gettempdir()) / f"{__app_name__.lower()}-data"]
 
 
 def _relocated(root: Path, requested: Path) -> Path:
@@ -327,6 +337,23 @@ def stranded_data(active: Path) -> Path | None:
             continue
         return candidate
     return None
+
+
+def launch_data_dir(active: Path) -> Path | None:
+    """The ``--data-dir`` a launch from outside needs to arrive at *active*.
+
+    None when a launch with no arguments gets there by itself: the portable
+    or per-user directory, or the area a refused one moved aside to. Anything
+    else came from ``--data-dir`` or ``QINGJIAN_DATA_DIR``, which Explorer's
+    "Open with Qingjian" does not pass on.
+    """
+    active = Path(active)
+    try:
+        default = portable_dir() or _platform_data_root()
+    except (OSError, RuntimeError, KeyError):       # no home directory at all
+        return active
+    unaided = [default] + [_relocated(root, default) for root in fallback_roots()]
+    return None if active in unaided else active
 
 
 def subdir(name: str, create: bool = True) -> Path:

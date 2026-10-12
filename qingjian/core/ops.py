@@ -14,7 +14,7 @@ from pathlib import PureWindowsPath
 from typing import Callable, Sequence
 
 from . import sidecar as sidecar_mod
-from . import metadata, naming, template
+from . import mediatypes, metadata, naming, template
 from .config import Binding, Settings
 from .logsetup import get_logger
 from .naming import NameError_
@@ -249,7 +249,8 @@ class Planner:
             return Outcome(cancelled=True, message_key="bind.target_folder")
         base = Path(binding.folder).expanduser().resolve()
         master = group.master
-        uses_sequence = "{seq" in binding.path_template or "{seq" in binding.name_template
+        uses_sequence = (template.uses_token(binding.path_template, "seq")
+                         or template.uses_token(binding.name_template, "seq"))
         seq = self.sequence.take(binding) if uses_sequence else self.sequence.peek(binding)
         ctx = self.context_for(master, binding, source_root, seq)
         try:
@@ -419,7 +420,11 @@ class Planner:
     def plan_undo(self, record: Record) -> Outcome:
         steps = list(record.payload.get("inverse") or [])
         delta = empty_delta()
-        delta["records_move"].append({"id": record.id, "to": "redo"})
+        # The step lists travel with the move: a copy back across volumes learns
+        # what the far clock kept, and the redo after it has to expect that.
+        delta["records_move"].append({"id": record.id, "to": "redo",
+                                      "forward": record.payload.get("forward") or [],
+                                      "inverse": record.payload.get("inverse") or []})
         self._reverse_side_effects(record, delta, undo=True)
         if not steps:
             return Outcome(record=record, delta=delta)
@@ -431,7 +436,9 @@ class Planner:
     def plan_redo(self, record: Record) -> Outcome:
         steps = list(record.payload.get("forward") or [])
         delta = empty_delta()
-        delta["records_move"].append({"id": record.id, "to": "history"})
+        delta["records_move"].append({"id": record.id, "to": "history",
+                                      "forward": record.payload.get("forward") or [],
+                                      "inverse": record.payload.get("inverse") or []})
         self._reverse_side_effects(record, delta, undo=False)
         if not steps:
             return Outcome(record=record, delta=delta)
@@ -451,13 +458,27 @@ class Planner:
         master = str(group.master)
         record.from_review = (self.state.is_queued(root, master)
                               if from_review is None else from_review)
+        if action == "rename" and record.from_review and self.state.is_queued(
+                root, str(record.destination)):
+            # A rename that replaced a file waiting for review: undo brings that
+            # file back, and it has to come back to review with it.
+            record.payload["replaced_in_review"] = True
         delta["records_clear_stack"].append(STACK_REDO)
         delta["records_add"].append(record.to_dict())
         # Any decision about a file takes it out of the review queue.
         delta["reviews_remove"].append([root, master])
+        if action == "rename" and record.from_review:
+            # A new name is not a decision about the photograph, so it keeps
+            # its place in review under the name it has now. Dropping it left
+            # the file on no list at all: gone from review, and still not in
+            # the main queue until the folder was opened again.
+            delta["reviews_add"].append([root, record.destination])
         if action in ("copy", "favorite"):
-            # The original stays put, so remember it was dealt with.
-            delta["done_add"].append(master)
+            # The originals stay put, so remember they were dealt with: the raw
+            # the copy carried as well as the JPEG. With companions listed as
+            # rows of their own, marking only the JPEG left the copied raw on
+            # screen to be copied again.
+            delta["done_add"].extend(_listable(record))
         return delta
 
     def _reverse_side_effects(self, record: Record, delta: dict, undo: bool) -> None:
@@ -473,6 +494,9 @@ class Planner:
                 delta["reviews_add"].append([root, master])
             else:
                 delta["reviews_remove"].append([root, master])
+            if record.action == "rename" and not record.payload.get("replaced_in_review"):
+                delta["reviews_remove" if undo else "reviews_add"].append(
+                    [root, record.destination])
         if record.action == "rename":
             for old, new, old_rating, old_label, new_rating, new_label in \
                     record.payload.get("tag_pairs") or []:
@@ -486,6 +510,16 @@ class Planner:
                     ])
         if record.action in ("copy", "favorite"):
             if undo:
-                delta["done_remove"].append(master)
+                delta["done_remove"].extend(_listable(record))
             else:
-                delta["done_add"].append(master)
+                delta["done_add"].extend(_listable(record))
+
+
+def _listable(record: Record) -> list[str]:
+    """The files of *record* that could be rows in the queue.
+
+    A sidecar such as an XMP never is, so marking it handled would only make
+    the count of hidden files say more than the queue ever showed.
+    """
+    return [path for path in record.paths
+            if path == record.original or mediatypes.is_media(path)]

@@ -1,0 +1,45 @@
+name: Windows tests
+
+# The behaviour this program depends on most -- the recycle bin, the registry,
+# NTFS permissions, junctions, long paths -- exists only on Windows, so the
+# suite and the self-check run there as well as wherever a change was written.
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Commit to test (defaults to the one dispatched)"
+        required: false
+
+jobs:
+  test:
+    runs-on: windows-latest
+    # A modal box left open offscreen waits for a click that never comes.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: python -m pip install -r requirements.txt
+      - name: Test suite
+        run: |
+          python run_tests.py 2>&1 | Tee-Object -FilePath test-output.txt
+          $status = $LASTEXITCODE
+          Write-Output "=== Failing tests ==="
+          Select-String -Path test-output.txt -Pattern "^(FAIL|ERROR): " | ForEach-Object { $_.Line }
+          Get-Content test-output.txt -Tail 3
+          exit $status
+      - name: Self-check
+        if: ${{ !cancelled() }}
+        run: python main.py --selfcheck

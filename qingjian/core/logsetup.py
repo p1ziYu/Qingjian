@@ -18,10 +18,10 @@ import sqlite3
 import sys
 import zipfile
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePath
 
 from .. import __version__
-from . import appdirs, i18n
+from . import appdirs, i18n, mediatypes, sidecar
 
 LOGGER_NAME = "qingjian"
 _configured = False
@@ -168,6 +168,21 @@ _HOME_PATH = re.compile(r"(?<![\w.~:/])~(?:" + _SEGMENT + r")+")
 _POSIX_PATH = re.compile(r"(?<![\w.~:/])(?:/(?:[^/\x00\r\n]*[^\s/\x00])?){2,}")
 _PATTERNS = (_EXTENDED_PATH, _WINDOWS_PATH, _HOME_PATH, _POSIX_PATH)
 _SEPARATORS = "\\/"
+#: A mask exactly as :func:`_mask_path` writes it. Every field is drawn from a
+#: fixed alphabet, so nothing a user named can hide inside one; text that
+#: already carries masks -- a summary masked once and then again with the rest
+#: of its member -- keeps them as they are.
+_MASK = re.compile(r"<path drive=(?:UNC|[A-Z]:|~|/) depth=\d+(?: ext=\.[0-9a-z]+)? "
+                   r"id=[0-9a-f]{8}>")
+
+#: Extensions a mask may name. Only these: the text after the last dot of a
+#: folder is as likely to be a name as a type -- ``Wedding.ChenLi``,
+#: ``Mr.Zhang``, the ``john.smith`` of an account folder -- and a mask that
+#: spells it out hands over the very word it was written to hide.
+_KNOWN_EXTENSIONS = (mediatypes.MEDIA_EXTENSIONS | sidecar.DEFAULT_METADATA
+                     | frozenset({".json", ".log", ".txt", ".csv", ".zip", ".db", ".sqlite",
+                                  ".wal", ".shm", ".lock", ".tmp", ".part", ".writing",
+                                  ".ini", ".exe", ".dll", ".py"}))
 
 #: Inside one bundle the same path gets the same tag, so a report can still be
 #: followed from a log line to the setting that points at the same file. The key
@@ -247,30 +262,88 @@ def _mask_path(text: str) -> str:
     if segments:
         name = segments[-1]
         dot = name.rfind(".")
-        if 0 < dot < len(name) - 1 and name[dot + 1:].isalnum() and len(name) - dot <= 9:
+        if 0 < dot and name[dot:].lower() in _KNOWN_EXTENSIONS:
             suffix = f" ext={name[dot:].lower()}"
     return (f"<path drive={drive} depth={len(segments)}{suffix} "
             f"id={_short_tag(unified.lower())}>")
 
 
-def _mask_matches(pattern: re.Pattern[str], text: str) -> str:
+def _mask_matches(pattern: re.Pattern[str], text: str) -> list[tuple[str, bool]]:
     """Replace every path *pattern* finds, resuming where the path really ended.
 
     ``re.sub`` would resume after the untrimmed match and so skip a second path
-    in the same sentence, leaving its folder names in place.
+    in the same sentence, leaving its folder names in place. Returns the text
+    in pieces, each marked with whether it is a mask, so that the next pattern
+    can be kept out of the masks this one wrote.
     """
-    pieces: list[str] = []
-    index = 0
+    pieces: list[tuple[str, bool]] = []
+    kept = index = 0
     while (match := pattern.search(text, index)) is not None:
         found = _trim_path(match.group(0), text[match.end():match.end() + 1])
         if len(found) < 3 or not any(sep in found for sep in _SEPARATORS):
+            # Passed over, not dropped: the words up to here are still the
+            # sentence, and "kept" is where the next piece of it begins.
             index = match.end()
             continue
-        pieces.append(text[index:match.start()])
-        pieces.append(_mask_path(found))
-        index = match.start() + len(found)
-    pieces.append(text[index:])
-    return "".join(pieces)
+        found = _posix_tail(text, match.start(), found)
+        pieces.append((text[kept:match.start()], False))
+        pieces.append((_mask_path(found), True))
+        kept = index = match.start() + len(found)
+    pieces.append((text[kept:], False))
+    return pieces
+
+
+#: Characters a Windows name may not hold, at which the Windows forms stop.
+_WINDOWS_FORBIDDEN = frozenset(':*?"<>|')
+_POSIX_RUN = re.compile(r"(?:/(?:[^/\x00\r\n]*[^\s/\x00])?)+")
+#: A quote stands before a path that begins afresh, as error messages quote it.
+_PATH_QUOTES = frozenset("'\"")
+
+
+def _posix_tail(text: str, start: int, found: str) -> str:
+    """*found*, run on to the end of a POSIX path the Windows forms stopped inside.
+
+    A Mac or Linux folder may be called "Trip: Japan", and the rooted and
+    home-relative forms end at the colon a Windows name could not hold, so the
+    rest of the path went out as words of the sentence -- and, kept from the
+    POSIX form by the mask in front of it, unmasked. A path that goes on past
+    such a character into a further name on the same line is taken to its
+    end; "target: denied" is still a path and a reason, and so is
+    "a.png: No such file: '/home/...'".
+    """
+    if "\\" in found or found[:1] not in ("/", "~"):
+        return found
+    end = start + len(found)
+    line_end = text.find("\n", end)
+    rest = text[end:line_end if line_end >= 0 else len(text)]
+    if rest[:1].isalnum():
+        # Stopped inside a name: "a.png:/home/..." reads "g:/" as a drive.
+        run = _POSIX_RUN.match(text, start + found.index("/"))
+        stop = run.end() if run is not None else end
+    else:
+        slash = rest.find("/")
+        if rest[:1] not in _WINDOWS_FORBIDDEN or slash < 1 or _starts_afresh(rest, slash):
+            return found
+        # On through the next separator and the path it carries on.
+        run = _POSIX_RUN.match(text, end + slash)
+        stop = run.end() if run is not None else end + slash + 1
+    if stop <= end:
+        return found
+    return _trim_path(text[start:stop], text[stop:stop + 1])
+
+
+def _starts_afresh(rest: str, slash: int) -> bool:
+    """Does the separator at *slash* open a path of its own, not carry on a name?
+
+    Only a quote, or a bracket after a space, says so for certain -- "...: No
+    such file: '/home/..." -- and only then is the reason kept. A space, a
+    comma or a semicolon may as well be part of a folder's name ("Fam: Smith,
+    Jones/"), so there the whole run is masked: a word of the sentence lost
+    rather than a name given away.
+    """
+    before = rest[slash - 1]
+    return before in _PATH_QUOTES or (
+        before in "([{<" and slash >= 2 and rest[slash - 2].isspace())
 
 
 def redact_text(text: str) -> str:
@@ -283,13 +356,47 @@ def redact_text(text: str) -> str:
 
     The account name goes first, so that an account named ``pat`` or ``dri``
     cannot afterwards eat its way through the ``<path drive=...>`` masks this
-    very function writes.
+    very function writes. Nor can a later pattern: a mask is set aside the
+    moment it is written. A POSIX path is masked by the rooted Windows form as
+    ``<path drive=/ ...>``, and the POSIX pattern used to start again at that
+    ``/`` and run on through the rest of the line -- "could not move <path
+    drive=<path ...>", with the reason the line was logged for gone with it.
     """
+    pieces = [(part, True) if index % 2 else (_strike_accounts(part), False)
+              for index, part in enumerate(_split_masks(text))]
+    for pattern in _PATTERNS:
+        pieces = [piece for part, masked in pieces
+                  for piece in ([(part, True)] if masked else _mask_matches(pattern, part))]
+    return "".join(part for part, _masked in pieces)
+
+
+def _strike_accounts(text: str) -> str:
+    """*text* with every spelling of the signed-in account put out of sight."""
     for name in _account_names():
         text = re.sub(re.escape(name), ACCOUNT_MASK, text, flags=re.IGNORECASE)
-    for pattern in _PATTERNS:
-        text = _mask_matches(pattern, text)
     return text
+
+
+def _mask_path_field(value: str) -> str:
+    """A settings path masked to the tag a log line naming it carries.
+
+    A log line has the account struck out before its paths are masked, and the
+    tag is taken from what is left; a setting masked as it stands was tagged
+    from the account's own name. Every library under ``C:\\Users\\<name>``
+    then carried one tag in the settings and another in the log, and the one
+    thing the tag is for -- following a report from a log line to the folder
+    it is about -- was gone on exactly the machines it was written for.
+    """
+    return _mask_path(_strike_accounts(value)) if value else value
+
+
+def _split_masks(text: str) -> list[str]:
+    """*text* split around the masks it already holds: text, mask, text, ..."""
+    pieces, index = [], 0
+    for match in _MASK.finditer(text):
+        pieces += [text[index:match.start()], match.group(0)]
+        index = match.end()
+    return pieces + [text[index:]]
 
 
 def redact_json(value):
@@ -405,7 +512,7 @@ def _mask_binding(value):
         if key in _TEMPLATE_FIELDS and isinstance(item, str):
             masked[key] = _mask_template(item)
         elif key in _PATH_FIELDS and isinstance(item, str):
-            masked[key] = _mask_path(item) if item else item
+            masked[key] = _mask_path_field(item)
         else:
             masked[key] = redact_json(item)
     return masked
@@ -440,7 +547,7 @@ def redact_settings(data):
         elif key == "current_profile" and isinstance(item, str):
             masked[key] = order.get(item, "preset ?") if item else item
         elif key in _PATH_FIELDS and isinstance(item, str):
-            masked[key] = _mask_path(item) if item else item
+            masked[key] = _mask_path_field(item)
         elif key in _TEMPLATE_FIELDS and isinstance(item, str):
             masked[key] = _mask_template(item)
         else:
@@ -494,12 +601,12 @@ def state_summary(path: str | Path) -> dict:
         return summary
     try:
         summary["bytes"] = target.stat().st_size
-        connection = sqlite3.connect(f"{target.resolve().as_uri()}?mode=ro", uri=True)
+        connection = sqlite3.connect(_read_only_uri(target.resolve()), uri=True)
     except OSError as error:
         summary.update(_why_unreadable(error))
         return summary
     except (ValueError, sqlite3.Error) as error:
-        summary["unreadable"] = redact_text(str(error))
+        summary.update(_why_unopenable(error))
         return summary
     try:
         tables = [row[0] for row in connection.execute(
@@ -514,10 +621,40 @@ def state_summary(path: str | Path) -> dict:
             row = connection.execute("SELECT value FROM meta WHERE key='schema'").fetchone()
             summary["schema"] = str(row[0]) if row and row[0] is not None else ""
     except sqlite3.Error as error:
-        summary["unreadable"] = redact_text(str(error))
+        summary.update(_why_unopenable(error))
     finally:
         connection.close()
     return summary
+
+
+def _read_only_uri(path: PurePath) -> str:
+    """The ``file:`` URI sqlite opens *path* read-only by, share or not.
+
+    ``as_uri`` names a share's server as the authority -- ``file://NAS/family/``
+    -- and that is also what ``resolve()`` makes of a mapped drive. sqlite takes
+    no authority but an empty one or ``localhost`` and refuses the rest with
+    "invalid uri authority", so a data directory on a NAS could never be
+    summarised. An empty authority before the whole ``//NAS/family/...`` path
+    is the spelling it opens.
+    """
+    uri = path.as_uri()
+    if uri.startswith("file://") and not uri.startswith("file:///"):
+        uri = "file:////" + uri[len("file://"):]
+    return uri + "?mode=ro"
+
+
+def _why_unopenable(error: Exception) -> dict:
+    """Why sqlite would not summarise the database, naming nothing in it.
+
+    sqlite's message is kept only up to its first colon. What follows is
+    whatever it was handed -- the server in "invalid uri authority: CHEN-NAS",
+    a table in "no such table: ..." -- and a server is named after a family or
+    a company as often as a folder is, but it is not a path, so ``redact_text``
+    could not see it.
+    """
+    reason = str(error).split(":", 1)[0].strip()
+    return {"unreadable": redact_text(reason) or type(error).__name__,
+            "error": getattr(error, "sqlite_errorname", None) or type(error).__name__}
 
 
 # ---------------------------------------------------------------------------

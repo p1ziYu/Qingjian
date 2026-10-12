@@ -6,8 +6,8 @@ import threading
 
 from collections import OrderedDict
 
-from PySide6.QtCore import (QObject, QRect, QRectF, QRunnable, QSize, Qt, QThreadPool, QUrl,
-                            Signal)
+from PySide6.QtCore import (QEvent, QObject, QRect, QRectF, QRunnable, QSize, Qt, QThreadPool,
+                            QUrl, Signal)
 from PySide6.QtGui import (QBrush, QColor, QImage, QImageIOHandler, QImageReader, QMovie,
                            QPainter, QPixmap, QTransform)
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (QComboBox, QFrame, QGraphicsPixmapItem, QGraphics
                                QSizePolicy, QSlider, QStackedWidget, QToolButton, QVBoxLayout,
                                QWidget)
 
-from ..core import imaging, mediatypes, video
+from ..core import imaging, mediatypes, metadata, video
 from ..core.i18n import tr
 from ..core.logsetup import get_logger
 from . import icons, theme
@@ -29,6 +29,17 @@ log = get_logger("preview")
 #: goes through Pillow, which can also lift a raw file's embedded preview.
 _QT_READABLE = {bytes(fmt).decode("ascii", "ignore").lower()
                 for fmt in QImageReader.supportedImageFormats()}
+
+#: Formats whose Qt reader ignores the EXIF orientation they can carry.
+_QT_UNORIENTED = {"png", "webp"}
+
+#: EXIF orientation as the mirror or turn that stands the picture upright.
+_ORIENTATIONS = {
+    2: QTransform(-1, 0, 0, 1, 0, 0), 3: QTransform(-1, 0, 0, -1, 0, 0),
+    4: QTransform(1, 0, 0, -1, 0, 0), 5: QTransform(0, 1, 1, 0, 0, 0),
+    6: QTransform(0, 1, -1, 0, 0, 0), 7: QTransform(0, -1, -1, 0, 0, 0),
+    8: QTransform(0, -1, 1, 0, 0, 0),
+}
 
 
 def decode_qimage(path: str | Path, target: QSize) -> tuple[QImage, str]:
@@ -50,6 +61,15 @@ def decode_qimage(path: str | Path, target: QSize) -> tuple[QImage, str]:
         rotated = bool(
             reader.transformation() & QImageIOHandler.Transformation.TransformationRotate90
         )
+        # Qt turns JPEG and TIFF by their EXIF orientation but not PNG or WebP,
+        # while the thumbnails and the pictures flipped past under a held key
+        # come from Pillow, which turns them all. Without this a PNG turned on
+        # screen as the key was let go.
+        orientation = 1
+        if (suffix in _QT_UNORIENTED
+                and reader.transformation() == QImageIOHandler.Transformation.TransformationNone):
+            orientation = metadata.read(target_path).orientation
+            rotated = orientation in (5, 6, 7, 8)
         if rotated:
             display_size.transpose()
         if display_size.isValid() and (display_size.width() > target.width()
@@ -58,6 +78,8 @@ def decode_qimage(path: str | Path, target: QSize) -> tuple[QImage, str]:
             reader.setScaledSize(QSize(scaled.height(), scaled.width()) if rotated else scaled)
         image = reader.read()
         if not image.isNull():
+            if orientation in _ORIENTATIONS:
+                image = image.transformed(_ORIENTATIONS[orientation])
             return image, ""
         error = reader.errorString()
     try:
@@ -215,7 +237,16 @@ class PreviewPrefetcher(QObject):
         if generation != self._generation:
             return
         self._pending.discard(key)
-        if not current or not self._still_wanted(key, generation):
+        if not current:
+            if self._still_wanted(key, generation):
+                # The file changed while it was read -- a sync client or an
+                # import still writing it -- so the picture was of a version
+                # that is gone, and is dropped. Saying nothing left the window
+                # on "Reading…" for good; this way it asks again for the file
+                # as it is now, a bounded number of times.
+                self.arrived.emit(key[0])
+            return
+        if not self._still_wanted(key, generation):
             return
         if image is not None:
             self._cache[key] = image
@@ -531,6 +562,7 @@ class MediaPreview(QWidget):
         self.animated.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.animated.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.animated.setStyleSheet(f"background: {theme.MAT};")
+        self.animated.installEventFilter(self)
 
         self.video_page = QWidget()
         video_layout = QVBoxLayout(self.video_page)
@@ -666,13 +698,20 @@ class MediaPreview(QWidget):
             movie = QMovie(str(target))
             if movie.isValid() and movie.frameCount() > 1:
                 self._movie = movie
+                # Nothing is decoded before the movie starts, so its current
+                # image is empty and every animation was stretched to the
+                # label's shape. The header knows the size.
                 self._movie_size = movie.currentImage().size()
-                if not self._movie_size.isValid():
-                    self._movie_size = movie.frameRect().size()
+                if self._movie_size.isEmpty():
+                    self._movie_size = QImageReader(str(target)).size()
                 self.animated.setMovie(movie)
+                # The page goes up first: a hidden page keeps whatever size it
+                # last had (640x480 if it was never shown), and an animation
+                # fitted to that was too small or cropped. The label's resize
+                # event fits it again once the layout has sized the page.
+                self.stack.setCurrentIndex(self.ANIMATED)
                 self._scale_movie()
                 movie.start()
-                self.stack.setCurrentIndex(self.ANIMATED)
                 return True, ""
 
         pixmap = cached
@@ -721,13 +760,16 @@ class MediaPreview(QWidget):
         if self._movie is None:
             return
         size = self._movie_size
-        if size.isValid():
+        if not size.isEmpty():
             self._movie.setScaledSize(size.scaled(self.animated.size(),
                                                   Qt.AspectRatioMode.KeepAspectRatio))
 
-    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt naming
-        super().resizeEvent(event)
-        self._scale_movie()
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt naming
+        # The label's own size is the one to fit, and it changes after this
+        # widget's resize event, or not at all while its page is hidden.
+        if watched is self.animated and event.type() == QEvent.Type.Resize:
+            self._scale_movie()
+        return super().eventFilter(watched, event)
 
     # -- playback ------------------------------------------------------
     def is_video_page(self) -> bool:

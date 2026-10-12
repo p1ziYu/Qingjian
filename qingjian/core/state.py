@@ -213,6 +213,16 @@ class StateStore:
             for move in delta.get("records_move") or []:
                 cursor.execute("UPDATE records SET stack=?, seq=? WHERE id=?",
                                (move["to"], self._next_seq(cursor), move["id"]))
+                if "forward" in move:
+                    # What an undo or redo really landed, so the next one expects it.
+                    # A damaged payload reads as empty everywhere else, so it is
+                    # rewritten from empty here rather than failing every undo.
+                    cursor.execute(
+                        "UPDATE records SET payload=json_set(CASE WHEN json_valid(payload) "
+                        "THEN CASE WHEN json_type(payload)='object' THEN payload ELSE '{}' END "
+                        "ELSE '{}' END, '$.forward', json(?), '$.inverse', json(?)) WHERE id=?",
+                        (json.dumps(move["forward"], ensure_ascii=False),
+                         json.dumps(move.get("inverse") or [], ensure_ascii=False), move["id"]))
             drops = delta.get("records_drop") or []
             if drops:
                 cursor.executemany("DELETE FROM records WHERE id=?", [(i,) for i in drops])

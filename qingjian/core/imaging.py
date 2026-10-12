@@ -59,13 +59,43 @@ def extract_embedded_jpeg(path: str | Path, search_bytes: int = 16 * 1024 * 1024
                 start = blob.find(_SOI, start + 3)
                 continue
         candidate = blob[start:end + 2]
-        if best is None or len(candidate) > len(best):
+        if (best is None or len(candidate) > len(best)) and _pillow_can_decode(blob, start):
             best = candidate
         start = blob.find(_SOI, end + 2)
     # The largest embedded JPEG wins. Some bodies store only a small preview; a
     # soft picture still beats refusing to show the file, and the perceptual
     # hash is computed at 32 pixels either way.
     return best
+
+
+#: Frame types libjpeg decodes through Pillow: baseline, extended and
+#: progressive, Huffman or arithmetic coded. Not lossless, not hierarchical.
+_DECODABLE_FRAMES = frozenset({0xC0, 0xC1, 0xC2, 0xC9, 0xCA})
+
+
+def _pillow_can_decode(blob: bytes, start: int) -> bool:
+    """False for a JPEG whose frame header says Pillow will refuse it.
+
+    A raw's sensor data can itself be a JPEG: Canon stores it lossless (SOF3)
+    at twelve or fourteen bits. In a small CR2 that is the largest JPEG in the
+    file, and taking it left the file with no preview and no hash. A header
+    that cannot be walked is given the benefit of the doubt, as before.
+    """
+    cursor = start + 2
+    while cursor + 4 < len(blob) and blob[cursor] == 0xFF:
+        marker = blob[cursor + 1]
+        if marker == 0xFF:                       # fill byte before a marker
+            cursor += 1
+            continue
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            return marker in _DECODABLE_FRAMES and blob[cursor + 4] == 8
+        if marker in (0xDA, 0xD9):
+            return True
+        length = int.from_bytes(blob[cursor + 2:cursor + 4], "big")
+        if length < 2:
+            return True
+        cursor += 2 + length
+    return True
 
 
 def _jpeg_end(blob: bytes, start: int) -> int | None:
@@ -295,11 +325,16 @@ def similarity(left: int | None, right: int | None) -> float:
     return 1.0 - hamming(left, right) / HASH_BITS
 
 
-def quality_score(path: str | Path) -> dict:
-    """Focus and exposure in one pass, for the 'which frame to keep' decision."""
+def quality_score(path: str | Path) -> dict | None:
+    """Focus and exposure in one pass, for the 'which frame to keep' decision.
+
+    None when the file could not be decoded. A score of zero there read as
+    "blurry", and was cached as a fact about a file that may only have been
+    locked or not yet downloaded at the time.
+    """
     pixels = _gray_array(path, 256)
     if pixels is None:
-        return {"sharpness": 0.0, "brightness": 0.0, "blown": 0.0, "crushed": 0.0}
+        return None
     laplace = (
         -4.0 * pixels[1:-1, 1:-1]
         + pixels[:-2, 1:-1] + pixels[2:, 1:-1]

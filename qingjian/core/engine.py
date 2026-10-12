@@ -8,6 +8,7 @@ by eye and this layer testable without a display.
 from __future__ import annotations
 
 import csv
+import os
 import threading
 import time
 import uuid
@@ -79,8 +80,10 @@ class Engine:
                                verify=self.settings.verification,
                                fast_path=self.settings.fast_path)
         self.state = StateStore(self.data_dir / "state" / "state.db")
-        self.cache = hashcache.HashCache(
-            (self.data_dir / "cache" / "hashes.db") if self.settings.hash_cache else None)
+        self.cache = self._open_cache(self.settings.hash_cache)
+        #: Caches swapped out by Settings, closed with the engine: a duplicate
+        #: scan still running on a worker may hold one.
+        self._retired_caches: list[hashcache.HashCache] = []
         self.planner = ops.Planner(self.store, self.state, self.settings)
         self.queue = OperationQueue(on_event=self._on_queue_event)
         self.queue_listeners: list[Callable[[str, Job], None]] = []
@@ -102,9 +105,13 @@ class Engine:
         log.info("engine ready · version %s · data %s", __version__, self.data_dir)
 
     # ------------------------------------------------------------ setup
+    def _open_cache(self, on_disk: bool) -> hashcache.HashCache:
+        return hashcache.HashCache((self.data_dir / "cache" / "hashes.db") if on_disk else None)
+
     def close(self) -> None:
         self.queue.stop()
-        self.cache.close()
+        for cache in (*self._retired_caches, self.cache):
+            cache.close()
         self.state.close()
 
     def save_settings(self) -> None:
@@ -112,6 +119,11 @@ class Engine:
 
     def apply_settings(self, settings: config.Settings) -> None:
         """Adopt edited settings, re-tuning the pieces that depend on them."""
+        if settings.hash_cache != self.settings.hash_cache:
+            # Read only when the engine was made, so the switch waited for a
+            # restart to keep, or stop keeping, hashes on disk.
+            self._retired_caches.append(self.cache)
+            self.cache = self._open_cache(settings.hash_cache)
         self.settings = settings
         self.planner.settings = settings
         self.store.verify = settings.verification
@@ -168,13 +180,25 @@ class Engine:
             raise
 
     def rescan(self, progress=_noop, cancel=_never) -> int:
+        """Read the source folder again; on any failure, change nothing.
+
+        Cancelling while the queue was rebuilt used to keep the new file list
+        beside the old queue, so the count and the queue disagreed and the
+        next in-place patch worked from a list the queue was not built from.
+        """
         if not self.source_root:
             return 0
+        previous = (self.all_files, self.queue_paths, self.index)
         self._stem_index.clear()
         metadata.clear_cache()
-        self.all_files = scanner.scan(self.source_root, self.settings.recursive,
-                                      self.settings.target_folders(), progress, cancel)
-        self.rebuild_queue(progress, cancel)
+        try:
+            self.all_files = scanner.scan(self.source_root, self.settings.recursive,
+                                          self.settings.target_folders(), progress, cancel)
+            self.rebuild_queue(progress, cancel)
+        except BaseException:
+            self.all_files, self.queue_paths, self.index = previous
+            self._stem_index.clear()
+            raise
         return len(self.all_files)
 
     def capture_time(self, path: Path) -> float:
@@ -186,7 +210,12 @@ class Engine:
         cached = self.cache.get(path, "captured")
         if cached is not None:
             return float(cached)
-        value = metadata.capture_time(path)
+        value = metadata.capture_time(path, strict=True)
+        if value is None:
+            # Locked or not yet downloaded just now: sort it by its mtime this
+            # time, but do not remember that, or it keeps the wrong date until
+            # the file is next edited.
+            return float(metadata.capture_time(path) or 0.0)
         self.cache.put(path, captured=float(value))
         return value
 
@@ -218,7 +247,9 @@ class Engine:
 
         def timestamp(path: Path) -> float:
             quick = metadata.capture_only(path)
-            return quick if quick is not None else metadata.capture_time(path)
+            # None for a file that could not be read just now; it is left out
+            # here, and the sort asks `capture_time`, which does not store it.
+            return quick if quick is not None else metadata.capture_time(path, strict=True)
 
         # One thread on purpose. Parsing EXIF is mostly Python holding the
         # interpreter lock, so a pool made this measurably slower, not faster.
@@ -550,8 +581,10 @@ class Engine:
         if target is None:
             return ops.Outcome(skipped=True)
         with self.exclusive():
-            outcome = self.planner.plan_rename(self.group_for(target), new_name,
-                                               self.source_root, resolver)
+            # "Never" keeps companions where they are for every action; a rename
+            # that took the raw and XMP along was the one place it did not.
+            outcome = self.planner.plan_rename(self._operation_group(self.group_for(target)),
+                                               new_name, self.source_root, resolver)
             return self._commit(outcome, progress, cancel)
 
     def trash(self, path: str | Path | None = None, progress=_noop, cancel=_never,
@@ -712,7 +745,7 @@ class Engine:
                         seen.setdefault(str(value), Path(value))
         return list(seen.values())
 
-    def absorb(self, record: Record | None) -> dict | None:
+    def absorb(self, record: Record | None, unordered: bool = False) -> dict | None:
         """Bring the file lists in line with what *record* changed.
 
         Undo and redo used to call :meth:`rescan`, which walks the whole source
@@ -721,73 +754,113 @@ class Engine:
         that touched one shot. Here the record already names the files involved,
         so the lists are patched in place.
 
-        Membership is decided by the queue and by the filter, never by
-        ``all_files``: that list keeps an entry for a file the queue has already
-        let go, so trusting it meant an undone move put the file back on disk
-        and nowhere on screen. Undoing a skip is the same shape -- the file
-        never moved, only its exclusion did -- so every touched file that still
-        exists is re-tested against the filter rather than assumed to be fine.
+        Membership is decided the way a rebuild decides it, one shot at a
+        time: every file of each shot the record touched is taken from
+        ``all_files`` and put through the same filter and grouping as
+        `rebuild_queue`, and the queue's rows for that shot are made to match.
+        Copying or marking a file leaves it where it was and only changes the
+        handled list, so a check that looked at the file rather than the filter
+        left it on screen and holding the key down copied it again and again.
+        Testing only the files the record names was not enough either: a raw
+        that a move left behind was listed by the next rebuild but not here,
+        and a restored raw was folded into its JPEG even with companions shown
+        as rows.
 
-        Returns None when the lists cannot be patched confidently and the
-        caller should rebuild the queue instead; otherwise the queue rows that
-        were added and removed, so the views can be patched the same way.
+        Returns None when the queue cannot be patched confidently and the
+        caller should rebuild it instead; otherwise the queue rows that were
+        added and removed, so the views can be patched the same way. The file
+        list is brought up to date either way, because that rebuild reads it:
+        one still naming the old file lost a renamed or restored file for good.
         """
         touched = self.touched_paths(record)
         if not touched or self.source_root is None:
             return None
+        metadata.forget(touched)
+        known = set(self.all_files)
+        dropped = self._list_touched(touched, known)
         if self.review_mode:
             # That queue is a database query, not a view of these lists.
             return None
-        key = self._sort_key(touched)
-        if key is None:                     # random order has no insert point
-            return None
+        ordered = scanner.sort_key(self.settings.sort_mode) is not None
+        if not ordered and not unordered:
+            return None                     # random order has no insert point
+
+        queued = set(self.queue_paths)
+        shots: dict[tuple[str, str], Path] = {}
+        for path in touched:
+            # A destination outside the source folder was never listed. A file
+            # that left still counts: the background queue takes its row out
+            # first, and a raw it left behind has to take that row's place.
+            if path in known or path in queued or path in dropped:
+                shots.setdefault(sidecar_mod.group_key(path), path)
+        plans: list[tuple[list[Path], list[Path]]] = []
+        for path in shots.values():
+            plans.append((self._same_shot(path, self.all_files),
+                          self._same_shot(path, self.queue_paths)))
+        members = [member for listed, _rows in plans for member in listed]
+        # *unordered*: in random order a file that arrives goes to the end, for
+        # a caller that would rather not reshuffle the whole queue to place it.
+        key = self._sort_key([*touched, *members]) if ordered else None
+        spec = self._filter_spec(members)
 
         added: list[tuple[int, Path]] = []
         removed: list[Path] = []
-        metadata.forget(touched)
+        arriving: list[Path] = []
+        for listed, rows in plans:
+            wanted = scanner.queue_rows(listed, spec, self.settings.sidecar)
+            for path in rows:
+                if path not in wanted and self.drop_from_queue(path) >= 0:
+                    removed.append(path)
+            arriving.extend(path for path in wanted if path not in rows)
+        # Every removal before any insertion: the views apply the change in
+        # that order, so each position below has to be counted the same way.
+        for path in arriving:
+            where = self._insert_into_queue(path, key)
+            if where >= 0:
+                added.append((where, path))
+
+        self.index = clamp_index(self.index, len(self.queue_paths))
+        return {"added": added, "removed": removed}
+
+    def _list_touched(self, touched: Sequence[Path], known: set[Path]) -> set[Path]:
+        """Add the touched files `scan` would return; drop the ones that are gone.
+
+        *known* is the set of ``all_files`` and is kept in step with it.
+        Returns the files that were dropped.
+        """
         root = self.source_root
         excluded = scanner.pruned_targets(root, self.settings.target_folders())
-        spec = self._filter_spec(touched)
-        queued = set(self.queue_paths)
-        known = set(self.all_files)
-
-        wanted_paths: list[Path] = []
+        dropped: set[Path] = set()
         for path in touched:
             if path.exists() and self._belongs(path, root, excluded):
                 if path not in known:
                     self.all_files.append(path)
                     known.add(path)
                     self._index_note(path)
-                # Whether it should be listed is re-decided every time, in both
-                # directions. Copying or marking a file leaves it exactly where
-                # it was and only changes the handled list, so a check that
-                # looked at the file rather than the filter left it on screen --
-                # and holding the key down copied it again and again.
-                wanted = bool(scanner.apply_filter([path], spec))
-                if wanted:
-                    wanted_paths.append(path)
-                    continue
-                if self.drop_from_queue(path) >= 0:
-                    removed.append(path)
-                    queued.discard(path)
                 continue
             if path in known:
                 self.all_files.remove(path)
                 known.discard(path)
-            if self.drop_from_queue(path) >= 0:
-                removed.append(path)
-                queued.discard(path)
+                dropped.add(path)
             self._index_forget(path)
+        return dropped
 
-        for path in wanted_paths:
-            if path not in queued:
-                where = self._insert_into_queue(path, key)
-                if where >= 0:
-                    added.append((where, path))
-                    queued.add(path)
+    @staticmethod
+    def _same_shot(path: Path, paths: Sequence[Path]) -> list[Path]:
+        """The entries of *paths* that belong to the same shot as *path*.
 
-        self.index = clamp_index(self.index, len(self.queue_paths))
-        return {"added": added, "removed": removed}
+        A string prefix is tested before the full key: the key costs several
+        microseconds a file, and on a folder of twenty thousand photographs
+        this runs on every key press.
+        """
+        key = sidecar_mod.group_key(path)
+        folder = os.path.join(os.fspath(path.parent), "")
+        stem = sidecar_mod.base_stem(path).casefold()
+        start = len(folder)
+        return [other for other in paths
+                if (text := os.fspath(other)).startswith(folder)
+                and text[start:].casefold().startswith(stem)
+                and sidecar_mod.group_key(other) == key]
 
     def exclude_targets(self) -> dict | None:
         """Drop files that now sit inside a destination folder.
@@ -887,15 +960,20 @@ class Engine:
                 return False
             if path.suffix.lower() not in mediatypes.MEDIA_EXTENSIONS:
                 return False
+            if scanner.stray_file(path.name):
+                return False
             parent = path.parent.resolve()
             if parent != path.parent:
                 return False
             if parent != root and not (self.settings.recursive
                                        and parent.is_relative_to(root)):
                 return False
-            # The recycle folder and anything else `scan` steps over.
-            if any(part.startswith(".qingjian") for part in parent.relative_to(root).parts):
-                return False
+            # The recycle folders and anything else `scan` steps over by name.
+            folder = root
+            for part in parent.relative_to(root).parts:
+                if scanner.system_folder(part, folder):
+                    return False
+                folder = folder / part
             if any(parent == folder or parent.is_relative_to(folder) for folder in excluded):
                 return False
         except (OSError, RuntimeError, ValueError):
@@ -939,18 +1017,14 @@ class Engine:
         return where
 
     def _insert_into_queue(self, path: Path, key) -> int:
-        """Place *path* where a full sort would have put it; -1 if not added."""
+        """Place *path* where a full sort would have put it; -1 if not added.
+
+        With no *key*, which is random order, it goes to the end.
+        """
         if path in self.queue_paths:
             return -1
-        if self.settings.sidecar.enabled:
-            # One row per shot: a restored RAW joins the JPEG already listed.
-            stem = sidecar_mod.base_stem(path).casefold()
-            folder = path.parent
-            for existing in self.queue_paths:
-                if (existing.parent == folder and
-                        sidecar_mod.base_stem(existing).casefold() == stem and
-                        self.settings.sidecar.classify(path, existing) is not None):
-                    return -1
+        if key is None:
+            return self.insert_at(path, len(self.queue_paths))
         try:
             value = key(path)
         except OSError:
@@ -988,14 +1062,18 @@ class Engine:
         paths = list(self.all_files)
         root = str(self.source_root or "")
         ignored = self.state.ignored_keys(root)
+        # "Worker threads" in Settings: the files read side by side while hashing.
+        # It was saved and never read, so a slow share could not be eased.
+        workers = self.settings.workers
         if mode == dedupe.MODE_SIMILAR:
             return dedupe.find_similar(paths, self.settings.similar_threshold, self.cache,
-                                       ignored, progress, cancel)
+                                       ignored, progress, cancel, workers=workers)
         if mode == dedupe.MODE_BURST:
             return dedupe.find_bursts(paths, self.settings.burst_gap_seconds,
                                       self.settings.burst_minimum, cache=self.cache,
-                                      ignored=ignored, progress=progress, cancel=cancel)
-        return dedupe.find_exact(paths, self.cache, ignored, progress, cancel)
+                                      ignored=ignored, progress=progress, cancel=cancel,
+                                      workers=workers)
+        return dedupe.find_exact(paths, self.cache, ignored, progress, cancel, workers=workers)
 
     def ignore_duplicates(self, candidates: Sequence[dedupe.Candidate],
                           root: Path) -> ops.Outcome:
@@ -1059,8 +1137,11 @@ class Engine:
         for index in drop:
             refs.extend(records[index].snapshots)
             ids.append(records[index].id)
-        freed = self.store.discard_snapshots(refs)
+        # The records stop being undoable before their files go, as `StateStore.apply`
+        # does it: a failure in between leaks disk, never an undo with nothing behind
+        # it -- and for a recycled photo that copy is the photo itself.
         self.state.retire(ids)
+        freed = self.store.discard_snapshots(refs)
         log.info("reclaimed %d bytes from %d records", freed, len(ids))
         return (freed, len(ids))
 

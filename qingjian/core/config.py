@@ -1,14 +1,19 @@
 """Key bindings, presets and application settings."""
 from __future__ import annotations
 
+import itertools
 import json
+import os
+import stat
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 from . import appdirs
+from .i18n import normalize_language
 from .logsetup import get_logger
 from .safestore import QuotaPolicy, VERIFY_FAST, VERIFY_FULL, atomic_json
 from .sidecar import SidecarRules
+from .work import WORKERS
 
 log = get_logger("config")
 
@@ -110,7 +115,9 @@ class Settings:
     log_days: int = 7
     # performance
     background_queue: bool = True
-    workers: int = 4
+    #: Files read side by side by a duplicate scan. Unset, it is what the scan
+    #: chose for itself before the setting was read at all: one per core, 2 to 8.
+    workers: int = WORKERS
     #: A 168 px RGBA tile is about 110 KB, so this holds several thousand.
     thumb_cache_mb: int = 512
     hash_cache: bool = True
@@ -176,7 +183,7 @@ class Settings:
                 value = min(high, value)
             return value
 
-        settings.language = text("language", default="system")
+        settings.language = normalize_language(text("language", default="system"))
         settings.density = text("density", DENSITIES, "standard")
         settings.default_view = text("default_view", (VIEW_SINGLE, VIEW_GRID), VIEW_SINGLE)
         settings.restore_position = flag("restore_position", True)
@@ -192,7 +199,7 @@ class Settings:
         settings.logging_enabled = flag("logging_enabled", True)
         settings.log_days = number("log_days", 7, 1, 365)
         settings.background_queue = flag("background_queue", True)
-        settings.workers = number("workers", 4, 1, 32)
+        settings.workers = number("workers", WORKERS, 1, 32)
         settings.thumb_cache_mb = number("thumb_cache_mb", 512, 64, 65536)
         settings.hash_cache = flag("hash_cache", True)
         settings.similar_threshold = number("similar_threshold", 0.92, 0.89, 1.0)
@@ -260,27 +267,77 @@ class Settings:
         return replace(self, language=language)
 
 
-def load(path: str | Path | None = None) -> Settings:
+def load(path: str | Path | None = None, notes: list[str] | None = None) -> Settings:
+    """Read the settings, setting a damaged file aside rather than failing.
+
+    Start-up loads these before there is a log -- the settings say whether
+    there is to be one -- so a warning logged here reached nothing but stderr,
+    which the frozen build hides, and the one record of the user's settings
+    being reset went nowhere. A caller in that position passes *notes* and logs
+    what lands there once the log is open.
+    """
     target = Path(path) if path else appdirs.settings_path()
     if not target.exists():
         settings = Settings()
         settings.ensure_profile()
         return settings
     try:
-        data = json.loads(target.read_text(encoding="utf-8"))
+        # "utf-8-sig": Notepad and PowerShell 5 write a byte-order mark, and a
+        # file someone fixed by hand is not a damaged one.
+        data = json.loads(target.read_text(encoding="utf-8-sig"))
         settings = Settings.from_dict(data)
     except (OSError, ValueError, TypeError, OverflowError, RecursionError) as error:
-        log.warning("settings unreadable (%s); keeping the file and starting fresh", error)
-        try:
-            target.replace(target.with_suffix(".broken.json"))
-        except OSError:
-            pass
+        spare = _set_aside(target)
+        note = (f"settings unreadable ({error}); "
+                + (f"kept as {spare.name}" if spare else "left in place") + ", starting fresh")
+        if notes is None:
+            log.warning("%s", note)
+        else:
+            notes.append(note)
         settings = Settings()
         settings.ensure_profile()
         return settings
     return settings
 
 
+def _set_aside(target: Path) -> Path | None:
+    """Move a damaged settings file out of the way without losing an earlier one.
+
+    Every damaged copy is kept under a name of its own: the second failure used
+    to overwrite ``settings.broken.json``, and with it the only copy of the
+    settings the first one had reset.
+    """
+    for number in itertools.count(1):
+        spare = target.with_suffix(".broken.json" if number == 1 else f".broken.{number}.json")
+        if spare.exists():
+            continue
+        try:
+            target.replace(spare)
+        except OSError:
+            return None
+        return spare
+    return None                                     # pragma: no cover - count() is endless
+
+
 def save(settings: Settings, path: str | Path | None = None) -> None:
     target = Path(path) if path else appdirs.settings_path()
+    _clear_read_only(target)
     atomic_json(target, settings.to_dict())
+
+
+def _clear_read_only(path: Path) -> None:
+    """Let a read-only settings file be replaced. Never raises.
+
+    Windows will not replace a file whose read-only attribute is set, so a
+    settings.json copied off a CD or a read-only share, or restored from a
+    backup with the attribute on, passed the start-up write probe -- which
+    makes files of its own -- and then failed every save after it.
+    """
+    try:
+        mode = path.lstat().st_mode
+        # A link is replaced, not written through: making the file it points
+        # at writable would change a file this program no longer touches.
+        if not stat.S_ISLNK(mode) and not mode & stat.S_IWRITE:
+            os.chmod(path, mode | stat.S_IWRITE)
+    except OSError:
+        pass

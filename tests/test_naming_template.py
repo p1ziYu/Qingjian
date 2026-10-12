@@ -55,6 +55,16 @@ class NamingTests(TempCase):
         # Re-filing "a (2).jpg" produces "a (3).jpg", not "a (2) (2).jpg".
         self.assertEqual("a (3).jpg", naming.unique_destination(folder, "a (2).jpg").name)
 
+    def test_a_year_in_brackets_is_not_taken_for_a_counter(self):
+        """A clash on "Wedding (2019).JPG" came out as "Wedding (2).JPG"."""
+        self.assertEqual("Wedding (2019)", naming.strip_sequence("Wedding (2019)"))
+        self.assertEqual("Scan (007)", naming.strip_sequence("Scan (007)"))
+        self.assertEqual("photo", naming.strip_sequence("photo (3)"))
+        folder = self.tmp / "dest"
+        self.write(folder / "Wedding (2019).JPG")
+        self.assertEqual("Wedding (2019) (2).JPG",
+                         naming.unique_destination(folder, "Wedding (2019).JPG").name)
+
     def test_compound_suffix_split(self):
         self.assertEqual(("IMG_1.JPG", ".xmp"), naming.split_name("IMG_1.JPG.xmp"))
 
@@ -129,6 +139,40 @@ class TemplateTests(unittest.TestCase):
 
     def test_explicit_extension_is_not_doubled(self):
         self.assertEqual("IMG_4821.JPG", template.render_name("{name}.{ext}", self.ctx()))
+
+    def test_the_extension_token_is_recognised_however_it_is_written(self):
+        """A fallback or spaces inside the token hid it from the check.
+
+        The extension was then appended a second time: IMG_4821.JPG.JPG.
+        """
+        for text in ("{name}.{ext}", "{name}.{ ext }", "{name}.{ext|jpg}", "{name}.{扩展名}"):
+            with self.subTest(template=text):
+                self.assertEqual("IMG_4821.JPG", template.render_name(text, self.ctx()))
+
+    def test_a_name_always_ends_in_the_real_extension(self):
+        """``{name}{ext}`` ended in the token, so nothing was appended.
+
+        The result had no extension at all -- IMG_4821JPG -- and was no longer
+        a file the next scan would call a photograph.
+        """
+        for text, expected in (("{name}{ext}", "IMG_4821JPG.JPG"),
+                               ("{name}_{ext}", "IMG_4821_JPG.JPG")):
+            with self.subTest(template=text):
+                self.assertEqual(expected, template.render_name(text, self.ctx()))
+                template.validate("", text)
+
+    def test_an_extension_inside_the_original_name_is_kept(self):
+        ctx = self.ctx(source=Path("/lib/a.jpg.jpg"))
+        self.assertEqual("a.jpg.jpg", template.render_name("{name}", ctx))
+
+    def test_a_template_is_asked_which_tokens_it_uses(self):
+        """The sequence counter moved on only for the literal text ``{seq``."""
+        for text in ("{seq}", "{seq:4}_{name}", "{序号}", "{ seq }", "{序号:3}", "{seq|0}"):
+            with self.subTest(template=text):
+                self.assertTrue(template.uses_token(text, "seq"))
+        for text in ("", "{name}", "{sequence}", "seq", "{ext}"):
+            with self.subTest(template=text):
+                self.assertFalse(template.uses_token(text, "seq"))
 
     def test_illegal_data_is_repaired_at_render_time(self):
         """Sorting must not stall because one camera name contains a slash."""

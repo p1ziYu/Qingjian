@@ -139,6 +139,21 @@ SUGGESTED_NAME_TOKENS = (
 _PADDABLE = frozenset({"seq", "rating", "iso", "ISO"})
 
 
+def _token_key(body: str) -> str:
+    """The token a ``{...}`` body names, read the way `_resolve_one` reads it."""
+    name = body.split("|", 1)[0].split(":", 1)[0].strip()
+    return ALIASES.get(name, name)
+
+
+def uses_token(text: str, token: str) -> bool:
+    """Whether *text* refers to *token* in any spelling the renderer accepts.
+
+    Looking for the text ``{seq`` missed ``{序号}`` and ``{ seq }``, which
+    render the number all the same, so the counter never moved on.
+    """
+    return any(_token_key(match.group(1)) == token for match in _TOKEN.finditer(text or ""))
+
+
 def _resolve_one(body: str, ctx: TemplateContext, strict: bool) -> str:
     name = body
     default = ""
@@ -264,10 +279,16 @@ def render_name(template: str, ctx: TemplateContext, strict: bool = True) -> str
     rendered = _tidy(_substitute(text, ctx, strict, protected=True))
     rendered = sanitize_component(rendered, collapse_spaces=False,
                                   strip_outer=False) if rendered else ctx.stem
-    tail = text.rsplit("}", 1)[-1] if "}" in text else text
-    last_token = list(_TOKEN.finditer(text))[-1] if _TOKEN.search(text) else None
-    ends_with_ext = bool(last_token and last_token.end() == len(text) and
-                         ALIASES.get(last_token.group(1), last_token.group(1)) == "ext")
+    tokens = list(_TOKEN.finditer(text))
+    last = tokens[-1] if tokens else None
+    tail = text[last.end():] if last else text
+    # The extension is already there only when the template ends in a dot and
+    # the extension token, however that token is spelled. Comparing its raw
+    # text missed ``{ ext }`` and ``{ext|jpg}`` and added a second extension,
+    # and ``{name}{ext}`` has no dot: ending in the token left IMG_0001JPG,
+    # a name with no extension at all.
+    ends_with_ext = bool(last and not tail and _token_key(last.group(1)) == "ext"
+                         and text[:last.start()].endswith("."))
     literal_ext = any(tail.casefold().endswith(ext) for ext in MEDIA_EXTENSIONS | {".xmp"})
     if not (ends_with_ext or literal_ext) and ctx.suffix:
         rendered += ctx.suffix

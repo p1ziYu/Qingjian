@@ -15,6 +15,7 @@ import threading
 from collections import OrderedDict
 from pathlib import Path
 
+import numpy as np
 from PySide6.QtCore import QObject, QRunnable, QSize, Qt, QThreadPool, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPixmap
 
@@ -30,6 +31,18 @@ MAX_WORKERS = max(2, min(4, (os.cpu_count() or 4) // 2))
 
 def pil_to_qimage(image) -> QImage:
     """Convert a Pillow image without going through a temporary file."""
+    if image.mode.startswith("I;16") or image.mode == "I":
+        # Pillow clips wide greyscale into eight bits rather than scaling it,
+        # which turned a 16-bit scan's thumbnail almost white. Scale it the way
+        # Qt does for the full preview, so the two agree.
+        from PIL import Image  # noqa: PLC0415 - already loaded: *image* is one
+
+        values = np.clip(np.asarray(image, dtype=np.float64), 0, 65535)
+        # Mode "I" is only a 32-bit container: a TIFF of plain 0..255 values
+        # comes in as one too, and scaled as if sixteen bits it went black.
+        if image.mode.startswith("I;16") or values.max(initial=0) > 255:
+            values = values / 257
+        image = Image.fromarray(np.rint(values).astype(np.uint8))
     converted = image.convert("RGBA")
     data = converted.tobytes("raw", "RGBA")
     result = QImage(data, converted.width, converted.height,
@@ -186,12 +199,20 @@ class ThumbnailCache(QObject):
             pixmap = QPixmap.fromImage(image)
         self._cache[key] = pixmap
         self._bytes += pixmap.width() * pixmap.height() * 4
+        self._fit_budget()
+        self.ready.emit(str(target), edge, pixmap)
+
+    def _fit_budget(self) -> None:
         while self._bytes > self._budget and len(self._cache) > 1:
             _old_key, old = self._cache.popitem(last=False)
             self._bytes -= old.width() * old.height() * 4
-        self.ready.emit(str(target), edge, pixmap)
 
     # -- housekeeping --------------------------------------------------
+    def set_budget(self, budget_mb: int) -> None:
+        """Adopt a new memory budget at once, letting the oldest tiles go to fit it."""
+        self._budget = max(32, budget_mb) * 1024 * 1024
+        self._fit_budget()
+
     def pending(self) -> int:
         return len(self._pending)
 

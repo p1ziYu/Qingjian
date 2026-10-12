@@ -23,7 +23,7 @@ from unittest import mock
 from base import ROOT, TempCase, unittest
 from qingjian.core import config, ops, safestore
 from qingjian.core.engine import Engine
-from qingjian.core.safestore import TransactionError
+from qingjian.core.safestore import VERIFY_FAST, TransactionError
 
 PACKAGE = ROOT / "qingjian"
 
@@ -110,6 +110,31 @@ class G11UndoStateTests(TempCase):
                                              max_days=0, automatic=False)
         self.assertEqual((4, 1), engine.reclaim(force=True))
         self.assertFalse(snapshot.exists())
+
+    def test_reclaiming_retires_the_records_before_deleting_their_copies(self):
+        """A failure in between may leak a restore copy, never leave an undo with nothing behind it."""
+        from qingjian.core.safestore import QuotaPolicy
+        photo = self.write(self.tmp / "src" / "one.jpg", b"one" * 100)
+        engine = Engine(self.data, config.Settings())
+        self.addCleanup(engine.close)
+        engine.trash(photo, allow_system=False)
+        kept = engine.state.top("history").snapshots
+        self.assertTrue(kept and all(Path(ref).is_file() for ref in kept))
+        engine.settings.quota = QuotaPolicy(max_operations=0, max_bytes=1,
+                                             max_days=0, automatic=False)
+
+        def locked(ids):
+            raise sqlite3.OperationalError("database is locked")
+
+        engine.state.retire = locked
+        with self.assertRaises(sqlite3.OperationalError):
+            engine.reclaim(force=True)
+        del engine.state.retire
+        self.assertTrue(engine.can_undo())
+        self.assertTrue(all(Path(ref).is_file() for ref in kept),
+                        "the recycled photo was deleted while its undo stayed offered")
+        engine.undo()
+        self.assertEqual(b"one" * 100, photo.read_bytes())
 
 
 
@@ -264,6 +289,26 @@ class StuckJournalTests(TempCase):
         engine.classify(binding, source / "IMG_2.JPG")
         self.assertTrue((keep / "IMG_2.JPG").is_file())
 
+    def test_undoing_a_replace_whose_restore_copy_is_gone_is_refused_up_front(self):
+        """The photo is as large as the file it replaced, so the restore looked done already.
+
+        But the undo first moves that photo away, so nothing would be there to
+        find: the missing restore copy has to stop the undo before anything moves.
+        """
+        engine, source, keep = self.build()
+        replaced = self.write(keep / "IMG_2.JPG", b"L" * 500)
+        outcome = engine.classify(config.Binding(key="1", action="move", folder=str(keep)),
+                                  source / "IMG_2.JPG",
+                                  resolver=lambda a, b: ops.CONFLICT_REPLACE)
+        for snapshot in outcome.record.snapshots:
+            Path(snapshot).unlink()
+        with self.assertRaises(TransactionError) as caught:
+            engine.undo()
+        self.assertEqual("status.undo_stuck", caught.exception.key)
+        self.assertFalse(engine.has_pending())
+        self.assertEqual(b"K" * 500, replaced.read_bytes(), "the photo was moved back regardless")
+        self.assertFalse((source / "IMG_2.JPG").exists())
+
 
 class ReplaceRecoveryTests(TempCase):
     """Every step ran, the state commit did not: recovery must see that."""
@@ -294,6 +339,238 @@ class ReplaceRecoveryTests(TempCase):
         engine.undo()
         self.assertTrue(old.read_bytes().startswith(b"OLD-"))
         self.assertFalse(engine.has_pending())
+
+
+class ReplaceReplayTests(TempCase):
+    """A Replace, or its undo, stopped part-way must still finish or reverse.
+
+    Replaying runs every step again from the top, so each one has to see that a
+    later step already put its own file at the path it is about to judge.
+    """
+
+    STAMP = 1_700_000_000_000_000_000
+
+    def engine_over(self, source: Path, settings: config.Settings | None = None) -> Engine:
+        settings = settings or config.Settings()
+        settings.logging_enabled = False
+        settings.source_folder = str(source)
+        engine = Engine(data_dir=self.tmp / "app", settings=settings)
+        self.addCleanup(engine.close)
+        engine.open_folder(source)
+        return engine
+
+    def commit_fails(self, engine: Engine, action) -> None:
+        """Run *action* while the state commit is refused, as on a full disk."""
+        real_apply = engine.state.apply
+
+        def failing(delta):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        engine.state.apply = failing
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                action()
+        finally:
+            engine.state.apply = real_apply
+        self.assertTrue(engine.has_pending())
+
+    def hold_second_rename(self) -> None:
+        """Another program holds the file the second rename from now on wants, once."""
+        real = safestore._retry_sharing
+        renames = []
+
+        def retry(operation, *args):
+            if operation is os.replace:
+                renames.append(args[0])
+                if len(renames) == 2:
+                    error = PermissionError(13, "used by another process")
+                    error.winerror = 32
+                    raise error
+            return real(operation, *args)
+
+        safestore._retry_sharing = retry
+        self.addCleanup(setattr, safestore, "_retry_sharing", real)
+
+    def move_replacing(self, engine: Engine, photo: Path, keep: Path, action: str = "move"):
+        return engine.classify(config.Binding(key="1", action=action, folder=str(keep)), photo,
+                               resolver=lambda a, b: ops.CONFLICT_REPLACE)
+
+    def test_recovering_keeps_a_photo_as_large_and_as_old_as_the_one_it_replaced(self):
+        """The replaced file's size and mtime describe the new one too: the delete must not rerun."""
+        card, keep = self.tmp / "card", self.tmp / "keep"
+        new = self.write(card / "DSC_0001.NEF", b"NEW-SHOT" * 1000)
+        old = self.write(keep / "DSC_0001.NEF", b"OLD-SHOT" * 1000)
+        for path in (new, old):
+            os.utime(path, ns=(self.STAMP, self.STAMP))
+        engine = self.engine_over(card)
+        self.commit_fails(engine, lambda: self.move_replacing(engine, new, keep))
+        engine.recover()
+        self.assertEqual(b"NEW-SHOT" * 1000, old.read_bytes(), "the photo moved in was deleted")
+        self.assertFalse(new.exists())
+        self.assertFalse(engine.has_pending())
+        engine.undo()
+        self.assertEqual(b"NEW-SHOT" * 1000, new.read_bytes())
+        self.assertEqual(b"OLD-SHOT" * 1000, old.read_bytes())
+
+    def test_recovering_a_group_stopped_at_its_last_member_keeps_the_first(self):
+        card, keep = self.tmp / "card", self.tmp / "keep"
+        for name, size in (("IMG_1.JPG", 500), ("IMG_1.CR2", 900)):
+            self.write(card / name, b"NEW!" * size)
+            self.write(keep / name, b"OLD!" * size)
+        for path in [*card.iterdir(), *keep.iterdir()]:
+            os.utime(path, ns=(self.STAMP, self.STAMP))
+        engine = self.engine_over(card)
+        self.hold_second_rename()
+        with self.assertRaises(TransactionError):
+            self.move_replacing(engine, card / "IMG_1.JPG", keep)
+        self.assertTrue(engine.has_pending())
+        engine.recover()
+        self.assertFalse(engine.has_pending())
+        self.assertEqual([], self.tree(card))
+        for name, size in (("IMG_1.JPG", 500), ("IMG_1.CR2", 900)):
+            self.assertEqual(b"NEW!" * size, (keep / name).read_bytes(),
+                             "a member that had already arrived was deleted")
+
+    def undo_whose_commit_fails(self, action: str = "move"):
+        card, keep = self.tmp / "card", self.tmp / "keep"
+        new = self.write(card / "IMG_1.JPG", b"NEW!" * 500)
+        old = self.write(keep / "IMG_1.JPG", b"OLD!" * 700)
+        engine = self.engine_over(card)
+        self.move_replacing(engine, new, keep, action)
+        self.commit_fails(engine, engine.undo)
+        return engine, new, old
+
+    def test_an_undo_of_a_replace_whose_commit_failed_recovers(self):
+        """The photo went back, then the replaced file came back where the photo had been."""
+        engine, new, old = self.undo_whose_commit_fails()
+        engine.recover()
+        self.assertEqual(b"NEW!" * 500, new.read_bytes())
+        self.assertEqual(b"OLD!" * 700, old.read_bytes())
+        self.assertFalse(engine.has_pending())
+        self.assertTrue(engine.can_redo())
+
+    def test_an_undo_of_a_replace_whose_commit_failed_can_be_rolled_back(self):
+        engine, new, old = self.undo_whose_commit_fails()
+        engine.abandon_pending(rollback=True)
+        self.assertFalse(engine.has_pending())
+        self.assertFalse(new.exists())
+        self.assertEqual(b"NEW!" * 500, old.read_bytes(), "the rollback did not restore the move")
+        engine.undo()
+        self.assertEqual(b"NEW!" * 500, new.read_bytes())
+        self.assertEqual(b"OLD!" * 700, old.read_bytes())
+
+    def test_an_undo_of_a_copy_that_replaced_recovers(self):
+        engine, new, old = self.undo_whose_commit_fails("copy")
+        engine.recover()
+        self.assertEqual(b"NEW!" * 500, new.read_bytes())
+        self.assertEqual(b"OLD!" * 700, old.read_bytes())
+        self.assertFalse(engine.has_pending())
+
+    def test_rolling_back_that_undo_leaves_what_the_record_says(self):
+        """The copy is still on record, so its file has to be the one in place."""
+        engine, new, old = self.undo_whose_commit_fails("copy")
+        engine.abandon_pending(rollback=True)
+        self.assertFalse(engine.has_pending())
+        self.assertEqual(b"NEW!" * 500, old.read_bytes(), "the restored file outlived the rollback")
+        engine.undo()
+        self.assertEqual(b"OLD!" * 700, old.read_bytes())
+        self.assertEqual(b"NEW!" * 500, new.read_bytes())
+
+    def test_an_undo_stopped_between_members_recovers(self):
+        """A viewer held the second member open while the group went back."""
+        card, keep = self.tmp / "card", self.tmp / "keep"
+        for name in ("IMG_1.JPG", "IMG_1.CR2"):
+            self.write(card / name, b"NEW!" * 500)
+            self.write(keep / name, b"OLD!" * 700)
+        engine = self.engine_over(card)
+        self.move_replacing(engine, card / "IMG_1.JPG", keep)
+        self.hold_second_rename()
+        with self.assertRaises(TransactionError):
+            engine.undo()
+        self.assertTrue(engine.has_pending())
+        engine.recover()
+        self.assertFalse(engine.has_pending())
+        for name in ("IMG_1.JPG", "IMG_1.CR2"):
+            self.assertEqual(b"NEW!" * 500, (card / name).read_bytes())
+            self.assertEqual(b"OLD!" * 700, (keep / name).read_bytes())
+
+
+class CopyThenDeleteTests(TempCase):
+    """With the fast path switched off, a move on one disk is a copy and then a delete.
+
+    So the state a rename can never leave -- the photo at both ends -- is exactly
+    what a source held open by another program leaves, and it must be finishable.
+    """
+
+    def stopped_before_the_delete(self, replacing: bytes = b""):
+        source, keep = self.tmp / "lib", self.tmp / "keep"
+        photo = self.write(source / "IMG_1.JPG", b"x" * 5000)
+        if replacing:
+            self.write(keep / "IMG_1.JPG", replacing)
+        settings = config.Settings()
+        settings.logging_enabled = False
+        settings.fast_path = False
+        settings.source_folder = str(source)
+        engine = Engine(data_dir=self.tmp / "app", settings=settings)
+        self.addCleanup(engine.close)
+        engine.open_folder(source)
+        real = safestore._unlink_source
+        held = []
+
+        def locked_once(src, landed=None):
+            if not held:
+                held.append(src)
+                error = PermissionError(13, "used by another process")
+                error.winerror = 32
+                raise error
+            return real(src, landed)
+
+        safestore._unlink_source = locked_once
+        self.addCleanup(setattr, safestore, "_unlink_source", real)
+        with self.assertRaises(TransactionError):
+            engine.classify(config.Binding(key="1", action="move", folder=str(keep)), photo,
+                            resolver=lambda _a, _b: ops.CONFLICT_REPLACE)
+        self.assertTrue(engine.has_pending())
+        self.assertTrue(photo.is_file())
+        self.assertTrue((keep / "IMG_1.JPG").is_file())
+        return engine, photo, keep / "IMG_1.JPG"
+
+    def test_recovery_finishes_the_delete(self):
+        engine, photo, moved = self.stopped_before_the_delete()
+        engine.recover()
+        self.assertFalse(engine.has_pending())
+        self.assertFalse(photo.exists())
+        self.assertEqual(b"x" * 5000, moved.read_bytes())
+
+    def test_rollback_takes_the_copy_away(self):
+        engine, photo, moved = self.stopped_before_the_delete()
+        engine.abandon_pending(rollback=True)
+        self.assertFalse(engine.has_pending())
+        self.assertEqual(b"x" * 5000, photo.read_bytes())
+        self.assertFalse(moved.exists())
+
+
+    def test_a_replace_stopped_there_recovers(self):
+        """The delete of the replaced file ran before the copy, and with the copy
+        now in its place it read as a file changed under the transaction:
+        recovery failed for good."""
+        engine, photo, moved = self.stopped_before_the_delete(b"old" * 3000)
+        engine.recover()
+        self.assertFalse(engine.has_pending())
+        self.assertFalse(photo.exists())
+        self.assertEqual(b"x" * 5000, moved.read_bytes())
+        engine.undo()
+        self.assertEqual(b"x" * 5000, photo.read_bytes())
+        self.assertEqual(b"old" * 3000, moved.read_bytes())
+
+    def test_a_replace_stopped_there_rolls_back_to_the_replaced_file(self):
+        """Taken for a run that had done nothing, rolling it back undid nothing
+        and then discarded the restore copy: the replaced file was gone."""
+        engine, photo, moved = self.stopped_before_the_delete(b"old" * 3000)
+        engine.abandon_pending(rollback=True)
+        self.assertFalse(engine.has_pending())
+        self.assertEqual(b"x" * 5000, photo.read_bytes())
+        self.assertEqual(b"old" * 3000, moved.read_bytes())
 
 
 @unittest.skipUnless(sys.platform == "win32", "read-only only blocks deletion on Windows")
@@ -352,6 +629,14 @@ class CoarseMtimeTests(TempCase):
         root = self.tmp / action
         usb = root / "usb"
         photo = self.write(root / "lib" / "IMG_5.JPG", b"f" * 3000)
+        engine = self.coarse_card(root, usb)
+        engine.classify(config.Binding(key="1", action=action, folder=str(usb)), photo)
+        engine.undo()
+        self.engine = engine
+        return photo, usb / "IMG_5.JPG"
+
+    def coarse_card(self, root, usb):
+        """An engine over root/lib whose *usb* keeps a two-second clock."""
         real_utime = os.utime
 
         def rounded(path, *args, ns=None, **kwargs):
@@ -372,14 +657,186 @@ class CoarseMtimeTests(TempCase):
         engine = Engine(data_dir=root / "app", settings=settings)
         self.addCleanup(engine.close)
         engine.open_folder(root / "lib")
-        engine.classify(config.Binding(key="1", action=action, folder=str(usb)), photo)
-        engine.undo()
-        return photo, usb / "IMG_5.JPG"
+        return engine
 
     def test_undoing_a_move_to_a_coarse_mtime_volume(self):
         photo, copy = self.sort_and_undo("move")
         self.assertTrue(photo.is_file(), "the photo did not come back")
         self.assertFalse(copy.exists())
+
+    def test_redoing_it_expects_the_clock_the_undo_brought_back(self):
+        """The copy back carries the card's rounded mtime; redo must not call that a change."""
+        photo, copy = self.sort_and_undo("move")
+        self.engine.redo()
+        self.assertTrue(copy.is_file(), "redo was refused")
+        self.assertFalse(photo.exists())
+        self.engine.undo()
+        self.assertTrue(photo.is_file())
+        self.assertFalse(copy.exists())
+        self.assertFalse(self.engine.has_pending())
+
+    def test_a_move_killed_once_it_landed_on_the_card_recovers(self):
+        """The journal guesses the photo lands with its own time, and the card
+        kept a rounded one: killed after the move had landed, the run could
+        never be recovered, nor its undo after it."""
+        root = self.tmp / "killed"
+        usb = root / "usb"
+        photo = self.write(root / "lib" / "IMG_5.JPG", b"f" * 3000)
+        os.utime(photo, ns=(1_700_000_000_123_456_789,) * 2)
+        engine = self.coarse_card(root, usb)
+        first: list[bytes] = []
+        real_atomic = safestore.atomic_json
+
+        def remember(path, value):
+            real_atomic(path, value)
+            if not first and Path(path) == engine.store.journal_path:
+                first.append(Path(path).read_bytes())
+
+        safestore.atomic_json = remember
+        self.addCleanup(setattr, safestore, "atomic_json", real_atomic)
+        engine.classify(config.Binding(key="1", action="move", folder=str(usb)), photo)
+        safestore.atomic_json = real_atomic
+        engine.store.journal_path.write_bytes(first[0])         # what a kill there leaves
+        engine.recover()
+        self.assertFalse(engine.has_pending())
+        self.assertTrue((usb / "IMG_5.JPG").is_file())
+        self.assertFalse(photo.exists())
+        engine.undo()
+        self.assertTrue(photo.is_file())
+        self.assertFalse((usb / "IMG_5.JPG").exists())
+
+    def held_replace_on_the_card(self):
+        """A Replace onto the card whose copy landed while a viewer held the source."""
+        root = self.tmp / "held"
+        usb = root / "usb"
+        photo = self.write(root / "lib" / "IMG_5.JPG", b"f" * 3000)
+        os.utime(photo, ns=(1_700_000_000_123_456_789,) * 2)
+        self.write(usb / "IMG_5.JPG", b"old" * 700)
+        engine = self.coarse_card(root, usb)
+        real = safestore._unlink_source
+        held: list = []
+
+        def locked_once(src, landed=None):
+            if not held:
+                held.append(src)
+                raise PermissionError(13, "used by another process")
+            return real(src, landed)
+
+        safestore._unlink_source = locked_once
+        self.addCleanup(setattr, safestore, "_unlink_source", real)
+        with self.assertRaises(TransactionError):
+            engine.classify(config.Binding(key="1", action="move", folder=str(usb)), photo,
+                            resolver=lambda _a, _b: ops.CONFLICT_REPLACE)
+        self.assertTrue(engine.has_pending())
+        return engine, photo, usb / "IMG_5.JPG"
+
+    def test_a_held_replace_on_the_card_rolls_back_to_the_file_it_replaced(self):
+        """The run stopped before it taught the inverse the card's rounded time,
+        so rolling back refused to move the copy off the card."""
+        engine, photo, target = self.held_replace_on_the_card()
+        engine.abandon_pending(rollback=True)
+        self.assertFalse(engine.has_pending())
+        self.assertEqual(b"f" * 3000, photo.read_bytes())
+        self.assertEqual(b"old" * 700, target.read_bytes())
+
+    def test_a_held_replace_on_the_card_can_be_finished(self):
+        engine, photo, target = self.held_replace_on_the_card()
+        engine.recover()
+        self.assertFalse(engine.has_pending())
+        self.assertFalse(photo.exists())
+        self.assertEqual(b"f" * 3000, target.read_bytes())
+
+    def test_a_copy_over_a_card_file_killed_once_it_landed_rolls_back(self):
+        """A copy kept no allowance for the card's clock, so rolling back a
+        Replace killed after the copy landed undid nothing, then discarded the
+        restore copy: the file it replaced was gone."""
+        root = self.tmp / "copied"
+        usb = root / "usb"
+        photo = self.write(root / "lib" / "IMG_5.JPG", b"f" * 3000)
+        os.utime(photo, ns=(1_700_000_000_123_456_789,) * 2)
+        self.write(usb / "IMG_5.JPG", b"o" * 3000)
+        os.utime(usb / "IMG_5.JPG", ns=(1_600_000_000_000_000_000,) * 2)
+        engine = self.coarse_card(root, usb)
+        first: list[bytes] = []
+        real_atomic = safestore.atomic_json
+
+        def remember(path, value):
+            real_atomic(path, value)
+            if not first and Path(path) == engine.store.journal_path:
+                first.append(Path(path).read_bytes())
+
+        safestore.atomic_json = remember
+        self.addCleanup(setattr, safestore, "atomic_json", real_atomic)
+        engine.classify(config.Binding(key="1", action="copy", folder=str(usb)), photo,
+                        resolver=lambda _a, _b: ops.CONFLICT_REPLACE)
+        safestore.atomic_json = real_atomic
+        engine.store.journal_path.write_bytes(first[0])         # what a kill there leaves
+        engine.abandon_pending(rollback=True)
+        self.assertFalse(engine.has_pending())
+        self.assertEqual(b"o" * 3000, (usb / "IMG_5.JPG").read_bytes())
+        self.assertEqual(b"f" * 3000, photo.read_bytes())
+
+    def test_a_replace_undone_from_a_data_folder_on_a_stick_can_be_redone(self):
+        """Portable mode on a FAT stick: the restore copy of the replaced file
+        keeps a rounded time, and so does the file undo writes back from it.
+        Redo deletes that file again and expected the time it had before:
+        it was refused as changed, every time."""
+        root = self.tmp / "portable"
+        stick = root / "app"
+        photo = self.write(root / "lib" / "IMG_5.JPG", b"f" * 3000)
+        keep = root / "keep"
+        older = self.write(keep / "IMG_5.JPG", b"o" * 2000)
+        os.utime(older, ns=(1_600_000_000_123_456_789,) * 2)
+        real_utime = os.utime
+
+        def rounded(path, *args, ns=None, **kwargs):
+            if ns is not None and str(stick) in str(path):
+                ns = tuple((value // 2_000_000_000) * 2_000_000_000 for value in ns)
+            if ns is None:
+                return real_utime(path, *args, **kwargs)
+            return real_utime(path, *args, ns=ns, **kwargs)
+
+        os.utime = rounded
+        self.addCleanup(setattr, os, "utime", real_utime)
+        settings = config.Settings()
+        settings.logging_enabled = False
+        settings.verification = VERIFY_FAST
+        engine = Engine(data_dir=stick, settings=settings)
+        self.addCleanup(engine.close)
+        engine.open_folder(root / "lib")
+        engine.classify(config.Binding(key="1", action="move", folder=str(keep)), photo,
+                        resolver=lambda _a, _b: ops.CONFLICT_REPLACE)
+        engine.undo()
+        self.assertEqual(b"o" * 2000, older.read_bytes())
+        engine.redo()
+        self.assertEqual(b"f" * 3000, older.read_bytes())
+        self.assertFalse(photo.exists())
+        engine.undo()
+        self.assertEqual(b"o" * 2000, older.read_bytes())
+        self.assertFalse(engine.has_pending())
+
+    def test_redo_refuses_a_restored_file_edited_in_place_since_the_undo(self):
+        """With full verification redo reads what it is about to delete: a
+        metadata tool that keeps the size and the date still changed the
+        bytes, and the edit is refused rather than lost."""
+        root = self.tmp / "edited"
+        photo = self.write(root / "lib" / "IMG_5.JPG", b"f" * 3000)
+        keep = root / "keep"
+        older = self.write(keep / "IMG_5.JPG", b"o" * 2000)
+        settings = config.Settings()
+        settings.logging_enabled = False
+        engine = Engine(data_dir=root / "app", settings=settings)
+        self.addCleanup(engine.close)
+        engine.open_folder(root / "lib")
+        engine.classify(config.Binding(key="1", action="move", folder=str(keep)), photo,
+                        resolver=lambda _a, _b: ops.CONFLICT_REPLACE)
+        engine.undo()
+        stamp = older.stat()
+        older.write_bytes(b"e" * 2000)
+        os.utime(older, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+        with self.assertRaises(TransactionError):
+            engine.redo()
+        self.assertEqual(b"e" * 2000, older.read_bytes())
 
     def test_undoing_a_favourite_to_a_coarse_mtime_volume(self):
         photo, copy = self.sort_and_undo("favorite")

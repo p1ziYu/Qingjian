@@ -35,6 +35,11 @@ CREATE TABLE IF NOT EXISTS cache_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL
 
 FIELDS = ("sha256", "phash", "sharpness", "blown", "crushed", "captured")
 
+#: What an SQLite INTEGER holds. A modification time after 2262, or before
+#: 1678 -- NTFS records both -- does not fit once counted in nanoseconds, and
+#: writing one raised an error that stopped a date-sorted folder from opening.
+_INT64 = range(-2**63, 2**63)
+
 
 class HashCache:
     """Thread-safe key/value store. Losing it costs time, never correctness."""
@@ -85,12 +90,24 @@ class HashCache:
                     "INSERT INTO cache_meta(key,value) VALUES('algorithm',?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     (str(ALGORITHM_VERSION),))
+            # Version 3: earlier ones kept the mtime as the capture time of a
+            # file that was locked just then, and of a photo taken before 1970
+            # on Windows, until the file next changed.
             captured_row = self._db.execute(
                 "SELECT value FROM cache_meta WHERE key='captured'").fetchone()
-            if not captured_row or captured_row[0] != "2":
+            if not captured_row or captured_row[0] != "3":
                 self._db.execute("UPDATE entries SET captured=NULL")
                 self._db.execute(
-                    "INSERT INTO cache_meta(key,value) VALUES('captured','2') "
+                    "INSERT INTO cache_meta(key,value) VALUES('captured','3') "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+            # A frame that could not be decoded used to be scored 0, which reads
+            # as blurry for good. Scored again, a truly flat one comes back 0.
+            sharpness_row = self._db.execute(
+                "SELECT value FROM cache_meta WHERE key='sharpness'").fetchone()
+            if not sharpness_row or sharpness_row[0] != "2":
+                self._db.execute("UPDATE entries SET sharpness=NULL WHERE sharpness=0")
+                self._db.execute(
+                    "INSERT INTO cache_meta(key,value) VALUES('sharpness','2') "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value")
             self._db.commit()
         except sqlite3.Error as error:
@@ -200,8 +217,8 @@ class HashCache:
             row = dict(self._memory.get(key) or {})
             row.update(clean)
             self._memory[key] = row
-            if self._db is None:
-                return
+            if self._db is None or key[1] not in _INT64 or key[2] not in _INT64:
+                return                      # such a file is remembered for this run only
             try:
                 self._db.execute(
                     "INSERT INTO entries(path,size,mtime_ns,sha256,phash,sharpness,"

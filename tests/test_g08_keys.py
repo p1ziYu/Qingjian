@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from unittest import mock
 
-from test_interface import WindowCase, HAVE_QT
+from test_interface import QtCase, WindowCase, HAVE_QT
 
 if HAVE_QT:
     from PySide6.QtCore import QMimeData, QPoint, QPointF, Qt, QUrl
@@ -180,3 +180,132 @@ class G08KeysTests(WindowCase):
         self.assertEqual(str(self.source), self.settings.source_folder)
         self.assertTrue(drop([remote, QUrl.fromLocalFile(str(local))]))
         self.assertEqual(local, self.engine.source_root)
+
+
+class G08EditorTests(QtCase):
+    """The bindings and settings editors, built on their own."""
+
+    def _press(self, edit, key, text):
+        from PySide6.QtCore import QEvent
+        from PySide6.QtGui import QKeyEvent
+        from PySide6.QtWidgets import QApplication
+        QApplication.sendEvent(edit, QKeyEvent(QEvent.Type.KeyPress, key,
+                                               Qt.KeyboardModifier.NoModifier, text))
+
+    def test_a_key_whose_capital_is_two_letters_is_captured_as_typed(self):
+        """"ß".upper() is "SS", which QKeySequence reads as no key at all: the
+        dialog saved it without a word, and pressing ß then did nothing."""
+        from PySide6.QtGui import QKeySequence, QShortcut
+        from PySide6.QtWidgets import QWidget
+        from qingjian.ui.editors import ShortcutEdit
+        edit = ShortcutEdit("1")
+        self.addCleanup(edit.deleteLater)
+        self._press(edit, Qt.Key.Key_ssharp, "ß")
+        self.assertEqual("ß", edit.sequence())
+        target = QWidget()
+        self.addCleanup(target.deleteLater)
+        fired = []
+        QShortcut(QKeySequence(edit.sequence()), target).activated.connect(
+            lambda: fired.append(True))
+        target.show()
+        target.activateWindow()
+        self.assertTrue(QTest.qWaitForWindowActive(target, 2000))
+        QTest.keyClick(target, Qt.Key.Key_ssharp)
+        self.assertEqual([True], fired)
+        # Ordinary letters are still stored as capitals.
+        self._press(edit, Qt.Key.Key_A, "a")
+        self.assertEqual("A", edit.sequence())
+
+    def test_a_key_that_does_not_read_back_as_one_is_refused_rather_than_saved_dead(self):
+        from PySide6.QtGui import QKeySequence
+        from qingjian.ui.editors import ShortcutEdit
+        self.assertEqual(Qt.Key.Key_unknown, QKeySequence("İ")[0].key())   # what Qt makes of it
+        edit = ShortcutEdit("1")
+        self.addCleanup(edit.deleteLater)
+        self._press(edit, Qt.Key.Key_unknown, "İ")
+        self.assertEqual("1", edit.sequence())
+
+    def test_escape_in_a_key_field_still_cancels_the_dialog(self):
+        """The field took every key it was given, Escape included, so the
+        bindings dialog could not be cancelled from the keyboard while a key
+        field had the focus."""
+        from qingjian.ui.editors import BindingsDialog
+        dialog = BindingsDialog(config.default_bindings())
+        self.addCleanup(dialog.deleteLater)
+        rejected = []
+        dialog.rejected.connect(lambda: rejected.append(True))
+        dialog.show()
+        field = dialog.rows[0]["key"]
+        field.setFocus()
+        QTest.keyClick(field, Qt.Key.Key_Escape)
+        self.assertEqual([True], rejected)
+        self.assertFalse(dialog.isVisible())
+        self.assertEqual("1", field.sequence())
+
+    def test_a_language_the_page_has_no_option_for_is_not_saved_as_chinese(self):
+        """"EN", "en-US" and "auto" all run the window, but the page offered
+        none of them, showed its first option -- 中文 -- and saved it."""
+        from qingjian.ui.editors import SettingsDialog
+        from qingjian.ui.widgets import Segmented
+        for value, shown in (("EN", "en"), ("en-US", "en"), ("auto", "system")):
+            with self.subTest(value=value):
+                settings = config.Settings()
+                settings.language = value
+                dialog = SettingsDialog(settings)
+                self.addCleanup(dialog.deleteLater)
+                self.assertEqual(shown, dialog._control("language", Segmented).value())
+                dialog._save()
+                self.assertEqual(shown, dialog.result_settings().language)
+
+    def test_an_entry_another_copy_left_goes_when_the_switch_is_turned_off(self):
+        """Such an entry reads as off, so turning the switch off changed nothing
+        and saving left the entry in Explorer; it took on, save, off, save."""
+        from types import SimpleNamespace
+        from test_config_logging import FakeRegistry
+        from qingjian.core import platform_
+        from qingjian.ui.editors import SettingsDialog
+        from qingjian.ui.widgets import Switch
+        registry = FakeRegistry()
+        self.patch(platform_, "IS_WINDOWS", True)
+        self.patch(platform_, "_registry", lambda _registry=None: registry)
+        engine = SimpleNamespace(data_dir=self.data, backup_usage=lambda: 0)
+        platform_.set_folder_menu(True, "Open with Qingjian", [r"F:\Gone\MediaSorter.exe"])
+        untouched = SettingsDialog(config.Settings(), engine)
+        self.addCleanup(untouched.deleteLater)
+        untouched._save()
+        self.assertTrue(platform_.folder_menu_installed(), "removed without being asked")
+        dialog = SettingsDialog(config.Settings(), engine)
+        self.addCleanup(dialog.deleteLater)
+        switch = dialog._control("folder_menu", Switch)
+        switch.setChecked(True)
+        switch.setChecked(False)
+        dialog._save()
+        self.assertFalse(platform_.folder_menu_installed())
+
+    def test_saving_with_the_folder_menu_on_repairs_an_entry_another_copy_left(self):
+        """A portable folder that moved leaves Explorer's entry starting a
+        program that is gone. The switch read it as on, and saving with it on
+        never wrote the entry again; and the command never carried the
+        ``--data-dir`` this copy was started with."""
+        from types import SimpleNamespace
+        from test_config_logging import FakeRegistry
+        from qingjian.core import platform_
+        from qingjian.ui.editors import SettingsDialog
+        from qingjian.ui.widgets import Switch
+        registry = FakeRegistry()
+        self.patch(platform_, "IS_WINDOWS", True)
+        self.patch(platform_, "_registry", lambda _registry=None: registry)
+        platform_.set_folder_menu(True, "Open with Qingjian", [r"F:\Gone\MediaSorter.exe"])
+        engine = SimpleNamespace(data_dir=self.data, backup_usage=lambda: 0)
+        dialog = SettingsDialog(config.Settings(), engine)
+        self.addCleanup(dialog.deleteLater)
+        switch = dialog._control("folder_menu", Switch)
+        self.assertFalse(switch.isChecked())                # not this copy's menu
+        switch.setChecked(True)
+        dialog._save()
+        written = registry.keys[platform_.FOLDER_MENU_KEYS[0][0] + "\\command"][""]
+        self.assertIn(f'"--data-dir" "{self.data}"', written)
+        self.assertNotIn("Gone", written)
+        again = SettingsDialog(config.Settings(), engine)
+        self.addCleanup(again.deleteLater)
+        self.assertTrue(again._control("folder_menu", Switch).isChecked())

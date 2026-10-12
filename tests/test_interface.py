@@ -130,7 +130,14 @@ class WindowCase(QtCase):
         self.app.processEvents()
 
     def close_window(self) -> None:
-        self.window.close()
+        from qingjian.ui import mainwindow, prompts
+        # A failure notice left by a case that already failed would wait for a
+        # click offscreen and hang every case after it. Cases that expect one
+        # stub `warning` themselves; only the real box is kept out here.
+        with mock.patch.object(mainwindow, "warning", mainwindow.warning
+                               if mainwindow.warning is not prompts.warning
+                               else lambda *a, **k: QMessageBox.StandardButton.Ok):
+            self.window.close()
         # Delete it as well: a closed window keeps its shortcuts, and the next
         # case's Ctrl+Z then went to the window this case left behind.
         self.window.deleteLater()
@@ -155,7 +162,7 @@ class QueueFailureTests(WindowCase):
         with mock.patch.object(self.engine.queue, "failures", return_value=[None] * 20):
             for index in range(20):
                 path = paths[index % len(paths)]
-                self.window._inflight[index + 100] = (path, index % len(paths))
+                self.window._inflight[index + 100] = (path, index % len(paths), False)
                 self.window._on_queue_event("failed", SimpleNamespace(
                     id=index + 100, context={}, error=OSError("failed")))
             self.assertIn("20", self.window.status_label.text())
@@ -168,8 +175,8 @@ class QueueFailureTests(WindowCase):
     def test_failure_report_never_nests(self):
         self.settings.background_queue = True
         path = self.engine.queue_paths[0]
-        self.window._inflight[1] = (path, 0)
-        self.window._inflight[2] = (path, 0)
+        self.window._inflight[1] = (path, 0, False)
+        self.window._inflight[2] = (path, 0, False)
         depth = peak = 0
 
         def warning(*_args, **_kwargs):
@@ -248,6 +255,26 @@ class RecoverStartupTests(WindowCase):
             self.window.recover_pending()
         self.assertEqual(self.engine.source_root, startup)
 
+    def leave_a_failed_recovery(self, choice: str) -> Path:
+        from qingjian.ui.mainwindow import MainWindow
+        RecoverExitTests.silence_warnings(self)
+        RecoverExitTests.stuck_journal(self)
+        startup = self.tmp / "start"
+        startup.mkdir()
+        self.window.startup_folder = startup
+        self.engine.source_root = None
+        self.patch(MainWindow, "_ask_recover_exit", lambda _self, _message, _rollback: choice)
+        self.window.recover_pending()
+        self.assertFalse(self.engine.has_pending())
+        return startup
+
+    def test_rolling_back_a_failed_recovery_opens_the_startup_folder(self):
+        """Only a recovery that finished opened the folder; a way out left the counter empty."""
+        self.assertEqual(self.leave_a_failed_recovery("rollback"), self.engine.source_root)
+
+    def test_keeping_the_files_after_a_failed_recovery_opens_the_startup_folder(self):
+        self.assertEqual(self.leave_a_failed_recovery("keep"), self.engine.source_root)
+
 
 class ProgressHandoverTests(WindowCase):
     def test_new_handover_during_scan_replaces_old_request(self):
@@ -323,6 +350,77 @@ class ProgressHandoverTests(WindowCase):
         self.window._with_progress("work", work)
         self.assertTrue(self.wait_until(lambda: self.engine.source_root == incoming))
 
+    def test_a_folder_reached_through_a_link_is_opened_once(self):
+        """A mapped drive, a subst drive or a junction opens under another spelling.
+
+        The request was only let go once the open folder equalled it as handed
+        over, which a resolved path never does: the folder was scanned again
+        and again, the cursor snapping back to the first photograph each time.
+        """
+        from PIL import Image
+        real = self.tmp / "nas" / "photos"
+        real.mkdir(parents=True)
+        Image.new("RGB", (32, 32)).save(real / "N_0.JPG")
+        link = self.tmp / "Z_drive"
+        try:
+            link.symlink_to(self.tmp / "nas", target_is_directory=True)
+        except OSError:
+            self.skipTest("this account cannot make a symbolic link")
+        with mock.patch.object(self.engine, "open_folder",
+                               wraps=self.engine.open_folder) as opened:
+            self.window.open_requested(str(link / "photos"))
+            QTest.qWait(300)
+        self.assertEqual(1, opened.call_count)
+        self.assertEqual(real.resolve(), self.engine.source_root)
+        self.assertIsNone(self.window._pending_open)
+
+    def test_a_handed_over_folder_that_cannot_be_read_is_reported_once(self):
+        """A failed open answers the hand-over; it used to come back with every F5."""
+        from qingjian.core import scanner
+        locked = self.tmp / "locked"
+        locked.mkdir()
+        reported: list = []
+        self.patch(self.window, "_report", reported.append)
+        real_scan = scanner.scan
+
+        def scan(root, *args, **kwargs):
+            if Path(root) == locked.resolve():
+                raise PermissionError(13, "Access is denied", str(root))
+            return real_scan(root, *args, **kwargs)
+
+        self.patch(scanner, "scan", scan)
+        self.window.open_requested(str(locked))
+        QTest.qWait(100)
+        for _ in range(3):
+            self.window.rescan()
+            QTest.qWait(50)
+        self.assertEqual(1, len(reported))
+        self.assertIsNone(self.window._pending_open)
+        self.assertEqual(self.source, self.engine.source_root)
+
+    def test_a_folder_handed_over_during_a_prompt_opens_when_it_closes(self):
+        """Only some prompts looked for a parked hand-over once they closed.
+
+        After the rename prompt it waited for some unrelated scan or dialog
+        much later, and then swapped the folder out from under the user.
+        """
+        incoming = self.tmp / "incoming"
+        incoming.mkdir()
+
+        def prompt(*_args, **_kwargs):
+            with mock.patch.object(QApplication, "activeModalWidget", return_value=self.window):
+                self.window.open_requested(str(incoming))
+                QTest.qWait(250)
+                self.assertEqual(self.source, self.engine.source_root,
+                                 "opened behind the prompt")
+            return "", False
+
+        with mock.patch("qingjian.ui.mainwindow.get_text", prompt):
+            self.window.rename_current()
+        self.until(lambda: self.engine.source_root == incoming,
+                   "the hand-over was parked after the prompt closed", timeout=3.0)
+        self.assertIsNone(self.window._pending_open)
+
 
 class BusyShortcutTests(WindowCase):
     def test_posted_shortcuts_do_not_open_dialogs_during_progress(self):
@@ -366,6 +464,7 @@ class DuplicateRootTests(TempCase):
 
 
 class RecycleTests(WindowCase):
+    @unittest.skipUnless(sys.platform == "win32", "the recycle-bin queries are Windows APIs")
     def test_background_delete_keeps_reclaim_and_volume_checks_off_ui_thread(self):
         import ctypes
         import threading
@@ -657,6 +756,86 @@ class GridTargetTests(WindowCase):
         self.assertTrue(all(path.exists() for path in queue))
         self.assertEqual(tr("status.nothing_chosen"), self.window.status_label.text())
 
+    def test_the_stars_and_sticker_show_and_mark_the_selected_tile(self):
+        """They showed the hidden cursor's marks, and a click toggled against those.
+
+        Three stars on the first photograph, then star three clicked on an
+        unrated tile, took that tile to no stars at all.
+        """
+        queue = list(self.engine.queue_paths)
+        self.window._rate_current(3)            # the first photograph, in the single view
+        self.engine.tag([queue[4]], label="red")
+        self.to_grid()
+        self.window.grid.setCurrentItem(self.window.grid._rows[str(queue[4])])
+        self.app.processEvents()
+        self.assertEqual((0, "red"), (self.window.rating.value(), self.window.labels.value()))
+        self.window.rating._stars[2].click()
+        self.app.processEvents()
+        self.assertEqual((3, "red"), self.engine.state.tag(str(queue[4])))
+        self.assertEqual((3, ""), self.engine.state.tag(str(queue[0])))
+
+    def test_ctrl_i_describes_the_selected_tile(self):
+        from qingjian.core.i18n import tr
+        queue = list(self.engine.queue_paths)
+        asked: list = []
+        self.patch(self.engine, "info_rows", lambda path: asked.append(Path(path)) or [])
+        self.patch(self.window, "_run_dialog", lambda dialog: dialog.deleteLater())
+        self.to_grid([queue[5]])
+        self.window.show_info()
+        self.assertEqual([queue[5]], asked)
+        self.window.grid.clearSelection()
+        self.app.processEvents()
+        self.window.show_info()
+        self.assertEqual([queue[5]], asked, "described a photo nobody chose")
+        self.assertEqual(tr("status.nothing_chosen"), self.window.status_label.text())
+
+    def conflict_on_the_first_of(self, chosen, decision) -> list:
+        from qingjian.ui import mainwindow
+        self.keep.mkdir()
+        (self.keep / chosen[0].name).write_bytes(b"already there")
+        asked: list = []
+        self.patch(mainwindow.ConflictDialog, "ask",
+                   lambda _parent, source, _target: asked.append(source) or (decision, False))
+        self.to_grid(chosen)
+        self.window.classify_index(0)
+        self.app.processEvents()
+        return asked
+
+    def test_cancel_in_the_conflict_prompt_stops_the_whole_selection(self):
+        """Cancel and "skip this one" both only passed over the file asked about."""
+        from qingjian.core import ops
+        queue = list(self.engine.queue_paths)
+        asked = self.conflict_on_the_first_of(queue[:4], ops.CONFLICT_CANCEL)
+        self.assertEqual([queue[0]], asked)
+        self.assertTrue(all(path.exists() for path in queue[:4]), "filed after Cancel")
+
+    def test_skip_in_the_conflict_prompt_files_the_rest(self):
+        from qingjian.core import ops
+        queue = list(self.engine.queue_paths)
+        self.conflict_on_the_first_of(queue[:4], ops.CONFLICT_SKIP)
+        self.assertEqual([True, False, False, False], [path.exists() for path in queue[:4]])
+
+    def test_cancel_in_the_sidecar_prompt_stops_the_whole_selection(self):
+        from qingjian.core.sidecar import PROMPT_EACH
+        from qingjian.ui import mainwindow
+        from qingjian.ui.dialogs import SidecarDialog
+        asked: list = []
+
+        class Cancelling(SidecarDialog):
+            def exec(self):
+                asked.append(self)
+                return QDialog.DialogCode.Rejected
+
+        self.patch(mainwindow, "SidecarDialog", Cancelling)
+        self.settings.sidecar = self.settings.sidecar.with_prompt(PROMPT_EACH)
+        queue = list(self.engine.queue_paths)
+        for path in queue[:3]:
+            self.write(path.with_suffix(".CR2"), b"raw")
+        self.to_grid(queue[:3])
+        self.window.classify_index(0)
+        self.assertEqual(1, len(asked))
+        self.assertTrue(all(path.exists() for path in queue[:3]), "filed after Cancel")
+
 
 @unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
 class GridSelectionTests(WindowCase):
@@ -694,6 +873,18 @@ class GridSelectionTests(WindowCase):
         self.assertFalse(self.window.grid_selected.isVisible(),
                          "the label still counts files that are gone")
         self.assertEqual([], self.window._targets())
+
+    def test_clicking_the_view_already_shown_stays_on_the_photo(self):
+        """The single-view button, clicked again, went back to where the grid was left."""
+        from qingjian.core import config
+        self.window._toggle_view()
+        self.window._toggle_view()
+        for _ in range(5):
+            self.window.step(1)
+        shown = self.engine.current_path()
+        self.window.view_switch._buttons[config.VIEW_SINGLE].click()
+        self.app.processEvents()
+        self.assertEqual(shown, self.engine.current_path())
 
 
 @unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
@@ -758,15 +949,16 @@ class GridProbeTests(QtCase):
         view.show()
         view.set_paths([str(self.tmp / f"img{i:05d}.jpg") for i in range(1000)])
         self.app.processEvents()
-        QTest.qWait(150)
-        self.app.processEvents()
-        cell = view.gridSize()
-        port = view.viewport()
-        columns = max(1, port.width() // cell.width())
-        rows = port.height() // cell.height()
-        on_screen = columns * rows
-        start, end = view.visible_rows()
-        self.assertGreaterEqual(end, on_screen - 1, f"visible_rows() = {(start, end)}")
+
+        def cells() -> int:
+            cell, port = view.gridSize(), view.viewport()
+            return max(1, port.width() // cell.width()) * (port.height() // cell.height())
+
+        # Qt lays a batched list out over several event turns, 400 items at a
+        # time; under full-suite load 150 ms was sometimes only the first batch.
+        self.until(lambda: view.visible_rows()[1] >= cells() - 1,
+                   f"visible_rows() stopped short of {cells()} cells", timeout=5)
+        on_screen = cells()
         last = view.paths()[on_screen - 1]
         # Qt fills a batched list over several event turns. Under full-suite
         # load the viewport can grow after the first 60 ms thumbnail request.
@@ -774,6 +966,30 @@ class GridProbeTests(QtCase):
                    "the final viewport never requested its last visible tile", timeout=5)
         self.assertIn((last, view.edge), cache._wanted)
         self.assertGreaterEqual(view._tile_room, on_screen)
+
+    def test_a_fetch_ahead_of_the_layout_asks_again_once_it_catches_up(self):
+        # Where a scroll bar appears and shrinks the viewport, the resize asks
+        # again; where its room never changes (always shown, never shown, or a
+        # list that fits) nothing did, and the rest of the screen stayed blank.
+        from qingjian.ui.browsers import ThumbnailGrid
+        from qingjian.ui.thumbs import ThumbnailCache
+        cache = ThumbnailCache()
+        self.addCleanup(cache.shutdown)
+        view = ThumbnailGrid(cache)
+        self.addCleanup(view.deleteLater)
+        view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        view.resize(3800, 1900)
+        view.set_show_names(False)
+        view.set_edge(96)
+        view.show()
+        view.set_paths([str(self.tmp / f"img{i:05d}.jpg") for i in range(1000)])
+        view._fetch_timer.stop()
+        view.request_visible()                       # before any batch is laid out
+        cell, port = view.gridSize(), view.viewport()
+        on_screen = max(1, port.width() // cell.width()) * (port.height() // cell.height())
+        last = view.paths()[on_screen - 1]
+        self.until(lambda: (last, view.edge) in cache._wanted,
+                   "the tiles past the first batch were never asked for", timeout=5)
 
 
 @unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
@@ -1045,6 +1261,68 @@ class RecoverExitTests(WindowCase):
         self.assertEqual([], asked)
 
 
+class ListingChoiceTests(WindowCase):
+    """A filter, sort or subfolder choice the list could not follow is taken back.
+
+    The control and the saved setting kept the new choice over the old list,
+    and undo then tested a photo it put back against a filter the list was
+    never built with: back on disk, missing from the screen.
+    """
+
+    def saved(self):
+        from qingjian.core import config
+        return config.load(self.data / "settings.json")
+
+    def test_a_cancelled_filter_puts_the_box_and_the_setting_back(self):
+        from qingjian.core.safestore import Cancelled
+        before = list(self.engine.queue_paths)
+        combo = self.window.filter_combo
+        with mock.patch.object(self.engine, "rebuild_queue", side_effect=Cancelled("cancelled")):
+            combo.setCurrentIndex(combo.findData("videos"))
+        self.assertEqual("all", combo.currentData())
+        self.assertEqual("all", self.settings.filter_mode)
+        self.assertEqual("all", self.saved().filter_mode)
+        self.assertEqual(before, self.engine.queue_paths)
+        combo.setCurrentIndex(combo.findData("videos"))
+        self.assertEqual("videos", self.saved().filter_mode)
+        self.assertEqual([], self.engine.queue_paths)
+
+    def test_a_sort_that_waited_in_vain_for_the_queue_puts_the_controls_back(self):
+        combo = self.window.sort_combo
+        with mock.patch.object(self.window, "_drain_queue", return_value=False):
+            combo.setCurrentIndex(combo.findData("size"))
+            self.window.reverse_button.setChecked(True)
+        self.assertEqual(("name", "name"), (combo.currentData(), self.settings.sort_mode))
+        self.assertEqual((False, False), (self.window.reverse_button.isChecked(),
+                                          self.settings.sort_reverse))
+
+    def test_a_cancelled_subfolder_scan_unticks_the_box_again(self):
+        from qingjian.core.safestore import Cancelled
+        self.assertFalse(self.settings.recursive)
+        with mock.patch.object(self.engine, "rescan", side_effect=Cancelled("cancelled")):
+            self.window.recursive_check.setChecked(True)
+        self.assertFalse(self.window.recursive_check.isChecked())
+        self.assertFalse(self.settings.recursive)
+        self.assertFalse(self.saved().recursive)
+
+    def test_a_new_thumbnail_budget_applies_without_a_restart(self):
+        from qingjian.core import config
+        from qingjian.ui import mainwindow
+
+        class Accepting:
+            def __init__(self, settings, _engine, _parent):
+                self.settings = config.Settings.from_dict(settings.to_dict())
+                self.settings.thumb_cache_mb = 64
+
+            def result_settings(self):
+                return self.settings
+
+        self.patch(mainwindow, "SettingsDialog", Accepting)
+        self.patch(self.window, "_run_dialog", lambda _dialog: QDialog.DialogCode.Accepted)
+        self.window.open_settings()
+        self.assertEqual(64 * 1024 * 1024, self.window.thumbs._budget)
+
+
 class RuntimeMainWindowContractTests(WindowCase):
     """Run the expensive-path contracts against live widgets and an Engine."""
 
@@ -1146,7 +1424,7 @@ class RuntimeMainWindowContractTests(WindowCase):
              mock.patch.object(self.window, "_rebuild_queue",
                                side_effect=AssertionError("unexpected rebuild")):
             self.window._finish_operation(self.engine.current_path(), 0, outcome)
-        absorb.assert_called_once_with(record)
+        absorb.assert_called_once_with(record, unordered=self.settings.background_queue)
         apply.assert_called_once_with(change)
 
     def test_rename_skip_and_unchanged_duplicates_use_their_single_hooks(self):
@@ -1160,7 +1438,7 @@ class RuntimeMainWindowContractTests(WindowCase):
              mock.patch.object(self.engine, "absorb") as absorb:
             self.window.rename_current()
         rename.assert_called_once()
-        finish.assert_called_once_with(current, self.engine.index, outcome)
+        finish.assert_called_once_with(current, self.engine.index, outcome, follow=None)
         absorb.assert_not_called()
 
         self.settings.bindings[0].action = "skip"
@@ -1231,7 +1509,7 @@ class RuntimeMainWindowContractTests(WindowCase):
              mock.patch.object(self.window, "_rebuild_queue") as rebuild:
             self.window._finish_operation(
                 self.engine.current_path(), self.engine.index, ops.Outcome(record=record))
-        absorb.assert_called_once_with(record)
+        absorb.assert_called_once_with(record, unordered=self.settings.background_queue)
         apply.assert_called_once_with(change)
         rebuild.assert_not_called()
 
@@ -1438,6 +1716,123 @@ class BackgroundQueueTests(WindowCase):
         self.assertEqual(row, self.engine.queue_paths.index(path), "put back on the wrong row")
         self.assertTrue(path.exists())
 
+    def refuse_after(self, gate):
+        """Make every queued move fail, once *gate* is opened."""
+        from qingjian.core.safestore import TransactionError
+
+        def refuse(*args, **kwargs):
+            gate.wait(10)
+            raise TransactionError("error.external_change", "injected")
+
+        self.patch(self.engine, "classify", refuse)
+
+    def test_several_failed_moves_go_back_in_their_own_order(self):
+        """Each row was remembered against the list as later keys had left it.
+
+        Put back first to last, three failures in a row came back reversed:
+        0001, 0004, 0003, 0002, 0005.
+        """
+        import threading
+        before = list(self.engine.queue_paths)
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        self.refuse_after(gate)
+        self.engine.go_to(before[2])
+        for _ in range(3):
+            self.window.classify_index(0)
+        # A step back as well, so a later key files a row in front of earlier ones.
+        self.window.step(-1)
+        self.window.classify_index(0)
+        self.assertEqual(before[:1] + before[5:], self.engine.queue_paths)
+        gate.set()
+        self.assertTrue(self.settled())
+        self.until(lambda: not self.window._inflight, "the failures never came back")
+        self.assertEqual(before, self.engine.queue_paths)
+        self.assertEqual([str(path) for path in before], self.window.filmstrip._all)
+
+    def test_a_move_that_fails_after_entering_review_goes_back_to_its_own_list(self):
+        """A photo filed from the main list is not put into the review list."""
+        import threading
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        self.refuse_after(gate)
+        current = self.engine.current_path()
+        self.window.classify_index(0)
+        # Into the review list without waiting for the queue, as Ctrl+R used to.
+        self.engine.set_review_mode(True)
+        gate.set()
+        self.assertTrue(self.settled())
+        self.until(lambda: not self.window._inflight, "the failure never came back")
+        self.assertNotIn(current, self.engine.queue_paths, "put into the review list")
+        self.engine.set_review_mode(False)
+        self.assertIn(current, self.engine.queue_paths)
+
+    def test_ctrl_r_waits_for_the_queue_before_listing_again(self):
+        """The photo being copied came back on screen; a second 1 made IMG_0000 (2).JPG."""
+        self.settings.bindings[0].action = "copy"
+        current = self.engine.current_path()
+        self.slow_classify(seconds=3)
+        self.window.classify_index(0)
+        self.window.toggle_review()
+        self.window.toggle_review()
+        listed = current in self.engine.queue_paths
+        self.assertTrue(self.settled())
+        self.assertFalse(listed, "the photo being copied was listed again")
+
+    def test_switching_presets_waits_for_the_queue_before_listing_again(self):
+        from qingjian.core import config
+        self.settings.profiles["Trip"] = [config.Binding(**binding.to_dict())
+                                          for binding in self.settings.bindings]
+        self.window._refresh_presets()
+        current = self.engine.current_path()
+        self.slow_classify(seconds=3)
+        self.window.classify_index(0)
+        self.window.preset_combo.setCurrentText("Trip")
+        listed = current in self.engine.queue_paths
+        self.assertTrue(self.settled())
+        self.assertEqual("Trip", self.settings.current_profile)
+        self.assertFalse(listed, "the photo being moved was listed again")
+
+    def press_during_the_wait(self, key, action) -> tuple:
+        """Press *key* while *action* waits for a move still in the queue.
+
+        Returns the photo on screen when *action* began and the one after it.
+        """
+        import threading
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        real = self.engine.store._run_step
+
+        def slow(*args, **kwargs):
+            gate.wait(10)
+            return real(*args, **kwargs)
+
+        self.patch(self.engine.store, "_run_step", slow)
+        self.window.classify_index(0)
+        shown = self.engine.current_path()
+        after = self.engine.queue_paths[self.engine.index + 1]
+        self.activate()
+        QTimer.singleShot(60, lambda: QTest.keyClick(self.window, key))
+        QTimer.singleShot(250, gate.set)
+        action()
+        self.assertTrue(self.settled())
+        self.app.processEvents()
+        return shown, after
+
+    def test_s_skips_the_photo_that_was_on_screen_when_it_was_pressed(self):
+        """S waits for the queue; an arrow key pressed meanwhile chose what it skipped."""
+        shown, after = self.press_during_the_wait(Qt.Key.Key_Right, self.window.skip_current)
+        self.assertNotIn(shown, self.engine.queue_paths, "the photo on screen was not skipped")
+        self.assertIn(after, self.engine.queue_paths, "the photo after it was skipped instead")
+
+    def test_f2_renames_the_photo_that_was_on_screen_when_it_was_pressed(self):
+        with mock.patch("qingjian.ui.mainwindow.get_text", return_value=("renamed.JPG", True)):
+            shown, after = self.press_during_the_wait(Qt.Key.Key_Right,
+                                                      self.window.rename_current)
+        self.assertFalse(shown.exists(), "the photo on screen was not renamed")
+        self.assertTrue(after.exists(), "the photo after it was renamed instead")
+        self.assertTrue(shown.with_name("renamed.JPG").exists())
+
     def test_pending_failure_notice_stays_nonmodal_during_window_cleanup(self):
         """A queued failure notice can run inside closeEvent.processEvents()."""
         from PySide6.QtCore import QTimer
@@ -1493,6 +1888,87 @@ class BackgroundQueueTests(WindowCase):
         self.press(Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
         self.until(lambda: current.exists(), "the old name did not come back")
         self.assertFalse(target.exists())
+
+    def test_filing_from_the_review_grid_keeps_the_next_pick(self):
+        """The review list is a query, and asking it again after every filing
+        refilled the grid: the tile picked while the job ran was let go."""
+        from qingjian.core import config
+        self.engine.send_to_review(list(self.engine.queue_paths), root=self.source)
+        self.window.toggle_review()
+        self.window._set_view(config.VIEW_GRID)
+        self.app.processEvents()
+        grid = self.window.grid
+        first, second = (str(path) for path in self.engine.queue_paths[2:4])
+        grid.clearSelection()
+        grid._rows[first].setSelected(True)
+        grid.setCurrentItem(grid._rows[first])
+        rebuilds = []
+        real = self.window._rebuild_queue
+        self.patch(self.window, "_rebuild_queue", lambda: rebuilds.append(1) or real())
+        self.window.classify_index(0)
+        grid.clearSelection()
+        grid._rows[second].setSelected(True)
+        grid.setCurrentItem(grid._rows[second])
+        self.assertTrue(self.settled())
+        self.until(lambda: not self.window._inflight, "the filing never landed")
+        self.app.processEvents()
+        self.assertEqual([], rebuilds)
+        self.assertEqual([second], grid.selected_paths())
+        self.assertNotIn(Path(first), self.engine.queue_paths)
+
+    def test_f2_in_review_keeps_the_new_name_in_the_review_list(self):
+        from unittest import mock
+        self.engine.send_to_review(list(self.engine.queue_paths), root=self.source)
+        self.window.toggle_review()
+        current = self.engine.current_path()
+        target = current.with_name("renamed.JPG")
+        with mock.patch("qingjian.ui.mainwindow.get_text", return_value=("renamed.JPG", True)):
+            self.press(Qt.Key.Key_F2)
+            self.until(lambda: target.exists(), "the file was not renamed")
+        self.app.processEvents()
+        self.assertTrue(self.engine.review_mode)
+        self.assertIn(target, self.engine.queue_paths)
+        self.assertNotIn(current, self.engine.queue_paths)
+
+    def test_f2_in_random_order_keeps_the_new_name_in_the_list(self):
+        """Random order has no place to insert a file, and with the background
+        queue only the old row was taken out: the photo was on disk under its
+        new name and nowhere on screen until the folder was opened again."""
+        from unittest import mock
+        self.settings.sort_mode = "random"
+        self.window._rebuild_queue()
+        current = self.engine.current_path()
+        target = current.with_name("renamed.JPG")
+        with mock.patch("qingjian.ui.mainwindow.get_text", return_value=("renamed.JPG", True)):
+            self.press(Qt.Key.Key_F2)
+            self.until(lambda: target.exists(), "the file was not renamed")
+        self.assertIn(target, self.engine.queue_paths)
+        self.assertNotIn(current, self.engine.queue_paths)
+        self.assertEqual(8, len(self.engine.queue_paths))
+
+    def test_f2_leaves_the_renamed_photo_on_screen(self):
+        """Re-sorted under its new name, the photo left its neighbour in its
+        place, and a Delete pressed next would have gone to that neighbour."""
+        from unittest import mock
+        from qingjian.core import config
+        for view in (config.VIEW_SINGLE, config.VIEW_GRID):
+            with self.subTest(view=view):
+                self.window._set_view(view)
+                current = self.engine.current_path()
+                if view == config.VIEW_GRID:
+                    self.window.grid.clearSelection()
+                    self.window.grid.show_path(current)
+                target = current.with_name(f"AAA_{view}.JPG")      # sorts to the top
+                with mock.patch("qingjian.ui.mainwindow.get_text",
+                                return_value=(target.name, True)):
+                    self.press(Qt.Key.Key_F2)
+                    self.until(lambda: target.exists(), "the file was not renamed")
+                self.app.processEvents()
+                self.assertEqual(target, self.engine.current_path())
+                if view == config.VIEW_GRID:
+                    self.assertEqual([str(target)], self.window.grid.selected_paths())
+                else:
+                    self.assertEqual(target, self.window.preview.current_path)
 
     def conflict(self, decision):
         from unittest import mock
@@ -1551,6 +2027,33 @@ class BackgroundQueueTests(WindowCase):
         drain.assert_called_once_with()
         self.assertEqual([0], pending, "the window closed over a queued move")
         self.assertTrue((self.keep / current.name).exists())
+
+    def test_closing_while_a_key_waits_for_the_queue_closes_after_the_wait(self):
+        """A close asked for while S waited for the queue was put off, not done.
+
+        Only a progress dialog looked at it afterwards, so the window shut at
+        some later scan instead, in the middle of whatever the user was doing.
+        """
+        import threading
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        real = self.engine.store._run_step
+
+        def slow(*args, **kwargs):
+            gate.wait(10)
+            return real(*args, **kwargs)
+
+        self.patch(self.engine.store, "_run_step", slow)
+        skipped: list = []
+        self.patch(self.engine, "skip", skipped.append)
+        self.window.classify_index(0)
+        QTimer.singleShot(50, self.window.close)
+        QTimer.singleShot(150, gate.set)
+        self.window.skip_current()
+        self.until(lambda: not self.window.isVisible(), "the close request was dropped",
+                   timeout=3.0)
+        self.assertFalse(self.window._close_requested)
+        self.assertEqual([], skipped, "the skip went ahead behind a closing window")
 
 
 @unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
@@ -1646,6 +2149,29 @@ class BindingCardTests(QtCase):
                                                             QPoint(10, 10)))
         self.assertEqual([], self.acted)
         self.assertEqual([3], self.asked)
+
+
+class PresetTests(WindowCase):
+    def test_deleting_the_preset_in_use_forgets_its_conflict_answers(self):
+        """Switching presets forgot an "always replace" answer; deleting one kept it."""
+        from PySide6.QtWidgets import QMenu
+        from qingjian.core import config, ops
+        from qingjian.ui import mainwindow
+        self.settings.profiles["Trip"] = [config.Binding(**binding.to_dict())
+                                          for binding in self.settings.bindings]
+        self.window._refresh_presets()
+        self.window.preset_combo.setCurrentText("Trip")
+        self.window._conflict_defaults[str(self.keep.resolve())] = ops.CONFLICT_REPLACE
+
+        class Deleting(QMenu):
+            def exec(self, *_args):
+                return self.actions()[2]
+
+        self.patch(mainwindow, "QMenu", Deleting)
+        self.patch(mainwindow, "ask", lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes)
+        self.window._preset_menu()
+        self.assertNotIn("Trip", self.settings.profiles)
+        self.assertEqual({}, self.window._conflict_defaults)
 
 
 class ReservedKeyTests(WindowCase):
@@ -2188,6 +2714,13 @@ class SecondLaunchTests(QtCase):
                 os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
 
         self.addCleanup(let_it_go)
+        try:
+            with open(path, "ab"):
+                pass
+        except OSError:
+            pass
+        else:
+            self.skipTest(f"this account can still write in {path}")
 
         plain = QLockFile(str(path))
         plain.setStaleLockTime(0)
@@ -2347,6 +2880,24 @@ class SecondLaunchTests(QtCase):
         written = (self.data / "logs" / "qingjian.log").read_text(encoding="utf-8")
         self.assertIn("error.lock_unreachable", written)
 
+    def test_settings_reset_at_start_up_are_logged_where_a_bundle_can_carry_it(self):
+        """They are read before there is a log -- the settings say whether there
+        is to be one -- so the warning went only to stderr, which the frozen
+        build hides, and nothing recorded that the user's settings were reset."""
+        from unittest.mock import Mock, patch
+        from qingjian.ui import app as app_module
+
+        self.write(self.data / "settings.json", b'{"profiles": {"Family": [')
+        self.addCleanup(self._close_windows)
+        with patch.object(QApplication, "exec", lambda _self: 0), \
+             patch.object(app_module, "_hand_over_with_retry", Mock(return_value=True)), \
+             patch.object(app_module, "warning", self._remember), \
+             patch.object(app_module, "critical", self._remember):
+            self.assertEqual(0, app_module.main(["MediaSorter.exe", "--lang", "en"]))
+        written = (self.data / "logs" / "qingjian.log").read_text(encoding="utf-8")
+        self.assertIn("settings unreadable", written)
+        self.assertIn("settings.broken.json", written)
+
     def test_a_data_directory_the_engine_cannot_use_is_explained_not_quoted(self):
         """A folder may take a file and still refuse a sub-directory or a
         deletion, so the engine can fail where the probe passed. Showing the
@@ -2415,13 +2966,42 @@ class SecondLaunchTests(QtCase):
         from unittest.mock import Mock, patch
         from qingjian.ui import app as app_module
 
-        attempt = Mock(side_effect=[False, False, True])
+        attempt = Mock(side_effect=[None, None, True])          # None: nobody answered
         with patch.object(app_module, "hand_over", attempt), \
              patch.object(app_module.time, "sleep") as sleep:
             self.assertTrue(app_module._hand_over_with_retry("bell", "folder", timeout=1.0,
                                                             interval=0.1))
         self.assertEqual(3, attempt.call_count)
         self.assertEqual(2, sleep.call_count)
+
+    def test_a_folder_handed_to_a_busy_copy_is_handed_over_once(self):
+        """Each attempt used to wait 150 ms for the answer and then write the
+        folder again, so a copy whose window was busy for a second -- a first
+        paint, a large folder, a slow disk -- opened it four times over."""
+        from qingjian.ui import app as app_module
+        name = f"qingjian-test-{uuid.uuid4().hex}"
+        script = self.write(self.tmp / "busy_copy.py", (
+            "import sys, time\n"
+            "from PySide6.QtCore import QCoreApplication, QTimer\n"
+            "app = QCoreApplication([])\n"
+            "from qingjian.ui.app import Doorbell\n"
+            "bell = Doorbell(sys.argv[1])\n"
+            "arrived = []\n"
+            "bell.arrived.connect(arrived.append)\n"
+            "print('listening', flush=True)\n"
+            "time.sleep(1.0)\n"
+            "QTimer.singleShot(1500, app.quit)\n"
+            "app.exec()\n"
+            "print(len(arrived), flush=True)\n").encode("utf-8"))
+        child = subprocess.Popen([sys.executable, str(script), name],
+                                 stdout=subprocess.PIPE, text=True,
+                                 env=dict(os.environ, PYTHONPATH=str(ROOT)))
+        self.addCleanup(child.stdout.close)
+        self.addCleanup(child.kill)
+        self.assertEqual("listening", child.stdout.readline().strip())
+        self.assertTrue(app_module._hand_over_with_retry(name, r"D:\Photos\Trip"))
+        self.assertTrue(self.wait_until(lambda: child.poll() is not None, timeout=30))
+        self.assertEqual("1", child.stdout.read().strip())
 
     def test_a_second_launch_hands_its_folder_to_the_running_window(self):
         """The second launch is a separate process, as it is from Explorer.
@@ -2911,6 +3491,42 @@ class G03WindowTests(WindowCase):
             self.window.rename_current()
         report.assert_called_once()
 
+    def test_keeping_the_offered_name_renames_nothing_and_asks_nothing(self):
+        """Enter on the name as offered asked whether to replace the file with itself."""
+        from qingjian.ui.mainwindow import ConflictDialog
+        current = self.engine.current_path()
+        with mock.patch("qingjian.ui.mainwindow.get_text", return_value=(current.name, True)), \
+             mock.patch.object(ConflictDialog, "ask") as ask, \
+             mock.patch.object(self.engine, "rename") as rename, \
+             mock.patch.object(self.window, "_report") as report:
+            self.window.rename_current()
+        ask.assert_not_called()
+        rename.assert_not_called()
+        report.assert_not_called()
+        self.assertTrue(current.exists())
+
+    def test_a_change_of_case_is_not_a_conflict_with_the_file_itself(self):
+        """On Windows the new spelling already exists, because it is the same file.
+
+        A second hard link stands in for that here: the same file under the
+        new spelling. The rename goes on as one, and the engine has its say.
+        """
+        from qingjian.ui.mainwindow import ConflictDialog
+        current = self.engine.current_path()
+        respelled = current.with_name(current.stem.lower() + current.suffix)
+        try:
+            os.link(current, respelled)
+        except OSError:
+            self.skipTest("this file system cannot give a file a second spelling")
+        reported: list = []
+        with mock.patch("qingjian.ui.mainwindow.get_text", return_value=(respelled.name, True)), \
+             mock.patch.object(ConflictDialog, "ask") as ask, \
+             mock.patch.object(self.window, "_report", reported.append):
+            self.window.rename_current()
+        ask.assert_not_called()
+        self.assertEqual(["error.name_case_only"], [getattr(error, "key", "")
+                                                    for error in reported])
+
 
 class G03EditorTests(QtCase):
     def test_relative_binding_is_rejected(self):
@@ -2994,7 +3610,7 @@ class G06Task1Tests(TestCase):
     def setUp(self):
         self.temp = TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         os.environ["QINGJIAN_DATA_DIR"] = str(self.root / "data")
 
     def gif(self, size=(120, 90)):
@@ -3048,7 +3664,7 @@ class G06Task3Tests(TestCase):
     def setUp(self):
         self.temp = TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         os.environ["QINGJIAN_DATA_DIR"] = str(self.root / "data")
 
     def test_f085_photo_keeps_height_on_tall_view(self):
@@ -3069,7 +3685,7 @@ class G06Task7Tests(TestCase):
     def setUp(self):
         self.temp = TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         os.environ["QINGJIAN_DATA_DIR"] = str(self.root / "data")
 
     def test_f091_release_outside_card_does_not_activate(self):
@@ -3160,3 +3776,109 @@ class G06PreviewOperationTests(WindowCase):
                                              (_ for _ in ()).throw(OSError("busy")))
             self.window.rename_current()
         refresh.assert_called_once()
+
+
+class PreviewRefreshTests(WindowCase):
+    """What is on screen is loaded again only when it is not what is shown already."""
+
+    def count_loads(self) -> list:
+        loads: list = []
+        real = self.window.preview.show_path
+
+        def counting(path, cached=None):
+            loads.append(Path(path))
+            return real(path, cached)
+
+        self.patch(self.window.preview, "show_path", counting)
+        return loads
+
+    def test_a_finished_job_and_a_language_switch_leave_the_picture_alone(self):
+        """Each loaded the current file again.
+
+        A playing video jumped back to the start, a paused one started
+        playing, and a photo turned for a closer look turned back.
+        """
+        import threading
+        self.settings.background_queue = True
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        real = self.engine.store._run_step
+
+        def slow(*args, **kwargs):
+            gate.wait(10)
+            return real(*args, **kwargs)
+
+        self.patch(self.engine.store, "_run_step", slow)
+        self.window.classify_index(0)
+        shown = self.engine.current_path()
+        self.window.preview.image.rotate_by(90)
+        loads = self.count_loads()
+        gate.set()
+        self.until(lambda: not self.window._inflight, "the move never finished")
+        self.app.processEvents()
+        self.window._toggle_language()
+        self.window._toggle_language()
+        self.assertEqual([], loads)
+        self.assertEqual(shown, self.window.preview.current_path)
+        self.assertEqual(90, self.window.preview.image._rotation)
+
+    def test_a_file_replaced_under_the_same_name_is_loaded_again(self):
+        shown = self.engine.current_path()
+        loads = self.count_loads()
+        self.window._refresh_view()
+        self.assertEqual([], loads)
+        Image.new("RGB", (64, 48), (250, 250, 250)).save(shown)
+        self.window._refresh_view()
+        self.assertEqual([shown], loads)
+
+    def test_a_stepped_video_let_go_of_is_loaded_again(self):
+        """A stepped frame stands on the image page, and was taken for the video
+        itself: after a move let go of the player, Space played nothing."""
+        from qingjian.core import video
+        av = video._av()
+        if av is None or "mpeg4" not in av.codecs_available:
+            self.skipTest("PyAV with an MPEG-4 encoder is not installed")
+        import numpy as np
+        clip = self.source / "IMG_0003b.mp4"
+        with av.open(str(clip), "w") as container:
+            stream = container.add_stream("mpeg4", rate=24)
+            stream.width, stream.height, stream.pix_fmt = 64, 48, "yuv420p"
+            for number in range(24):
+                frame = av.VideoFrame.from_ndarray(
+                    np.full((48, 64, 3), number * 10, np.uint8), format="rgb24")
+                for packet in stream.encode(frame):
+                    container.mux(packet)
+            for packet in stream.encode():
+                container.mux(packet)
+        self.addCleanup(self.window.preview.release)
+        self.window.rescan()
+        self.assertTrue(self.engine.go_to(clip))
+        self.window._refresh_view()
+        preview = self.window.preview
+        self.window._step_frame(1)
+        self.assertEqual(preview.IMAGE, preview.stack.currentIndex())
+        loads = self.count_loads()
+        self.window._refresh_view()
+        self.assertEqual([], loads, "a stepped video still held was loaded again")
+        preview.release()
+        self.window._refresh_view()
+        self.assertEqual([clip], loads)
+        self.assertFalse(preview.player.source().isEmpty())
+
+    def test_a_failed_or_cancelled_undo_puts_the_animation_back(self):
+        """Undo lets go of the file on screen first, and nothing loaded it again."""
+        from qingjian.core.safestore import Cancelled, TransactionError
+        clip = self.source / "MOVING.gif"
+        frames = [Image.new("RGB", (40, 30), colour) for colour in ("red", "blue")]
+        frames[0].save(clip, save_all=True, append_images=frames[1:], duration=100, loop=0)
+        self.addCleanup(self.window.preview.release)
+        self.window.rescan()
+        self.assertTrue(self.engine.go_to(clip))
+        self.window._refresh_view()
+        self.assertIsNotNone(self.window.preview._movie, "the gif never played")
+        self.patch(self.window, "_report", lambda error: None)
+        for error in (TransactionError("error.external_change", "injected"),
+                      TransactionError("status.undo_stuck"), Cancelled("cancelled")):
+            with mock.patch.object(self.engine, "undo", side_effect=error):
+                self.window.undo()
+            self.assertIsNotNone(self.window.preview._movie, f"blank after {error!r}")

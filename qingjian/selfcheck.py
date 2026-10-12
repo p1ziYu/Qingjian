@@ -138,6 +138,17 @@ class _CallbackExceptionMonitor:
             monitoring.free_tool_id(self._tool_id)
 
 
+def _require(condition: object, message: str) -> None:
+    """``assert``, without what ``python -O`` does to it.
+
+    Optimised runs strip every ``assert`` statement, so a check written with
+    them passed whatever the program did -- the one outcome a self-check
+    exists to rule out.
+    """
+    if not condition:
+        raise AssertionError(message)
+
+
 def check(name: str):
     def wrapper(function):
         @functools.wraps(function)
@@ -188,7 +199,10 @@ def run(argv: list[str] | None = None) -> int:
     argv = argv or []
     keep = "--keep" in argv
     RESULTS.clear()
-    workspace = Path(tempfile.mkdtemp(prefix="qingjian-selfcheck-"))
+    # %TEMP% is often spelled with 8.3 names (C:\Users\JOHNSM~1), and the
+    # engine resolves every folder it opens, so the checks compare its paths
+    # against the long spelling.
+    workspace = Path(tempfile.mkdtemp(prefix="qingjian-selfcheck-")).resolve()
     data = workspace / "data"
     data.mkdir()
     os.environ["QINGJIAN_DATA_DIR"] = str(data)
@@ -298,22 +312,22 @@ def _check_core(library: Path, data: Path) -> str:
     engine = Engine(data, settings)
     try:
         engine.open_folder(library)
-        assert engine.queue_paths, "no media found"
+        _require(engine.queue_paths, "no media found")
         engine.go_to(made["files"][0])
         outcome = engine.classify(settings.bindings[0])
-        assert outcome.record is not None, "classify produced no record"
+        _require(outcome.record is not None, "classify produced no record")
         moved = sorted(p.name for p in keep.rglob("*") if p.is_file())
-        assert len(moved) == 3, f"sidecars did not travel: {moved}"
+        _require(len(moved) == 3, f"sidecars did not travel: {moved}")
         engine.undo()
         restored = library / "Day1"
         for suffix in ("JPG", "CR2", "XMP"):
-            assert (restored / f"IMG_0001.{suffix}").exists(), f"undo lost IMG_0001.{suffix}"
-        assert not any(path.is_file() for path in keep.rglob("*")), "undo left files behind"
+            _require((restored / f"IMG_0001.{suffix}").exists(), f"undo lost IMG_0001.{suffix}")
+        _require(not any(path.is_file() for path in keep.rglob("*")), "undo left files behind")
         exact = engine.find_duplicates(dedupe.MODE_EXACT)
-        assert len(exact) == 1, f"expected one duplicate group, got {len(exact)}"
+        _require(len(exact) == 1, f"expected one duplicate group, got {len(exact)}")
         engine.find_duplicates(dedupe.MODE_SIMILAR)
         engine.tag([made["files"][1]], rating=4, label="green")
-        assert engine.state.tag(str(made["files"][1]))[0] == 4
+        _require(engine.state.tag(str(made["files"][1]))[0] == 4, "the rating was not kept")
         engine.export_csv(data / "records.csv")
         engine.diagnostic_bundle(data / "bundle.zip")
         return f"{len(engine.all_files)} files, {len(engine.queue_paths)} queue rows"
@@ -357,8 +371,8 @@ def _check_scale(workspace: Path) -> str:
     try:
         start = time.perf_counter()
         engine.open_folder(library)
-        assert len(engine.queue_paths) == count, (
-            f"expected {count} queue rows, got {len(engine.queue_paths)}")
+        _require(len(engine.queue_paths) == count,
+                 f"expected {count} queue rows, got {len(engine.queue_paths)}")
         opened = time.perf_counter() - start
 
         start = time.perf_counter()
@@ -376,9 +390,9 @@ def _check_scale(workspace: Path) -> str:
             if current is None:
                 break
             outcome = engine.classify(settings.bindings[0], current)
-            assert outcome.record is not None, "large-folder classify produced no record"
-            assert engine.absorb(outcome.record) is not None, (
-                "large-folder classify could not patch the queue")
+            _require(outcome.record is not None, "large-folder classify produced no record")
+            _require(engine.absorb(outcome.record) is not None,
+                     "large-folder classify could not patch the queue")
         sort_ms = (time.perf_counter() - start) / 15 * 1000
 
         # Pointing a key at a folder used to re-read the whole library.
@@ -580,8 +594,8 @@ def _check_ui(library: Path, data: Path) -> str:
             window.resize(1540, 940)
             window.show()
             app.processEvents()
-            assert not window.undo_button.isEnabled(), "undo enabled on a fresh window"
-            assert not window.redo_button.isEnabled(), "redo enabled on a fresh window"
+            _require(not window.undo_button.isEnabled(), "undo enabled on a fresh window")
+            _require(not window.redo_button.isEnabled(), "redo enabled on a fresh window")
             notes.append("fresh undo/redo disabled")
             window.open_folder(library)
             engine.go_to(library / "Day1" / "IMG_0002.JPG")
@@ -620,7 +634,8 @@ def _check_ui(library: Path, data: Path) -> str:
             from qingjian.ui.duplicates import DuplicatesDialog
             from qingjian.ui.editors import BindingsDialog, SettingsDialog, TemplateEditor
             current = engine.current_path()
-            assert current is not None
+            if current is None:
+                raise AssertionError("no current file to build the dialogs around")
             group = engine.group_for(current)
             built = []
             for name, factory in (
@@ -643,16 +658,17 @@ def _check_ui(library: Path, data: Path) -> str:
             notes.append("dialogs: " + ",".join(built))
 
             original = engine.current_path()
-            assert original is not None
+            if original is None:
+                raise AssertionError("no current file to classify")
             window.classify_index(0)
             app.processEvents()
             keepers = library.parent / "Keepers2"
-            assert any(keepers.rglob("*")), "classify wrote nothing"
+            _require(any(keepers.rglob("*")), "classify wrote nothing")
             window.undo()
             app.processEvents()
-            assert original.exists(), "interface undo lost the original"
-            assert not any(path.is_file() for path in keepers.rglob("*")), (
-                "interface undo left files behind")
+            _require(original.exists(), "interface undo lost the original")
+            _require(not any(path.is_file() for path in keepers.rglob("*")),
+                     "interface undo left files behind")
             notes.append("classify+undo ok")
 
             shot = data / "selfcheck-window.png"

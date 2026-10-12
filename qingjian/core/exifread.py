@@ -92,6 +92,23 @@ def _read_value(blob: bytes, endian: str, kind: int, count: int, offset: int):
     return values[0] if count == 1 else values
 
 
+def _whole(value) -> int | None:
+    """One tag value as a whole number, whatever type the camera stored it as.
+
+    DNG allows DefaultCropSize as RATIONAL and some writers give NewSubfileType
+    as a list. A bare int() on either raised, and that threw away the capture
+    date and orientation read alongside them.
+    """
+    if isinstance(value, list):
+        value = value[0] if value else None
+    if isinstance(value, tuple):
+        value = value[0] / value[1] if len(value) == 2 and value[1] else None
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def _read_ifd(blob: bytes, endian: str, offset: int, names: dict[int, str]) -> dict:
     out: dict[str, object] = {}
     if offset <= 0 or offset + 2 > len(blob):
@@ -147,23 +164,35 @@ def read_tiff_exif(path: str | Path, max_bytes: int = 2 * 1024 * 1024) -> dict:
     if magic not in (42, 0x4F52, 0x5352, 0x0055):
         return {}
     data = _read_ifd(blob, endian, first, IFD0_TAGS)
-    sub_offset = data.pop("_SubIFDs", None)
-    thumbnail = bool(int(data.pop("_NewSubfileType", 0) or 0) & 1)
+    sub_offsets = data.pop("_SubIFDs", None)
+    thumbnail = bool((_whole(data.pop("_NewSubfileType", 0)) or 0) & 1)
     crop = data.pop("_DefaultCropSize", None)
-    if isinstance(sub_offset, list):
-        sub_offset = sub_offset[0] if sub_offset else None
-    main = _read_ifd(blob, endian, sub_offset, IFD0_TAGS) if isinstance(sub_offset, int) else {}
-    if main:
-        main.pop("_NewSubfileType", None)
-        main.pop("_SubIFDs", None)
-        crop = main.pop("_DefaultCropSize", crop)
-        if main.get("ImageWidth") and main.get("ImageLength"):
-            data.update({key: main[key] for key in ("ImageWidth", "ImageLength")})
+    if not isinstance(sub_offsets, list):
+        sub_offsets = [sub_offsets]
+    # The full-size image is not always the first SubIFD: Nikon puts the
+    # JpgFromRaw preview there, with no size of its own, and the raw second.
+    # Take the one that is not a reduced copy and has the most pixels.
+    main: dict = {}
+    most = -1
+    for offset in sub_offsets:
+        if not isinstance(offset, int):
+            continue
+        sub = _read_ifd(blob, endian, offset, IFD0_TAGS)
+        if (_whole(sub.get("_NewSubfileType", 0)) or 0) & 1:
+            continue
+        area = (_whole(sub.get("ImageWidth")) or 0) * (_whole(sub.get("ImageLength")) or 0)
+        if area > most:
+            main, most = sub, area
+    crop = main.get("_DefaultCropSize", crop)
+    if main.get("ImageWidth") and main.get("ImageLength"):
+        data.update({key: main[key] for key in ("ImageWidth", "ImageLength")})
     elif thumbnail:
         data.pop("ImageWidth", None)
         data.pop("ImageLength", None)
     if isinstance(crop, list) and len(crop) >= 2:
-        data["ImageWidth"], data["ImageLength"] = int(crop[0]), int(crop[1])
+        width, height = _whole(crop[0]), _whole(crop[1])
+        if width and height:
+            data["ImageWidth"], data["ImageLength"] = width, height
     exif_offset = data.pop("_ExifIFD", None)
     data.pop("_DNGVersion", None)
     if isinstance(exif_offset, int):

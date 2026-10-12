@@ -335,7 +335,7 @@ class BlockingDecodeTests(unittest.TestCase):
             "clip.avi": (preview.HEAVY_BYTES + 1, False),
         }
         with tempfile.TemporaryDirectory() as directory:
-            folder = Path(directory)
+            folder = Path(directory).resolve()
             for name, (size, expected) in cases.items():
                 with self.subTest(name=name):
                     path = folder / name
@@ -493,7 +493,7 @@ class G06Task4Tests(TestCase):
     def setUp(self):
         self.temp = TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         os.environ["QINGJIAN_DATA_DIR"] = str(self.root / "data")
 
     def test_f089_setting_interest_does_not_stat_files(self):
@@ -530,7 +530,9 @@ class G06Task4Tests(TestCase):
             fetcher._pool.waitForDone(3000)
             APP.processEvents()
         self.assertEqual({}, fetcher._cache)
-        self.assertEqual([], arrived)
+        # The old picture is not filed, but the window is still told, so it asks
+        # again for the file as it is now: silence left it on "Reading…".
+        self.assertEqual([str(path)], arrived)
         self.assertEqual(set(), fetcher._pending)
 
     def test_f089_replaced_path_skips_queued_old_version(self):
@@ -697,7 +699,7 @@ class G06Task5Tests(TestCase):
     def setUp(self):
         self.temp = TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         os.environ["QINGJIAN_DATA_DIR"] = str(self.root / "data")
 
     def test_f088_key_tracks_target_height(self):

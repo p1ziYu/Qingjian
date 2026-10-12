@@ -5,7 +5,7 @@ from pathlib import Path
 
 from base import TempCase, unittest
 from qingjian.core import safestore as ss
-from qingjian.core.safestore import (Cancelled, Plan, QuotaPolicy, SafeStore, TransactionError,
+from qingjian.core.safestore import (MOVE, Cancelled, Plan, QuotaPolicy, SafeStore, TransactionError,
                                      VERIFY_FAST, VERIFY_FULL, identity, reclaim_candidates,
                                      step_copy, step_move, step_unlink)
 
@@ -224,6 +224,23 @@ class PrecheckTests(StoreCase):
         self.assertFalse(self.store.has_pending())
 
 
+    def test_a_replace_whose_photo_vanished_is_refused_before_the_old_file_goes(self):
+        """The replaced file looks like the photo already moved in; the photo is just gone."""
+        stamp = 1_700_000_000_000_000_000
+        photo = self.file("a.bin", b"new content")
+        target = self.write(self.dst / "a.bin", b"old content")
+        for path in (photo, target):
+            os.utime(path, ns=(stamp, stamp))
+        unlink = step_unlink(target, identity(target, VERIFY_FAST))
+        unlink["snapshot"] = self.store.snapshot(target)
+        plan = Plan(forward=[unlink, step_move(photo, target, identity(photo, VERIFY_FAST))])
+        photo.unlink()
+        with self.assertRaises(TransactionError) as caught:
+            self.store.run(plan)
+        self.assertEqual("error.external_change", caught.exception.key)
+        self.assertEqual(b"old content", target.read_bytes())
+        self.assertFalse(self.store.has_pending())
+
     def test_a_target_that_cannot_be_stated_is_refused_before_anything_moves(self):
         """"I cannot tell" is not "nothing is there".
 
@@ -249,6 +266,47 @@ class PrecheckTests(StoreCase):
         self.assertTrue(first.is_file(), "the first member moved although the plan was doomed")
         self.assertTrue(second.is_file())
         self.assertEqual([], self.tree(self.dst))
+
+
+class ForeignFileRollbackTests(StoreCase):
+    def test_a_file_that_turned_up_at_an_unreached_target_is_left_alone(self):
+        """A two-shot move was killed after the first. A file of the same size,
+        a second off in time, then appeared where the second was going. Taken
+        for the move's own copy, rolling back tried to move it back, refused,
+        and left a journal that blocked every later operation."""
+        import os
+        stamp = 1_700_000_000_123_456_789
+        for fast in (True, False):
+            with self.subTest(fast_path=fast):
+                root = self.tmp / ("fast" if fast else "slow")
+                store = SafeStore(root / "data", fast_path=fast)
+                source, keep = root / "s", root / "k"
+                source.mkdir(parents=True)
+                keep.mkdir()
+                for name in ("a.jpg", "a.cr2"):
+                    (source / name).write_bytes(name.encode() * 1000)
+                    os.utime(source / name, ns=(stamp, stamp))
+                forward = [step_move(source / n, keep / n, identity(source / n, VERIFY_FAST))
+                           for n in ("a.jpg", "a.cr2")]
+                real = store._run_step
+
+                def killed(step, *args, **kwargs):
+                    if step["kind"] == MOVE and step["src"].endswith("a.cr2"):
+                        raise KeyboardInterrupt("kill")
+                    return real(step, *args, **kwargs)
+
+                store._run_step = killed
+                with self.assertRaises(BaseException):
+                    store.run(Plan(forward=forward, inverse=SafeStore.invert(forward)))
+                store._run_step = real
+                foreign = keep / "a.cr2"
+                foreign.write_bytes(b"X.CR2" * 1000)
+                os.utime(foreign, ns=(stamp + 1_000_000_000,) * 2)
+                store.abandon(rollback=True)
+                self.assertFalse(store.has_pending())
+                self.assertEqual(b"X.CR2" * 1000, foreign.read_bytes())
+                self.assertEqual(b"a.jpg" * 1000, (source / "a.jpg").read_bytes())
+                self.assertFalse((keep / "a.jpg").exists())
 
 
 class AbandonTests(StoreCase):
@@ -306,6 +364,27 @@ class AbandonTests(StoreCase):
             self.store.abandon(False)
         self.assertTrue(self.store.has_pending(), "the journal went away with the record")
         self.assertTrue(Path(snapshot["file"]).is_file())
+
+    def test_abandoning_removes_its_partial_copy_from_a_template_subfolder(self):
+        """A kill mid-copy leaves the staged copy where the template put the photo.
+
+        The sweep that follows only looks at the top of each folder in play, so
+        that copy would stay in dst/2026/08 for good.
+        """
+        photo = self.file("a.bin")
+        target = self.dst / "2026" / "08" / "a.bin"
+        plan = self.move_plan(photo, target)
+        payload = plan.to_dict()
+        payload["stage_id"] = "stage"
+        theirs = self.write(target.with_name(".qingjian-other-a.bin.part"), b"another run")
+        for rollback in (True, False):
+            with self.subTest(rollback=rollback):
+                ss.atomic_json(self.store.journal_path, payload)
+                partial = self.write(target.with_name(".qingjian-stage-a.bin.part"), b"half")
+                self.assertTrue(self.store.abandon(rollback))
+                self.assertFalse(partial.exists(), "the half-written copy was left behind")
+                self.assertTrue(photo.is_file())
+        self.assertTrue(theirs.exists(), "a staged copy of another run was taken")
 
     def test_a_damaged_journal_can_be_set_aside(self):
         self.store.journal_path.write_text("{ not json", encoding="utf-8")
@@ -392,6 +471,26 @@ class RecoveryTests(StoreCase):
                         "the journal was deleted, so the finished move has no record")
         self.assertTrue((self.dst / "a.bin").is_file())
 
+    def test_a_second_name_for_the_source_is_not_a_finished_copy(self):
+        """Without the fast path a move on one disk is a copy, but not every pair is one.
+
+        A folder linked to the source folder shows the very same file at the far
+        end; deleting the "source" because the two agree would delete it.
+        """
+        store = SafeStore(self.data / "store", fast_path=False)
+        source = self.file("a.bin")
+        alias = self.tmp / "alias"
+        try:
+            alias.symlink_to(self.src, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks unavailable")
+        payload = self.move_plan(source, alias / "a.bin").to_dict()
+        payload["stage_id"] = "stage"
+        ss.atomic_json(store.journal_path, payload)
+        with self.assertRaises(TransactionError):
+            store.recover()
+        self.assertTrue(source.is_file(), "the only copy was deleted as a finished move's source")
+
     def test_a_damaged_journal_is_not_silently_dropped(self):
         self.store.journal_path.write_text("{ not json", encoding="utf-8")
         with self.assertRaises(json.JSONDecodeError):
@@ -462,6 +561,21 @@ class SyncInverseTests(StoreCase):
         self.assertEqual(first["result"], body["inverse"][0]["src_id"],
                          "undoing this record still expects the clock the plan guessed")
 
+    def test_a_record_moved_by_a_replayed_undo_learns_what_landed(self):
+        """Undo runs the record's inverse; read back from the journal it holds copies."""
+        there = step_move(self.src / "a.JPG", self.dst / "a.JPG", {"size": 111, "mtime_ns": 11})
+        record = {"forward": [there], "inverse": SafeStore.invert([there])}
+        journal = json.loads(json.dumps({
+            "forward": record["inverse"], "inverse": record["forward"],
+            "state": {"records_move": [{"id": "rec", "to": "redo", **record}]}}))
+        back = journal["forward"][0]
+        back["result"] = {"size": 111, "mtime_ns": 8_000_000_000}
+        SafeStore._sync_inverse(journal, 0, back)
+        moved = journal["state"]["records_move"][0]
+        self.assertEqual(back["result"], moved["forward"][0]["src_id"],
+                         "redoing this record still expects the clock it had before the undo")
+        self.assertEqual(back["result"], moved["inverse"][0]["result"])
+
     def test_a_record_holding_another_step_is_left_alone(self):
         other = step_move(self.src / "b.JPG", self.dst / "b.JPG", {"size": 222, "mtime_ns": 22})
         payload, first, body = self.build([other])
@@ -510,6 +624,18 @@ class DeleteAndReplaceTests(StoreCase):
         self.store.run(Plan(forward=plan.inverse))
         self.assertEqual(b"old content", target.read_bytes())
         self.assertEqual(b"new content", source.read_bytes())
+
+    def test_a_copy_over_a_file_of_the_same_size_and_time_still_lands(self):
+        """A copy leaves its source, so a matching target is no sign that it already ran."""
+        stamp = 1_700_000_000_000_000_000
+        source = self.file("a.bin", b"new content")
+        target = self.write(self.dst / "a.bin", b"old content")
+        for path in (source, target):
+            os.utime(path, ns=(stamp, stamp))
+        unlink = step_unlink(target, identity(target, VERIFY_FAST))
+        unlink["snapshot"] = self.store.snapshot(target)
+        self.store.run(Plan(forward=[unlink, step_copy(source, target, identity(source, VERIFY_FAST))]))
+        self.assertEqual(b"new content", target.read_bytes())
 
 
 class VerificationTests(StoreCase):

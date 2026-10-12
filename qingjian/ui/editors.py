@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (QComboBox, QDialog, QDoubleSpinBox, QFileDialog, 
                                QListWidgetItem, QMessageBox, QPushButton, QScrollArea,
                                QSpinBox, QStackedWidget, QVBoxLayout, QWidget)
 
-from ..core import config, platform_, template
+from ..core import appdirs, config, platform_, template
 from ..core.engine import human_size
 from ..core.i18n import LANGUAGES, tr
 from ..core.logsetup import bundle_description, get_logger
@@ -51,6 +51,11 @@ class ShortcutEdit(QLineEdit):
         if key in (Qt.Key.Key_Tab, Qt.Key.Key_Backtab):
             super().keyPressEvent(event)
             return
+        if key == Qt.Key.Key_Escape:
+            # The window keeps Escape for itself, so no binding can have it;
+            # passed on, it cancels the dialog as it does from any other field.
+            event.ignore()
+            return
         if key in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete):
             self.setText("")
             return
@@ -61,7 +66,15 @@ class ShortcutEdit(QLineEdit):
             return
         text = event.text()
         if text and text.isprintable() and not text.isspace():
-            self.setText(text.upper())
+            # Upper-cased only where that leaves it one character: "ß" becomes
+            # "SS", which QKeySequence reads as no key at all, so the binding
+            # was saved and then never fired. Anything that does not read back
+            # as one key is refused here rather than saved dead.
+            upper = text.upper()
+            text = upper if len(upper) == len(text) else text
+            sequence = QKeySequence(text)
+            if sequence.count() == 1 and cast(Any, sequence)[0].key() != Qt.Key.Key_unknown:
+                self.setText(text)
             return
         named = {Qt.Key.Key_Space: "Space", Qt.Key.Key_Return: "Return",
                  Qt.Key.Key_Enter: "Enter", Qt.Key.Key_Insert: "Insert",
@@ -513,14 +526,31 @@ class SettingsDialog(QDialog):
                             self.settings.default_view)))
         if platform_.IS_WINDOWS:
             # The registry is the setting: read it rather than keep a copy that
-            # could disagree with what Explorer actually shows.
-            self._folder_menu_was = platform_.folder_menu_installed()
+            # could disagree with what Explorer actually shows. On means it
+            # opens folders here, in this copy on this library, so an entry a
+            # moved portable folder left behind reads as off, and turning it
+            # on writes it afresh.
+            self._folder_menu_command = self._open_with_command()
+            self._folder_menu_was = platform_.folder_menu_installed(self._folder_menu_command)
+            # Such an entry reads as off, so turning the switch off left it in
+            # place; one turned on and off again here is asked to go.
+            self._folder_menu_stale = (not self._folder_menu_was
+                                       and platform_.folder_menu_installed())
+            self._folder_menu_touched = False
+            switch = self._switch("folder_menu", self._folder_menu_was)
+            switch.toggled.connect(lambda _on: setattr(self, "_folder_menu_touched", True))
             card.add_row(SettingRow(
-                tr("settings.folder_menu"), tr("settings.folder_menu.desc"),
-                self._switch("folder_menu", self._folder_menu_was)))
+                tr("settings.folder_menu"), tr("settings.folder_menu.desc"), switch))
         layout.addWidget(card)
         layout.addStretch(1)
         return page
+
+    def _open_with_command(self) -> list[str]:
+        """What Explorer runs to open a folder in this copy, on this library."""
+        script = Path(__file__).resolve().parents[2] / "main.py"
+        data = appdirs.launch_data_dir(self.engine.data_dir) if self.engine is not None else None
+        return platform_.launch_command(getattr(sys, "frozen", False), sys.executable,
+                                        str(script), data)
 
     def _page_sidecar(self) -> QWidget:
         page, layout = self._page()
@@ -718,12 +748,13 @@ class SettingsDialog(QDialog):
             hide_from_queue=self._control("sidecar_hide", Switch).isChecked())
 
         menu = self._controls.get("folder_menu")
-        if isinstance(menu, Switch) and menu.isChecked() != self._folder_menu_was:
-            script = Path(__file__).resolve().parents[2] / "main.py"
-            command = platform_.launch_command(getattr(sys, "frozen", False), sys.executable,
-                                               str(script))
+        if isinstance(menu, Switch) and (
+                menu.isChecked() != self._folder_menu_was
+                or (not menu.isChecked() and self._folder_menu_stale
+                    and self._folder_menu_touched)):
             try:
-                platform_.set_folder_menu(menu.isChecked(), tr("app.open_with"), command)
+                platform_.set_folder_menu(menu.isChecked(), tr("app.open_with"),
+                                          self._folder_menu_command)
             except OSError as error:
                 warning(self, tr("error.title"), str(error))
         self.accept()
